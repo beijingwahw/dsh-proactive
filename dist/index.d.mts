@@ -4226,6 +4226,10 @@ declare class ProgressBroadcaster {
   /**
    * 解析入站帧（客户端帧必带掩码）
    * 仅处理控制帧：close(0x8) / ping(0x9) / pong(0xA)；业务上行暂不需要
+   *
+   * TCP 不保证报文边界：一个 WebSocket 帧可能跨多个 data 事件到达（分片），
+   * 多个帧也可能挤在同一个 chunk 里（粘包）。因此维护 pendingData 缓冲，
+   * 每次仅消费完整帧，未消费的余量留给下一个 data 事件拼接。
    */
   private handleData;
   /** 发送未掩码服务端帧 */

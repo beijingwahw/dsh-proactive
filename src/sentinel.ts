@@ -19,7 +19,6 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { NetworkError } from './errors.js';
 
 /** 统一信号对象（执行链路第 1 步产物） */
 export interface Signal {
@@ -454,7 +453,10 @@ export class Sentinel {
       });
     });
     server.on('error', (err) => {
-      throw new NetworkError(`webhook 信号源异常: ${err.message}`, { port });
+      // 'error' 监听器内 throw 会成为进程级未捕获异常，直接击穿宿主；
+      // 优雅降级：记录日志、摘除失效 server，保住哨兵与其他信号源
+      console.error(`[sentinel] webhook 信号源异常（端口 ${port}）: ${err.message}`);
+      this.webhookServers = this.webhookServers.filter((s) => s !== server);
     });
     server.listen(port);
     this.webhookServers.push(server);

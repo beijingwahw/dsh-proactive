@@ -925,7 +925,13 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       signalSources: cfg.sentinel?.signalSources,
       watchDir: process.cwd(),
     },
-    (batch) => void processBatch(batch),
+    (batch) => {
+      // 火忘调用：processBatch 内部已逐信号 try/catch，此处兜底捕获
+      // 循环前置阶段（决策引擎/记忆库读取）的异常，防止未处理拒绝
+      processBatch(batch).catch((err) => {
+        logger.error('信号批次处理失败: %s', (err as Error).message);
+      });
+    },
   );
 
   // ── 第四阶段：元认知层（自我建模 + 元认知控制——观察并改进进化机制本身） ──

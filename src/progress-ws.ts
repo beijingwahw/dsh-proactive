@@ -33,6 +33,8 @@ const REPLAY_BUFFER_SIZE = 50;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 /** 单连接写缓冲上限（字节），超限视为慢客户端 */
 const MAX_BUFFERED_BYTES = 1024 * 1024;
+/** 单连接入站半包缓冲上限（字节），超限视为恶意/异常客户端 */
+const MAX_INBOUND_BUFFER = 64 * 1024;
 
 /** 内部连接记录 */
 interface WsConnection {
@@ -41,6 +43,8 @@ interface WsConnection {
   closed: boolean;
   /** 最近一次收到该连接任何入站帧（pong/上行）的时间 */
   lastPongAt: number;
+  /** 跨 TCP 分片累积的未完整帧数据（处理粘包/半包） */
+  pendingData: Buffer;
 }
 
 /**
@@ -208,7 +212,7 @@ export class ProgressBroadcaster {
       ].join('\r\n'),
     );
 
-    const conn: WsConnection = { socket, closed: false, lastPongAt: Date.now() };
+    const conn: WsConnection = { socket, closed: false, lastPongAt: Date.now(), pendingData: Buffer.alloc(0) };
     this.connections.add(conn);
 
     // 回放历史事件 → 再发 connected（附录协议）
@@ -226,29 +230,34 @@ export class ProgressBroadcaster {
   /**
    * 解析入站帧（客户端帧必带掩码）
    * 仅处理控制帧：close(0x8) / ping(0x9) / pong(0xA)；业务上行暂不需要
+   *
+   * TCP 不保证报文边界：一个 WebSocket 帧可能跨多个 data 事件到达（分片），
+   * 多个帧也可能挤在同一个 chunk 里（粘包）。因此维护 pendingData 缓冲，
+   * 每次仅消费完整帧，未消费的余量留给下一个 data 事件拼接。
    */
   private handleData(conn: WsConnection, chunk: Buffer): void {
     conn.lastPongAt = Date.now(); // 任何入站帧都证明对端存活
+    const buffer = conn.pendingData.length > 0 ? Buffer.concat([conn.pendingData, chunk]) : chunk;
     let offset = 0;
-    while (offset + 2 <= chunk.length) {
-      const opcode = chunk[offset]! & 0x0f;
-      const masked = (chunk[offset + 1]! & 0x80) !== 0;
-      let payloadLength = chunk[offset + 1]! & 0x7f;
+    while (offset + 2 <= buffer.length) {
+      const opcode = buffer[offset]! & 0x0f;
+      const masked = (buffer[offset + 1]! & 0x80) !== 0;
+      let payloadLength = buffer[offset + 1]! & 0x7f;
       let headerSize = 2;
 
       if (payloadLength === 126) {
-        if (offset + 4 > chunk.length) return;
-        payloadLength = chunk.readUInt16BE(offset + 2);
+        if (offset + 4 > buffer.length) break;
+        payloadLength = buffer.readUInt16BE(offset + 2);
         headerSize = 4;
       } else if (payloadLength === 127) {
-        if (offset + 10 > chunk.length) return;
-        payloadLength = Number(chunk.readBigUInt64BE(offset + 2));
+        if (offset + 10 > buffer.length) break;
+        payloadLength = Number(buffer.readBigUInt64BE(offset + 2));
         headerSize = 10;
       }
 
       const maskSize = masked ? 4 : 0;
       const frameEnd = offset + headerSize + maskSize + payloadLength;
-      if (frameEnd > chunk.length) return; // 等待更多数据
+      if (frameEnd > buffer.length) break; // 半包：等待更多数据
 
       if (opcode === 0x8) {
         // close：回应并断开
@@ -257,6 +266,7 @@ export class ProgressBroadcaster {
         } catch {
           /* 忽略 */
         }
+        conn.pendingData = Buffer.alloc(0);
         conn.socket.end();
         return;
       }
@@ -266,6 +276,12 @@ export class ProgressBroadcaster {
       }
       // pong(0xA) 与文本帧无需处理
       offset = frameEnd;
+    }
+    // 余量留存：半包数据等下一个 data 事件拼接
+    conn.pendingData = buffer.subarray(offset);
+    // 半包超限：客户端声称的帧长度远超合理控制帧尺寸（且拒不补齐），按异常断开
+    if (conn.pendingData.length > MAX_INBOUND_BUFFER) {
+      this.dropConnection(conn);
     }
   }
 

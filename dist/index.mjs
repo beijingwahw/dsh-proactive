@@ -3179,6 +3179,8 @@ const REPLAY_BUFFER_SIZE = 50;
 const HEARTBEAT_INTERVAL_MS = 3e4;
 /** 单连接写缓冲上限（字节），超限视为慢客户端 */
 const MAX_BUFFERED_BYTES = 1048576;
+/** 单连接入站半包缓冲上限（字节），超限视为恶意/异常客户端 */
+const MAX_INBOUND_BUFFER = 65536;
 /**
 * WebSocket 进度广播器
 *
@@ -3315,7 +3317,8 @@ var ProgressBroadcaster = class {
 		const conn = {
 			socket,
 			closed: false,
-			lastPongAt: Date.now()
+			lastPongAt: Date.now(),
+			pendingData: Buffer.alloc(0)
 		};
 		this.connections.add(conn);
 		for (const past of this.replayBuffer) this.sendFrame(socket, Buffer.from(JSON.stringify(past), "utf-8"), 1);
@@ -3332,37 +3335,45 @@ var ProgressBroadcaster = class {
 	/**
 	* 解析入站帧（客户端帧必带掩码）
 	* 仅处理控制帧：close(0x8) / ping(0x9) / pong(0xA)；业务上行暂不需要
+	*
+	* TCP 不保证报文边界：一个 WebSocket 帧可能跨多个 data 事件到达（分片），
+	* 多个帧也可能挤在同一个 chunk 里（粘包）。因此维护 pendingData 缓冲，
+	* 每次仅消费完整帧，未消费的余量留给下一个 data 事件拼接。
 	*/
 	handleData(conn, chunk) {
 		conn.lastPongAt = Date.now();
+		const buffer = conn.pendingData.length > 0 ? Buffer.concat([conn.pendingData, chunk]) : chunk;
 		let offset = 0;
-		while (offset + 2 <= chunk.length) {
-			const opcode = chunk[offset] & 15;
-			const masked = (chunk[offset + 1] & 128) !== 0;
-			let payloadLength = chunk[offset + 1] & 127;
+		while (offset + 2 <= buffer.length) {
+			const opcode = buffer[offset] & 15;
+			const masked = (buffer[offset + 1] & 128) !== 0;
+			let payloadLength = buffer[offset + 1] & 127;
 			let headerSize = 2;
 			if (payloadLength === 126) {
-				if (offset + 4 > chunk.length) return;
-				payloadLength = chunk.readUInt16BE(offset + 2);
+				if (offset + 4 > buffer.length) break;
+				payloadLength = buffer.readUInt16BE(offset + 2);
 				headerSize = 4;
 			} else if (payloadLength === 127) {
-				if (offset + 10 > chunk.length) return;
-				payloadLength = Number(chunk.readBigUInt64BE(offset + 2));
+				if (offset + 10 > buffer.length) break;
+				payloadLength = Number(buffer.readBigUInt64BE(offset + 2));
 				headerSize = 10;
 			}
 			const maskSize = masked ? 4 : 0;
 			const frameEnd = offset + headerSize + maskSize + payloadLength;
-			if (frameEnd > chunk.length) return;
+			if (frameEnd > buffer.length) break;
 			if (opcode === 8) {
 				try {
 					this.sendFrame(conn.socket, Buffer.alloc(0), 8);
 				} catch {}
+				conn.pendingData = Buffer.alloc(0);
 				conn.socket.end();
 				return;
 			}
 			if (opcode === 9) this.sendFrame(conn.socket, Buffer.alloc(0), 10);
 			offset = frameEnd;
 		}
+		conn.pendingData = buffer.subarray(offset);
+		if (conn.pendingData.length > MAX_INBOUND_BUFFER) this.dropConnection(conn);
 	}
 	/** 发送未掩码服务端帧 */
 	sendFrame(socket, payload, opcode) {
@@ -3982,7 +3993,8 @@ var Sentinel = class {
 			});
 		});
 		server.on("error", (err) => {
-			throw new NetworkError(`webhook 信号源异常: ${err.message}`, { port });
+			console.error(`[sentinel] webhook 信号源异常（端口 ${port}）: ${err.message}`);
+			this.webhookServers = this.webhookServers.filter((s) => s !== server);
 		});
 		server.listen(port);
 		this.webhookServers.push(server);
@@ -20760,7 +20772,11 @@ function apply(ctx, config) {
 		aggregationWindow: cfg.sentinel?.aggregationWindow ?? .5,
 		signalSources: cfg.sentinel?.signalSources,
 		watchDir: process.cwd()
-	}, (batch) => void processBatch(batch));
+	}, (batch) => {
+		processBatch(batch).catch((err) => {
+			logger.error("信号批次处理失败: %s", err.message);
+		});
+	});
 	const metaLayerEnabled = cfg.autonomy?.metaLayer?.enabled ?? true;
 	/**
 	* 2.0 稳态目标带（自我建模与元认知控制器共享）：
