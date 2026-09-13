@@ -27,10 +27,26 @@
  *   未配置的动作沿用共享全局窗口（与升级前行为一致）
  * - 预算/审计持久化：persistPath 配置后，token/成本累计与审计尾部
  *   落盘重启恢复——升级前纯内存，重启即预算清零、审计丢失
+ *
+ * 15.0 升级（形式语义闭环）：
+ * - attachRuntimeVerifier() 挂载运行时验证器后，治理器把自身全部
+ *   关键迁移（动作失败/熔断开闭/Kill Switch 启停）作为事件流喂给
+ *   LTLf 安全规约监视器——治理器从「标量门控的集合」升级为
+ *   「被形式规约监视的守卫」；
+ * - 违规升级通道：critical 违规（如失败风暴）→ 自动触发 Kill Switch
+ *   （形式裁决获得治理的牙齿）；warn 违规 → 记入失败压力推动熔断；
+ *   info → 仅审计。规约可配置声明、违规报告携带可重放见证轨迹。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  RuntimeVerifier,
+  defaultSafetySpecs,
+  type RuntimeVerifierStatus,
+  type SafetySpec,
+  type ViolationReport,
+} from './core/runtime-verification.js';
 
 /** 治理动作类型 */
 export type GovernedAction = 'autonomous-execute' | 'exploration' | 'goal-dispatch' | 'strategy-evolution';
@@ -133,10 +149,46 @@ export class SafetyGovernor {
   private audit: GovernanceAuditEntry[] = [];
   /** 4.0：持久化防抖定时器 */
   private persistTimer?: ReturnType<typeof setTimeout>;
+  /** 15.0：运行时验证器（挂载后治理迁移成为被监视的事件流） */
+  private verifier?: RuntimeVerifier;
+  /** 15.0：形式违规升级计数（审计可观测） */
+  private formalViolations = { critical: 0, warn: 0, info: 0 };
 
   constructor(config?: Partial<SafetyGovernorConfig>) {
     this.config = { ...DEFAULT_SAFETY_GOVERNOR_CONFIG, ...config };
     this.loadPersisted();
+  }
+
+  /**
+   * 15.0：挂载运行时验证器（幂等；缺省规约集以治理器自身的
+   * circuitFailureThreshold 参数化——失败风暴规约与熔断阈值同源）。
+   *
+   * 挂载后治理器的全部关键迁移自动喂入规约监视器：
+   * action-failed / breaker-opened / breaker-closed /
+   * kill-switch-engaged / kill-switch-disengaged。
+   *
+   * @param specs 安全规约集（缺省 defaultSafetySpecs(circuitFailureThreshold)）
+   * @returns 挂载的验证器（可继续 register 附加规约）
+   */
+  attachRuntimeVerifier(specs?: SafetySpec[]): RuntimeVerifier {
+    if (!this.verifier) {
+      this.verifier = new RuntimeVerifier(specs ?? defaultSafetySpecs(this.config.circuitFailureThreshold));
+    } else if (specs && specs.length > 0) {
+      for (const spec of specs) this.verifier.register(spec);
+    }
+    return this.verifier;
+  }
+
+  /** 15.0：动态注册一条安全规约（需先挂载验证器） */
+  registerSafetySpec(spec: SafetySpec): boolean {
+    if (!this.verifier) this.attachRuntimeVerifier();
+    this.verifier!.register(spec);
+    return true;
+  }
+
+  /** 15.0：运行时验证状态（未挂载时 undefined） */
+  getVerificationStatus(): RuntimeVerifierStatus | undefined {
+    return this.verifier?.status();
   }
 
   /**
@@ -250,17 +302,21 @@ export class SafetyGovernor {
       if (this.circuitState === 'half-open') {
         this.circuitState = 'closed';
         this.halfOpenProbeInFlight = false;
+        this.emit('breaker-closed', { via: 'half-open-probe-success' });
       }
     } else {
       this.consecutiveFailures += 1;
+      this.emit('action-failed', { consecutiveFailures: this.consecutiveFailures });
       // 半开试探失败 → 重新熔断；连续失败超阈值 → 熔断
       if (this.circuitState === 'half-open') {
         this.halfOpenProbeInFlight = false;
         this.circuitState = 'open';
         this.circuitOpenedAt = Date.now();
+        this.emit('breaker-opened', { via: 'half-open-probe-failure' });
       } else if (this.consecutiveFailures >= this.config.circuitFailureThreshold && this.circuitState !== 'open') {
         this.circuitState = 'open';
         this.circuitOpenedAt = Date.now();
+        this.emit('breaker-opened', { via: `consecutive-failures-${this.consecutiveFailures}` });
       }
     }
     this.schedulePersist();
@@ -292,12 +348,14 @@ export class SafetyGovernor {
   /** 启用 Kill Switch */
   engageKillSwitch(): void {
     this.killSwitchEngaged = true;
+    this.emit('kill-switch-engaged');
     this.schedulePersist();
   }
 
   /** 解除 Kill Switch */
   disengageKillSwitch(): void {
     this.killSwitchEngaged = false;
+    this.emit('kill-switch-disengaged');
     this.schedulePersist();
   }
 
@@ -308,9 +366,11 @@ export class SafetyGovernor {
 
   /** 手动重置熔断器 */
   resetCircuit(): void {
+    const wasNonClosed = this.circuitState !== 'closed';
     this.circuitState = 'closed';
     this.consecutiveFailures = 0;
     this.halfOpenProbeInFlight = false;
+    if (wasNonClosed) this.emit('breaker-closed', { via: 'manual-reset' });
     this.schedulePersist();
   }
 
@@ -333,6 +393,10 @@ export class SafetyGovernor {
         costBudget: this.config.costBudget,
       },
       recentAudit: this.audit.slice(-10),
+      // 15.0：形式验证面板（挂载验证器后输出）
+      verification: this.verifier
+        ? { formalViolations: { ...this.formalViolations }, ...this.verifier.status() }
+        : undefined,
     };
   }
 
@@ -380,6 +444,47 @@ export class SafetyGovernor {
   }
 
   // ─────────────────────────── 内部实现 ───────────────────────────
+
+  /**
+   * 15.0：治理事件流出口（挂载验证器时生效）。
+   *
+   * 事件喂入规约监视器；产出的违规按严重级升级：
+   * - critical → Kill Switch（形式裁决获得治理的牙齿）；
+   * - warn → 计入失败压力（推动熔断器开路）；
+   * - info → 仅计数审计。
+   */
+  private emit(type: string, detail?: Record<string, unknown>): void {
+    if (!this.verifier) return;
+    const violations = this.verifier.observe({ type, at: Date.now(), detail });
+    for (const violation of violations) {
+      this.escalate(violation);
+    }
+  }
+
+  /** 形式违规升级通道 */
+  private escalate(violation: ViolationReport): void {
+    this.formalViolations[violation.severity] += 1;
+    this.audit.push({
+      timestamp: violation.at,
+      action: 'autonomous-execute',
+      verdict: {
+        allowed: false,
+        reason: `[formal] 规约 ${violation.specId} 违规（${violation.severity}）：${violation.message}`,
+        blockedBy: violation.severity === 'critical' ? 'kill-switch' : 'circuit-breaker',
+      },
+    });
+    if (this.audit.length > this.config.auditLimit) {
+      this.audit.splice(0, this.audit.length - this.config.auditLimit);
+    }
+    if (violation.severity === 'critical') {
+      // 形式确证的 critical 违规 → 冻结全部自主行为（证明携带裁决）
+      this.killSwitchEngaged = true;
+      this.schedulePersist();
+    } else if (violation.severity === 'warn') {
+      // warn 违规计入失败压力（可能推动熔断开路）
+      this.consecutiveFailures += 1;
+    }
+  }
 
   /** 记录审计日志 */
   private logAudit(action: GovernedAction, verdict: GovernanceVerdict): void {

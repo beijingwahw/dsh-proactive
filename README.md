@@ -5,7 +5,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-339933?logo=nodedotjs&logoColor=white)](#安装)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-8250df)](https://github.com/topics/dsh-plugin)
 
-> **主动智能（Proactive Intelligence）调度插件** —— DeepSeek Harness（DSH）生态中的多模型协同调度系统：自主感知、自主决策、自主进化，内置**科学家 / 理论家双心智**与**认知能量共生经济**。
+> **主动智能（Proactive Intelligence）调度插件** —— DeepSeek Harness（DSH）生态中的多模型协同调度系统：自主感知、自主决策、自主进化，内置**科学家 / 理论家双心智**、**认知能量共生经济**与**十四大质变内核（证据 → 保证层，任意时刻有效 / 保形 / 多样性 / 形式安全 / 公平归因）**。
 >
 > [English](./README.en.md) | 中文
 
@@ -31,9 +31,11 @@
 │  操作环：信号→决策→执行→反思 10 步主链路（index.ts）             │
 │  进化环：策略进化器 + 安全沙盒 + 金丝雀部署（policy/）            │
 │  元认知外环：自我建模 → 保守调整 → 观察/回滚（meta/）             │
-├─ 质变内核（core/）3.0 → 11.0 九大内核 ────────────────────────┤
+├─ 质变内核（core/）3.0 → 16.0 十四大内核 ──────────────────────┤
 │  证据 3.0  弹性 4.0  因果 5.0  自由能 6.0  深思 7.0             │
 │  元推理 8.0  抽象 9.0  科学家 10.0  理论家 11.0                 │
+│  任意时刻证据 12.0  保形预测 13.0  质量-多样性 14.0              │
+│  运行时验证 15.0  Shapley 归因 16.0                             │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -48,7 +50,14 @@
 - **科学家内核**（[core/scientist.ts](./src/core/scientist.ts)）：贝叶斯最优实验设计——为「知识获取本身」定价。真 EIG（nat）评估实验信息价值、混杂加成（实验独占价值）、预算仲裁（netValue = EIG − cost）、信息台账校准、知识前沿收缩
 - **理论内核**（[core/theorist.ts](./src/core/theorist.ts)）：层级贝叶斯 + MDL（理解即压缩）——把数据压缩为定律。同族观测边汇聚为定律（借力收缩）、压缩定价（对数贝叶斯因子）、零样本预测、反常侦测、范式转移（库恩跃迁）
 
-### 质变内核（core/，3.0 → 11.0）
+### 任意时刻证据 / 保形 / 多样性 / 形式安全 / 公平归因（12.0 → 16.0）
+- **任意时刻证据内核**（[core/anytime-evidence.ts](./src/core/anytime-evidence.ts)）：置信序列 + e-过程——**任何时刻偷看都合法**。时间一致置信区间（缝合 CS）随时读取随时有效；e-过程资本以 Ville 不等式裁决假设，多基因组淘汰经 e-BH 过程获得 FDR 上限（冤案率有数学保证）；元认知 KPI 保证层挂载后，退化/恢复判定升级为情节化状态机（水位线两侧各自积累证据，越线即重置——偷看免疫、恢复可判）
+- **保形预测内核**（[core/conformal.ts](./src/core/conformal.ts)）：分布无关精确覆盖——**零分布假设的预测区间**。分裂保形区间给出有限样本精确保证（P(实际 ∈ 区间) ≥ 1−α）；覆盖漂移监视器以可预测 λ 下注的 e-过程侦测失准；阈值自校准升级为风险受控选择（经验伯恩斯坦上界 + Bonferroni，P(未来重试率 ≤ 目标) ≥ 置信水平）
+- **质量-多样性内核**（[core/quality-diversity.ts](./src/core/quality-diversity.ts)）：MAP-Elites 行为归档——**多样性坍缩被结构性阻断**。策略基因按行为描述子（敢为/节俭/警觉三维）落入 niche 网格，各流派获得等量试验预算（前沿均匀采样）；QD-score 同时度量质量与覆盖，进化不再收敛到单一解
+- **运行时验证内核**（[core/runtime-verification.ts](./src/core/runtime-verification.ts)）：LTLf 规约监视——**安全规约形式化，裁决携带证明**。缺省规约集（无失败风暴 / 命令必响应 / 周期心跳 / 先授权后执行）编译为四类监视器原子；违规报告含完整证据轨迹与反例见证；severity 分级升级（critical → Kill Switch、warn → 熔断、info → 审计）
+- **Shapley 归因内核**（[core/shapley.ts](./src/core/shapley.ts)）：公理化公平分配——**贡献拆账有数学定理背书**。效率/对称/哑元/可加四公理精确满足；置换采样 + 任意时刻有效置信区间（边采样边出置信界，停不停都有保证）；协同侦测自动识别 1+1>2 的正协同与搭便车的负协同
+
+### 质变内核（core/，3.0 → 16.0）
 | 内核 | 版本 | 一句话 |
 |------|------|--------|
 | evidence.ts | 3.0 | 统一证据语言：Wilson 界 / 时间衰减 / 证据排序，铺满所有记忆层 |
@@ -60,6 +69,11 @@
 | abstraction.ts | 9.0 | 抽象泛化：状态骨架分解 + 结构类比，经验跨域「举一反三」 |
 | scientist.ts | 10.0 | 科学家心智：贝叶斯最优实验设计（见上） |
 | theorist.ts | 11.0 | 理论心智：层级贝叶斯 + MDL 定律归纳（见上） |
+| anytime-evidence.ts | 12.0 | 任意时刻证据：置信序列 + e-过程 + e-BH FDR（见上） |
+| conformal.ts | 13.0 | 保形预测：分布无关区间 + 风险受控阈值（见上） |
+| quality-diversity.ts | 14.0 | 质量-多样性：MAP-Elites 行为归档（见上） |
+| runtime-verification.ts | 15.0 | 运行时验证：LTLf 规约监视 + 证明携带裁决（见上） |
+| shapley.ts | 16.0 | Shapley 归因：公理化公平分配 + 任意时刻置信区间（见上） |
 
 ### 认知能量共生经济（symbiosis/）
 - **能量账本**（ledger.ts）：认知能量不可伪造，复式记账全局守恒，每笔转账 sha256 链式可审计可回放，基尼系数度量生态健康
@@ -150,7 +164,7 @@ dsh web
 - **多密钥故障转移**：同一厂商存在多个候选密钥时，认证失败（401/403）或配额耗尽（429）会自动轮换到下一个候选密钥重试，并升级为**健康感知路由**——按成功/失败统计选择最优密钥，429 冷却 1 分钟、401/403 冷却 5 分钟，成功后自动恢复；用户可通过 `manage_keys` 工具调整密钥使用顺序（持久化，重启保留），启动日志输出每个模型的密钥来源（不含密钥值），运行时可用 `query_memory keys` 查看各密钥健康状态；
 - 若只需单一厂商，可改用 `patches/domestic-models/` 下按厂商拆分的 patch；重新生成：`pnpm generate:patches`。
 
-完整运行配置项（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主循环 `autonomy` / 宿主融合 `hostFusion`）同样内置于 [cordis.patch.yml](./cordis.patch.yml)，无需改动；共生经济子项位于 `autonomy.symbiosis`（futarchy 表决、能量反哺等，缺省关闭）。
+完整运行配置项（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主循环 `autonomy` / 宿主融合 `hostFusion`）同样内置于 [cordis.patch.yml](./cordis.patch.yml)，无需改动；共生经济子项位于 `autonomy.symbiosis`（futarchy 表决、能量反哺等，缺省关闭）。保证层内核 12.0-16.0 子项同样缺省关闭（零漂移）：`autonomy.anytimeEvidence`（α / 水位线）、`autonomy.conformal`（α / 校准容量 / 阈值风险与置信）、`autonomy.qualityDiversity`（探索率）、`autonomy.runtimeVerification`（附加规约 `specs`）。
 
 ## 工具一览（18 个）
 
@@ -183,7 +197,7 @@ dsh web
 - `manage_autonomy`：`start` / `stop` / `tick` / `kill-switch` / `revive` / `reset-circuit`
 - `query_memory`：`world-model` / `curiosity` / `governance` / `patterns` / `lessons` / `keys` 等
 
-## 离线验证（24 个，零 API Key）
+## 离线验证（29 个，零 API Key）
 
 每个内核与子系统均有离线端到端验证脚本（`node scripts/verify-*.mjs`）：
 
@@ -192,12 +206,15 @@ node scripts/verify-scientist.mjs     # 科学家：EIG 定价 / 预算仲裁 / 
 node scripts/verify-theorist.mjs      # 理论家：定律归纳 / 零样本预测 / 范式转移
 node scripts/verify-symbiosis.mjs     # 共生经济：账本 / 市场 / 三智能体六轮心跳闭环
 node scripts/verify-self-evolution.mjs # 自进化闭环：推荐采纳 / 快路径 / 三对冲机制
+node scripts/verify-anytime-evidence.mjs # 任意时刻证据：CS 时间一致性 / e-过程裁决 / e-BH FDR
+node scripts/verify-shapley.mjs       # Shapley：四公理 / 置信区间 / 协同侦测
 ```
 
 | 分组 | 脚本 |
 |------|------|
 | 双心智 | verify-scientist · verify-theorist |
 | 质变内核 | verify-unified-evidence · verify-resilience-governance · verify-causal-kernel · verify-active-inference · verify-deliberation · verify-metareasoning · verify-abstraction |
+| 保证层内核 12.0-16.0 | verify-anytime-evidence · verify-conformal · verify-quality-diversity · verify-runtime-verification · verify-shapley |
 | 共生经济 | verify-symbiosis · verify-symbiosis-bridge · verify-belief-market · verify-futarchy · verify-energy-feedback · verify-full-agents · verify-observability |
 | 学习与进化 | verify-self-evolution · verify-self-evolution-v2 · verify-knowledge-distillation · verify-policy-evolution · verify-meta-cognition · verify-meta-cognition-v2 · verify-meta-edge · verify-consensus-sync |
 
@@ -230,7 +247,7 @@ node scripts/verify-self-evolution.mjs # 自进化闭环：推荐采纳 / 快路
 ├── cordis.patch.yml              # bundle 配置层（dsh.bundle.patch 指向，全部国产模型零密钥）
 ├── symbiosis-sankey-demo.html    # 认知生态能量流 Sankey 全景（零依赖自包含）
 ├── patches/domestic-models/      # 按厂商拆分的可选 patch（9 厂商 + all-domestic.yml）
-├── scripts/                      # patch 生成器 + 24 个离线验证脚本
+├── scripts/                      # patch 生成器 + 29 个离线验证脚本
 └── src/
     ├── index.ts                  # 插件入口：10 步主链路编排 + 18 个 Tool 注册
     ├── types.ts / errors.ts      # 共享类型层 / 统一错误体系（稳定机器可读 code）
@@ -253,7 +270,7 @@ node scripts/verify-self-evolution.mjs # 自进化闭环：推荐采纳 / 快路
     ├── autonomy-loop.ts          # 自主循环：11 步心跳编排
     ├── host-fusion.ts            # 宿主融合层：全宿主可观测 + 安全治理
     ├── dsh-host.ts               # DSH 宿主集成：LLM 客户端 / 模型目录 / Key 注入
-    ├── core/                     # 质变内核：evidence 3.0 → theorist 11.0 九大内核
+    ├── core/                     # 质变内核：evidence 3.0 → shapley 16.0 十四大内核
     ├── meta/                     # 元认知层：自我建模 + 元认知控制器（双环外环）
     ├── policy/                   # 策略进化器 + 安全沙盒：种群进化 / 金丝雀部署
     ├── symbiosis/                # 认知能量共生经济：账本 / 市场 / 信念市场 / 智能体 / 运行时 / Sankey

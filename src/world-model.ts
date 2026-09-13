@@ -50,6 +50,13 @@ export interface ArrivalPrediction {
   confidence: number;
   /** 趋势方向 */
   trend: 'rising' | 'falling' | 'stable';
+  /**
+   * 13.0：保形区间（分布无关精确覆盖保证，attachConformalCalibrator 后输出）。
+   * 挂载后 lowerBound/upperBound 即保形口径（P(实际 ∈ [lower, upper]) ≥ 1−α，
+   * 精确有限样本保证，零分布假设）；finite=false 表示校准不足——
+   * 区间诚实发散（+∞），而非伪装确定。
+   */
+  conformal?: { lower: number; upper: number; finite: boolean; qhat: number; calibrationN: number; alpha: number };
 }
 
 /** 预测校准记录 */
@@ -104,6 +111,8 @@ export interface WorldModelSummary {
   calibrationError: number;
   /** 5.0：混杂指纹（观测共现 ≠ 因果的证伪现场） */
   confoundedPairs?: Array<{ typeA: string; typeB: string; observationalStrength: number; causalEffect: number; divergence: number }>;
+  /** 13.0：保形校准状态（attachConformalCalibrator 后输出） */
+  conformal?: import('./core/conformal.js').ConformalStatus;
 }
 
 /**
@@ -123,9 +132,19 @@ export class WorldModel {
   private stats = new Map<string, ArrivalStats>();
   private calibrations: CalibrationRecord[] = [];
   /** 待校准的预测（type → 预测值，窗口结束后对账） */
-  private pendingPredictions = new Map<string, { predicted: number; windowEnd: number }>();
+  private pendingPredictions = new Map<
+    string,
+    {
+      predicted: number;
+      windowEnd: number;
+      /** 13.0：发出预测时的保形区间（对账覆盖监测用） */
+      conformalInterval?: { lower: number; upper: number; finite: boolean };
+    }
+  >();
   /** 5.0：因果内核（可选挂载） */
   private causal?: import('./core/causal-kernel.js').CausalKernel;
+  /** 13.0：保形校准引擎（可选挂载） */
+  private conformalEngine?: import('./core/conformal.js').ConformalIntervalEngine;
 
   constructor(config?: Partial<WorldModelConfig>) {
     this.config = { ...DEFAULT_WORLD_MODEL_CONFIG, ...config };
@@ -146,6 +165,23 @@ export class WorldModel {
         kernel.observe(`signal:${corr.typeA}`, `signal:${corr.typeB}`, true, true);
       }
     }
+  }
+
+  /**
+   * 13.0：挂载保形校准引擎（幂等）。
+   *
+   * 挂载后 predictArrivals 的区间从 sqrt(λ) 泊松近似升级为保形区间：
+   * 精确有限样本覆盖 ≥ 1−α，零分布假设（可交换性即可）；每次
+   * settleCalibrations 的残差自动入校准集，覆盖漂移由 e-过程监测
+   * （失准确证 → status().drift.drifting，应重校准）。
+   */
+  attachConformalCalibrator(engine: import('./core/conformal.js').ConformalIntervalEngine): void {
+    this.conformalEngine = engine;
+  }
+
+  /** 13.0：保形校准状态（未挂载返回 undefined） */
+  getConformalStatus(): import('./core/conformal.js').ConformalStatus | undefined {
+    return this.conformalEngine?.status();
   }
 
   /**
@@ -228,17 +264,45 @@ export class WorldModel {
       const spread = Math.sqrt(Math.max(adjusted, 0.5));
       const confidence = this.calibrationConfidence(type);
 
-      predictions.push({
-        type,
-        expectedCount: Number(adjusted.toFixed(2)),
-        lowerBound: Math.max(0, Number((adjusted - spread).toFixed(2))),
-        upperBound: Number((adjusted + spread).toFixed(2)),
-        confidence,
-        trend,
-      });
-
-      // 登记待校准预测
-      this.pendingPredictions.set(type, { predicted: adjusted, windowEnd: now + horizonMs });
+      // 13.0：保形区间升级——泊松 sqrt(λ) 近似是「假装高斯」；
+      // 保形区间给出精确有限样本覆盖保证（≥ 1−α，零分布假设）。
+      // 校准不足时 finite=false（诚实发散），回退泊松近似区间。
+      let prediction: ArrivalPrediction;
+      if (this.conformalEngine) {
+        const interval = this.conformalEngine.interval(adjusted);
+        prediction = {
+          type,
+          expectedCount: Number(adjusted.toFixed(2)),
+          lowerBound: interval.finite ? Number(Math.max(0, interval.lower).toFixed(2)) : Math.max(0, Number((adjusted - spread).toFixed(2))),
+          upperBound: interval.finite ? Number(Math.max(0, interval.upper).toFixed(2)) : Number((adjusted + spread).toFixed(2)),
+          confidence,
+          trend,
+          conformal: {
+            lower: interval.finite ? Number(Math.max(0, interval.lower).toFixed(2)) : Number.POSITIVE_INFINITY,
+            upper: interval.finite ? Number(Math.max(0, interval.upper).toFixed(2)) : Number.POSITIVE_INFINITY,
+            finite: interval.finite,
+            qhat: interval.qhat,
+            calibrationN: interval.calibrationN,
+            alpha: interval.alpha,
+          },
+        };
+        this.pendingPredictions.set(type, {
+          predicted: adjusted,
+          windowEnd: now + horizonMs,
+          conformalInterval: interval.finite ? { lower: interval.lower, upper: interval.upper, finite: true } : undefined,
+        });
+      } else {
+        prediction = {
+          type,
+          expectedCount: Number(adjusted.toFixed(2)),
+          lowerBound: Math.max(0, Number((adjusted - spread).toFixed(2))),
+          upperBound: Number((adjusted + spread).toFixed(2)),
+          confidence,
+          trend,
+        };
+        this.pendingPredictions.set(type, { predicted: adjusted, windowEnd: now + horizonMs });
+      }
+      predictions.push(prediction);
     }
 
     return predictions.sort((a, b) => b.expectedCount - a.expectedCount);
@@ -265,6 +329,15 @@ export class WorldModel {
       };
       this.calibrations.push(record);
       settled.push(record);
+      // 13.0：残差入保形校准集 + 覆盖监测（发出过有限区间才对账覆盖）
+      if (this.conformalEngine) {
+        this.conformalEngine.calibrate(record.error);
+        if (pending.conformalInterval?.finite) {
+          this.conformalEngine.recordCovered(
+            actualCount >= pending.conformalInterval.lower && actualCount <= pending.conformalInterval.upper,
+          );
+        }
+      }
       this.pendingPredictions.delete(type);
     }
     if (this.calibrations.length > 200) this.calibrations.splice(0, this.calibrations.length - 200);
@@ -336,6 +409,8 @@ export class WorldModel {
               divergence: e.divergence,
             }))
         : undefined,
+      // 13.0：保形校准状态（区间保证 + 覆盖漂移监测）
+      conformal: this.conformalEngine ? this.conformalEngine.status() : undefined,
     };
   }
 

@@ -65,6 +65,7 @@ import { RationalMetareasoner } from './core/metareasoning.js';
 import { AbstractionEngine } from './core/abstraction.js';
 import { ScientistMind } from './core/scientist.js';
 import { TheoristEngine } from './core/theorist.js';
+import { ConformalIntervalEngine } from './core/conformal.js';
 import { CuriosityEngine, type ExplorationProposal } from './curiosity-engine.js';
 import { SafetyGovernor } from './safety-governor.js';
 import { SymbiosisBridge } from './symbiosis/bridge.js';
@@ -348,6 +349,59 @@ export interface SchedulerConfig {
       minMembers?: number;
       /** 零样本预测的臂证据门槛（缺省 1） */
       zeroShotMaxArmSamples?: number;
+    };
+    /**
+     * 12.0：任意时刻证据配置（结论永不夸大的统计）。
+     * enabled 时进化适应度升级为置信序列下界（流式统计永不夸大），
+     * e-BH FDR 控制淘汰「证明确实低劣」的基因组（冤案率有数学上限），
+     * 元认知挂载 KPI 保证层（退化判定偷看免疫）。缺省关闭（零漂移）。
+     */
+    anytimeEvidence?: {
+      enabled?: boolean;
+      /** 时间一致覆盖率（1−alpha，缺省 0.05 → 95%） */
+      alpha?: number;
+      /** 裁决水位线（缺省 0.5） */
+      reference?: number;
+    };
+    /**
+     * 13.0：保形校准配置（预测与阈值的分布无关保证）。
+     * enabled 时世界模型预测区间获得精确有限样本覆盖保证
+     * （P(实际 ∈ 区间) ≥ 1−α，零分布假设），反思引擎阈值自校准
+     * 升级为风险受控选择（P(未来重试率 ≤ targetRisk) ≥ confidence）。
+     * 缺省关闭（区间回退既有泊松近似口径）。
+     */
+    conformal?: {
+      enabled?: boolean;
+      /** 名义误覆盖率 α（覆盖 ≥ 1−α，缺省 0.1） */
+      alpha?: number;
+      /** 校准集容量上限（缺省 200） */
+      maxCalibration?: number;
+      /** 阈值选择的目标重试风险（缺省 0.1） */
+      thresholdTargetRisk?: number;
+      /** 阈值选择的置信水平（缺省 0.95） */
+      thresholdConfidence?: number;
+    };
+    /**
+     * 14.0：质量-多样性进化配置（行为流派不灭）。
+     * enabled 时策略探索从纯 UCB 升级为 MAP-Elites 前沿 niche
+     * 均匀采样——敢为/节俭/警觉各行为流派获得等量试验预算，
+     * 多样性坍缩被结构性阻断。缺省关闭（零漂移）。
+     */
+    qualityDiversity?: {
+      enabled?: boolean;
+      /** 探索概率（selectGenome 从归档采样的概率，缺省 0.25） */
+      exploreRate?: number;
+    };
+    /**
+     * 15.0：运行时验证配置（安全规约形式化）。
+     * enabled 时治理器迁移事件流自动喂入 LTLf 规约监视器；
+     * critical 违规（如失败风暴）自动触发 Kill Switch——
+     * 形式裁决获得治理的牙齿。缺省关闭（零漂移——不挂载即不监视）。
+     */
+    runtimeVerification?: {
+      enabled?: boolean;
+      /** 附加安全规约（在缺省规约集之上注册，id 幂等） */
+      specs?: import('./core/runtime-verification.js').SafetySpec[];
     };
     /** 目标分解器注入（测试离线模拟） */
     decomposer?: import('./goal-engine.js').GoalDecomposer;
@@ -1264,6 +1318,50 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     scientistMind?.attachTheorist(theoristEngine);
   }
 
+  // ── 12.0 任意时刻证据内核：结论永不夸大的统计 ──
+  // 质变基座：固定样本统计在「边看边停」场景（进化淘汰、退化判定）
+  // 会累积假阳性（偷看悖论）。启用后：进化适应度改用任意时刻有效
+  // 置信序列下界，基因组淘汰走 e-BH FDR 控制（冤案率有数学上限）；
+  // 元认知 KPI 保证层以 e-过程确证退化（任意时刻读取均合法）。
+  // 缺省关闭（零漂移）；启用后「随时下结论且结论永不夸大」。
+  if (cfg.autonomy?.anytimeEvidence?.enabled === true) {
+    strategyEvolution.attachAnytimeEvidence({
+      alpha: cfg.autonomy.anytimeEvidence.alpha,
+      reference: cfg.autonomy.anytimeEvidence.reference,
+    });
+    metaCognition.attachAnytimeGuards({ alpha: cfg.autonomy.anytimeEvidence.alpha });
+  }
+
+  // ── 13.0 保形校准内核：预测与阈值的分布无关保证 ──
+  // 质变基座：世界模型的 sqrt(λ) 泊松区间没有覆盖率保证；反思引擎
+  // ±0.02 步进阈值没有风险保证。启用后：预测区间升级为分裂保形区间
+  // （精确有限样本覆盖 ≥ 1−α，零分布假设），阈值自校准升级为风险
+  // 受控选择（P(未来重试率 ≤ targetRisk) ≥ confidence——重试风暴
+  // 在数学上被封顶）。缺省关闭（回退既有口径，零漂移）。
+  const conformalCfg = cfg.autonomy?.conformal;
+  if (conformalCfg?.enabled === true) {
+    const conformalEngine = new ConformalIntervalEngine({
+      alpha: conformalCfg.alpha,
+      maxCalibration: conformalCfg.maxCalibration,
+    });
+    worldModel.attachConformalCalibrator(conformalEngine);
+    reflectionEngine.attachRiskController({
+      targetRisk: conformalCfg.thresholdTargetRisk,
+      confidence: conformalCfg.thresholdConfidence,
+    });
+  }
+
+  // ── 14.0 质量-多样性内核：行为流派不灭 ──
+  // 质变基座：纯 UCB 探索必然坍缩到单一最优流派（局部最优陷阱）。
+  // 启用后 selectGenome 以 exploreRate 概率从 MAP-Elites 行为归档
+  // 均匀采样——敢为/节俭/警觉各流派获得等量试验预算，演化报告
+  // 携带 coverage/QD-score 多样性审计。缺省关闭（零漂移）。
+  if (cfg.autonomy?.qualityDiversity?.enabled === true) {
+    strategyEvolution.attachQualityDiversity({
+      exploreRate: cfg.autonomy.qualityDiversity.exploreRate,
+    });
+  }
+
   if (activeInferenceEnabled) {
     modelScheduler.attachFreeEnergy(freeEnergyEngine);
     modelScheduler.updateConfig({
@@ -1273,6 +1371,19 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
   }
 
   const governor = new SafetyGovernor(cfg.autonomy?.governor);
+
+  // ── 15.0 运行时验证内核：安全规约形式化 ──
+  // 质变基座：治理器的标量门控表达不了时序性质（「熔断开后 10 分钟
+  // 必须恢复」「失败风暴 60 秒 ≤ 5 次」）。启用后治理器迁移事件流
+  // 自动喂入 LTLf 规约监视器（确定性可重放），critical 违规自动触发
+  // Kill Switch——形式裁决获得治理的牙齿，违规报告携带见证轨迹。
+  // 缺省关闭（零漂移——不挂载即不监视）。
+  if (cfg.autonomy?.runtimeVerification?.enabled === true) {
+    const verifier = governor.attachRuntimeVerifier();
+    for (const spec of cfg.autonomy.runtimeVerification.specs ?? []) {
+      verifier.register(spec);
+    }
+  }
 
   /** KPI 采集器：从真实引擎状态聚合 KPI 快照 */
   const collectKpi = () => {
@@ -2692,6 +2803,16 @@ export * from './core/abstraction.js';
 export * from './core/scientist.js';
 // ── 11.0 理论内核：从数据到定律（层级归纳 + MDL 压缩 + 零样本 + 范式转移）──
 export * from './core/theorist.js';
+// ── 12.0 任意时刻证据内核：置信序列 + e-过程 + e-BH（结论永不夸大）──
+export * from './core/anytime-evidence.js';
+// ── 13.0 保形校准内核：分裂保形区间 + 覆盖漂移 e-监测 + 风险受控阈值 ──
+export * from './core/conformal.js';
+// ── 14.0 质量-多样性内核：MAP-Elites 行为归档（多样性坍缩结构性阻断）──
+export * from './core/quality-diversity.js';
+// ── 15.0 运行时验证内核：LTLf 安全规约监视器（证明携带裁决）──
+export * from './core/runtime-verification.js';
+// ── 16.0 Shapley 归因内核：公理化公平分配 + 任意时刻有效置信区间 ──
+export * from './core/shapley.js';
 // 4.0 弹性内核：熔断器 / 指数退避 / 错误分型（可靠执行共享组件）
 export {
   CircuitBreaker,

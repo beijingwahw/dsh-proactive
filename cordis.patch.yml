@@ -219,6 +219,30 @@
         autonomy:
           enabled: true
           heartbeatMs: 30000
+          # 12.0 任意时刻证据：进化适应度置信序列下界 + e-BH FDR 淘汰 +
+          # 元认知 KPI 保证层（退化判定偷看免疫）。缺省关闭（零漂移）
+          anytimeEvidence:
+            enabled: false
+            alpha: 0.05
+            reference: 0.5
+          # 13.0 保形校准：预测区间精确覆盖保证 + 反思阈值风险受控选择。
+          # 缺省关闭（回退既有泊松近似/步进校准口径）
+          conformal:
+            enabled: false
+            alpha: 0.1
+            maxCalibration: 200
+            thresholdTargetRisk: 0.1
+            thresholdConfidence: 0.95
+          # 14.0 质量-多样性进化：MAP-Elites 前沿 niche 均匀采样探索
+          # （敢为/节俭/警觉流派等量预算，多样性坍缩被阻断）。缺省关闭
+          qualityDiversity:
+            enabled: false
+            exploreRate: 0.25
+          # 15.0 运行时验证：治理迁移事件流喂入 LTLf 规约监视器；
+          # critical 违规自动触发 Kill Switch。缺省关闭（不挂载即不监视）
+          runtimeVerification:
+            enabled: false
+            specs: []
         # 宿主融合层：全宿主工具可观测 + 安全治理；关闭后 isActive()=false
         hostFusion:
           enabled: true

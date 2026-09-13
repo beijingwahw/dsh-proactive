@@ -25,6 +25,7 @@ import type { NodeResult, PlanExecutionResult, ExecutionPlan } from './types.js'
 import type { Signal } from './sentinel.js';
 import { decayFactor } from './core/evidence.js';
 import type { CausalKernel } from './core/causal-kernel.js';
+import { selectRiskControlledThreshold, type RiskControlResult } from './core/conformal.js';
 
 /** 评审模型签名（可注入） */
 export type JudgeModel = (params: {
@@ -108,6 +109,8 @@ export interface TrendSummary {
       trending: 'rising' | 'falling' | 'stable';
     }
   >;
+  /** 13.0：当前阈值的风险依据（挂载风险控制器后输出） */
+  basis?: RiskControlResult;
 }
 
 /** 反思引擎配置 */
@@ -173,10 +176,37 @@ export class ReflectionEngine {
   private lessonCounter = 0;
   /** 5.0：因果内核（挂载后失败反思自动触发反事实分析） */
   private causal?: CausalKernel;
+  /** 13.0：风险受控阈值选择配置（挂载后 ±0.02 步进启发式退役） */
+  private riskControl?: { targetRisk: number; confidence: number; gridSteps: number };
+  /** 13.0：最近一次阈值选择的风险依据（可观测/可审计） */
+  private thresholdBasis?: RiskControlResult;
 
   constructor(config?: Partial<ReflectionEngineConfig>) {
     this.config = { ...DEFAULT_REFLECTION_CONFIG, ...config };
     this.currentThreshold = this.config.qualityThreshold;
+  }
+
+  /**
+   * 13.0：挂载风险受控阈值选择器（幂等）。
+   *
+   * 质变点：阈值自校准从「±0.02 步进启发式」（重试率全凭运气）升级为
+   * 分布无关的**带保证选择**——每轮从历史质量分布中选出「未来重试率
+   * ≤ targetRisk」以 confidence 置信成立的最严格质量门槛：
+   *   P(未来重试率 ≤ targetRisk) ≥ confidence
+   * 质量普遍优秀 → 风险余量大 → 门槛自动收紧；能力不足 → 门槛自动
+   * 让位，但重试率上界永不突破——重试风暴在数学上被封顶。
+   */
+  attachRiskController(options?: { targetRisk?: number; confidence?: number; gridSteps?: number }): void {
+    this.riskControl = {
+      targetRisk: options?.targetRisk ?? 0.1,
+      confidence: options?.confidence ?? 0.95,
+      gridSteps: options?.gridSteps ?? 18,
+    };
+  }
+
+  /** 13.0：最近一次阈值选择的风险依据（未挂载或未决出时 undefined） */
+  getThresholdBasis(): RiskControlResult | undefined {
+    return this.thresholdBasis;
   }
 
   /** 设置告警回调 */
@@ -383,7 +413,11 @@ export class ReflectionEngine {
 
     const history = this.qualityHistory.get(taskType) ?? [];
     history.push({ quality, at: Date.now() });
-    if (history.length > 50) history.shift();
+    // 13.0：风险受控路径需要样本深度（经验伯恩斯坦上界以 ~7ln(1/β)/(3n)
+    // 收敛——95% 置信 × 19 候选网格认证 ≤15% 风险约需 94+ 样本），
+    // 挂载后扩容至 200；未挂载维持 4.0 的 50 条轻量口径（零漂移）
+    const cap = this.riskControl ? 200 : 50;
+    if (history.length > cap) history.shift();
     this.qualityHistory.set(taskType, history);
 
     this.checkDeclineAlert(taskType, history);
@@ -456,7 +490,12 @@ export class ReflectionEngine {
         trending: this.trendDirection(qualities),
       };
     }
-    return { threshold: this.currentThreshold, windowSize: this.trendWindow.length, byType: summary };
+    return {
+      threshold: this.currentThreshold,
+      windowSize: this.trendWindow.length,
+      byType: summary,
+      ...(this.thresholdBasis ? { basis: this.thresholdBasis } : {}),
+    };
   }
 
   // ─────────────────────────── 内部实现 ───────────────────────────
@@ -493,14 +532,45 @@ export class ReflectionEngine {
   }
 
   /**
-   * 阈值自校准（4.0 证据化：时间衰减均值）
+   * 阈值自校准
    *
-   * 校准基准从裸算术均值升级为半衰期 30 天的时间加权均值——旧的
-   * 质量分布（模型更强/更弱时期）自然让位，阈值始终锚定「当前能力」：
-   * 分布整体偏高 → 收紧；偏低 → 放宽。
+   * 13.0 质变（风险受控选择）：挂载 attachRiskController 后，校准从
+   * 「时间衰减均值 ±0.02 步进」升级为分布无关的带保证选择——
+   * 对候选网格逐一计算「质量 < λ 即重试」的风险上界（经验伯恩斯坦 +
+   * Bonferroni 分摊），取上界 ≤ targetRisk 的最严格 λ：
+   *   P(未来重试率 ≤ targetRisk) ≥ confidence
+   * 重试率第一次被钉在数学上限之内；无合格候选（能力全面不足）时
+   * 保持现阈值不动（宁可不调，不可越界）。
+   *
+   * 未挂载时维持 4.0 行为（半衰期 30 天时间加权均值 ±0.02 步进）。
    */
   private calibrateThreshold(taskType: string, history: Array<{ quality: number; at: number }>): void {
     if (history.length < this.config.calibrationMinSamples) return;
+    const [min, max] = this.config.thresholdRange;
+
+    // 13.0：风险受控路径（带数学保证）
+    if (this.riskControl) {
+      const grid: number[] = [];
+      for (let i = 0; i <= this.riskControl.gridSteps; i += 1) {
+        grid.push(Number((min + ((max - min) * i) / this.riskControl.gridSteps).toFixed(4)));
+      }
+      const result = selectRiskControlledThreshold(
+        history.map((h) => h.quality),
+        grid,
+        { targetRisk: this.riskControl.targetRisk, confidence: this.riskControl.confidence },
+      );
+      if (result) {
+        this.currentThreshold = result.threshold; // 网格值天然落在 thresholdRange 内
+        this.thresholdBasis = result;
+      } else {
+        // 连最低门槛的风险上界都超 targetRisk：证据不足以安全收紧，
+        // 保持现阈值（诚实不动优于激进越界）
+        this.thresholdBasis = undefined;
+      }
+      return;
+    }
+
+    // 4.0 回退路径：时间衰减均值 ±0.02 步进（未挂载时的既有行为）
     const now = Date.now();
     let weighted = 0;
     let totalWeight = 0;
@@ -510,7 +580,6 @@ export class ReflectionEngine {
       totalWeight += weight;
     }
     const avg = totalWeight > 0 ? weighted / totalWeight : 0.5;
-    const [min, max] = this.config.thresholdRange;
 
     if (avg > this.currentThreshold + 0.15) {
       // 质量普遍优秀：收紧阈值追求卓越

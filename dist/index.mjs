@@ -9505,6 +9505,565 @@ function fingerprintOf(signal) {
 	return crypto.createHash("sha256").update(`${signal.type}:${normalized}`).digest("hex").slice(0, 16);
 }
 //#endregion
+//#region src/core/anytime-evidence.ts
+/**
+* 缝合置信序列半径（纯函数，epoch k 上的联合界）。
+*
+* 数学（对 n ≥ 1，k = ⌊log2 n⌋，β_k = α·2^{−(k+2)} 每条界各分一半）：
+* - Hoeffding：|μ̂−μ| ≤ sqrt(ln(2/β_k) / (2n))（X∈[0,1]）
+* - 经验伯恩斯坦（Maurer–Pontil）：|μ̂−μ| ≤ sqrt(2σ̂²·ln(2/β_k)/n)
+*   + 7ln(2/β_k)/(3(n−1))，σ̂² = 样本方差
+* - 取二者最小（每条各用 β_k，分期 × 两条界联合求和恰为 α）
+*
+* 任何时刻读取均合法：Σ_k 2β_k = α。
+*/
+function stitchedCsRadius(n, sampleVariance, alpha) {
+	if (n <= 0) return Infinity;
+	const beta = alpha * Math.pow(2, -(Math.floor(Math.log2(n)) + 2));
+	const logTerm = Math.log(2 / beta);
+	const hoeffding = Math.sqrt(logTerm / (2 * n));
+	if (n < 2) return hoeffding;
+	const eb = Math.sqrt(2 * Math.min(.25, Math.max(0, sampleVariance)) * logTerm / n) + 7 * logTerm / (3 * (n - 1));
+	return Math.min(hoeffding, eb);
+}
+/**
+* 固定样本单侧上界（13.0 风险控制器复用；β 直接给定，不做分期）。
+*
+* 经验伯恩斯坦上界：μ ≤ μ̂ + sqrt(2σ̂²·ln(1/β)/n) + 7ln(1/β)/(3(n−1))。
+*/
+function fixedSampleUpperBound(n, mean, sampleVariance, beta) {
+	if (n <= 0) return 1;
+	const logTerm = Math.log(1 / beta);
+	if (n < 2) return Math.min(1, mean + Math.sqrt(logTerm / (2 * n)));
+	const eb = Math.sqrt(2 * Math.min(.25, Math.max(0, sampleVariance)) * logTerm / n) + 7 * logTerm / (3 * (n - 1));
+	const hoeffding = Math.sqrt(logTerm / (2 * n));
+	return Math.min(1, mean + Math.min(eb, hoeffding));
+}
+/**
+* 流式经验伯恩斯坦置信序列
+*
+* observe(x∈[0,1]) 单遍累积（均值 + 方差 Welford 在线算法），
+* bounds() 在任意时刻返回时间一致置信区间。
+*/
+var EmpiricalBernsteinSequence = class {
+	alpha;
+	n = 0;
+	mean = 0;
+	m2 = 0;
+	constructor(alpha) {
+		this.alpha = alpha;
+	}
+	/** 观测一次 x ∈ [0,1]（连续收益按值观测，布尔按 0/1 观测） */
+	observe(x) {
+		const v = Math.max(0, Math.min(1, x));
+		this.n += 1;
+		const delta = v - this.mean;
+		this.mean += delta / this.n;
+		this.m2 += delta * (v - this.mean);
+	}
+	/** 当前样本量 */
+	get count() {
+		return this.n;
+	}
+	/** 当前均值 */
+	get sampleMean() {
+		return this.mean;
+	}
+	/** 样本方差（n≥2；n=1 视为 0） */
+	get sampleVariance() {
+		return this.n >= 2 ? this.m2 / (this.n - 1) : 0;
+	}
+	/** 任意时刻读取的时间一致置信区间 */
+	bounds() {
+		const radius = this.n > 0 ? stitchedCsRadius(this.n, this.sampleVariance, this.alpha) : Infinity;
+		return {
+			n: this.n,
+			mean: round(this.mean),
+			lower: round(Math.max(0, this.mean - radius)),
+			upper: round(Math.min(1, this.mean + radius)),
+			radius: round(radius),
+			epoch: this.n > 0 ? Math.floor(Math.log2(this.n)) : -1
+		};
+	}
+	/** 假设值 μ 是否落在当前置信序列内（任意停止时刻合法） */
+	contains(mu) {
+		if (this.n === 0) return true;
+		const b = this.bounds();
+		return mu >= b.lower - 1e-9 && mu <= b.upper + 1e-9;
+	}
+};
+/**
+* 单侧 e-过程（资本过程）
+*
+* 检验 H0: μ ≤ μ0（side='at-most'，λ ≥ 0）或 H0: μ ≥ μ0
+* （side='at-least'，λ ≤ 0）：
+*   e_t = Π_{i≤t} (1 + λ_i (X_i − μ0))
+* λ_i 可预测（只依赖 i−1 前的 μ̂）且 |λ_i| ≤ 0.5 —— 对任意
+* μ0∈(0,1)、x∈[0,1] 保持因子严格正（≥ 0.5）。零假设下
+* E[1+λ(X−μ0)] ≤ 1 → 非负上鞅 → Ville：P(∃t: e_t ≥ 1/α) ≤ α。
+*/
+var EProcess = class {
+	mu0;
+	side;
+	capital = 1;
+	n = 0;
+	mean = 0;
+	/** 历史峰值（审计：证据曾到达多强） */
+	peak = 1;
+	constructor(mu0, side) {
+		this.mu0 = mu0;
+		this.side = side;
+	}
+	/** 观测一次 x ∈ [0,1]；返回更新后的 e-值 */
+	observe(x) {
+		const v = Math.max(0, Math.min(1, x));
+		const edge = (this.mean - this.mu0) / 4;
+		const factor = 1 + (this.side === "at-most" ? clamp(lambdaAtMost(edge), 0, .5) : clamp(lambdaAtLeast(edge), -.5, 0)) * (v - this.mu0);
+		this.capital *= Math.max(.5, factor);
+		this.peak = Math.max(this.peak, this.capital);
+		this.n += 1;
+		this.mean += (v - this.mean) / this.n;
+		return this.capital;
+	}
+	/** 当前 e-值（≥ 0；零假设下任意时刻 ≤ 1/α 的概率 ≤ α） */
+	get eValue() {
+		return this.capital;
+	}
+	/** 历史峰值 */
+	get peakValue() {
+		return this.peak;
+	}
+	/** 样本量 */
+	get count() {
+		return this.n;
+	}
+	/** 是否已在水平 α 下拒绝零假设（e ≥ 1/α，任意停止时刻合法） */
+	rejectedAt(alpha) {
+		return this.capital >= 1 / alpha;
+	}
+	/** 任意时刻有效 p-值：p_t = min(1, 1/e_t)（超均匀） */
+	anytimePValue() {
+		return Math.min(1, 1 / this.capital);
+	}
+};
+function lambdaAtMost(edge) {
+	return Math.max(0, edge);
+}
+function lambdaAtLeast(edge) {
+	return Math.min(0, edge);
+}
+/**
+* e-Benjamini-Hochberg（Wang & Ramdas 2022）：任意依赖下 FDR ≤ fdr。
+*
+* 算法：e 值降序 e_(1) ≥ … ≥ e_(m)；
+*   k* = max{ k : e_(k) ≥ m/(k·fdr) }；
+*   拒绝所有 e ≥ m/(k*·fdr) 的对象（k*=0 时不拒绝）。
+*
+* 用途：并行淘汰「证明确实低于水位线」的策略/模型——冤案率（FDR）
+* 有数学上限，与检验数量、依赖结构无关。
+*/
+function eBenjaminiHochberg(entries, fdr) {
+	const m = entries.length;
+	if (m === 0 || fdr <= 0 || fdr > 1) return [];
+	const sorted = [...entries].sort((a, b) => b.eValue - a.eValue);
+	let kStar = 0;
+	for (let k = 1; k <= m; k += 1) if (sorted[k - 1].eValue >= m / (k * fdr)) kStar = k;
+	if (kStar === 0) return [];
+	const threshold = m / (kStar * fdr);
+	return entries.filter((e) => e.eValue >= threshold).map((e) => e.id);
+}
+const DEFAULT_ANYTIME_EVIDENCE_CONFIG = {
+	alpha: .05,
+	reference: .5
+};
+/**
+* 任意时刻有效证据流（置信序列 + 双侧 e-过程 + 裁决）
+*
+* 一次 observe 同时驱动三台机器：
+* - 置信序列：值域估计（任意时刻读取）
+* - e↑：检验「μ ≤ μ0」（确证高于水位线）
+* - e↓：检验「μ ≥ μ0」（确证低于水位线）
+* verdict 在任一方向确证时给出，否则 undecided——系统第一次拥有
+* 「随时下结论且结论永不夸大」的能力。
+*/
+var AnytimeEvidenceStream = class {
+	config;
+	cs;
+	eUp;
+	eDown;
+	constructor(config) {
+		this.config = {
+			...DEFAULT_ANYTIME_EVIDENCE_CONFIG,
+			...config
+		};
+		this.cs = new EmpiricalBernsteinSequence(this.config.alpha);
+		this.eUp = new EProcess(this.config.reference, "at-most");
+		this.eDown = new EProcess(this.config.reference, "at-least");
+	}
+	/** 参考水位线 */
+	get reference() {
+		return this.config.reference;
+	}
+	/** 观测一次 x ∈ [0,1]（连续收益或 0/1 布尔） */
+	observe(x) {
+		this.cs.observe(x);
+		this.eUp.observe(x);
+		this.eDown.observe(x);
+		return this.view();
+	}
+	/** 当前读取视图（纯读取，不改变状态） */
+	view() {
+		const threshold = 1 / this.config.alpha;
+		const eAbove = this.eUp.eValue;
+		const eBelow = this.eDown.eValue;
+		const verdict = eAbove >= threshold ? "above-reference" : eBelow >= threshold ? "below-reference" : "undecided";
+		return {
+			n: this.cs.count,
+			cs: this.cs.bounds(),
+			eAbove: round(eAbove),
+			eBelow: round(eBelow),
+			verdict,
+			anytimeP: round(Math.min(1, 1 / Math.max(eAbove, eBelow)))
+		};
+	}
+};
+/**
+* 任意时刻证据登记表
+*
+* 管理一组并行对象（策略基因组 / 模型 / 密钥）的证据流：
+* - observe(id, x)：向对象 id 的流喂证据（流惰性创建）
+* - verdicts()：全部流的当前裁决
+* - eliminate(fdr)：对「确证低于水位线」的对象做 e-BH FDR 控制淘汰
+*
+* 淘汰语义：只淘汰 e-值确证的对象；FDR ≤ fdr 在任意依赖下成立——
+* 并行淘汰的冤案率第一次有了数学上限。
+*/
+var AnytimeEvidenceRegistry = class {
+	config;
+	streams = /* @__PURE__ */ new Map();
+	confirmedOnce = /* @__PURE__ */ new Set();
+	totalEliminations = 0;
+	fdrLevel = .1;
+	constructor(config) {
+		this.config = {
+			...DEFAULT_ANYTIME_EVIDENCE_CONFIG,
+			...config
+		};
+	}
+	/** 喂证据（流按需创建）；返回该对象当前视图 */
+	observe(id, x) {
+		let stream = this.streams.get(id);
+		if (!stream) {
+			stream = new AnytimeEvidenceStream(this.config);
+			this.streams.set(id, stream);
+		}
+		const view = stream.observe(x);
+		if (view.verdict !== "undecided") this.confirmedOnce.add(id);
+		return view;
+	}
+	/** 对象当前视图（未登记返回 undefined） */
+	viewOf(id) {
+		return this.streams.get(id)?.view();
+	}
+	/** 释放对象（淘汰/注销后清理流） */
+	forget(id) {
+		this.streams.delete(id);
+		this.confirmedOnce.delete(id);
+	}
+	/**
+	* e-BH FDR 控制淘汰：返回被确证低于水位线（且通过多重校正）的对象。
+	*
+	* 只对 e↓ ≥ 1/α 的候选进入 e-BH；淘汰即 forget（调用方负责从其
+	* 业务结构中移除对象）。零候选 → 零淘汰（诚实的不确定）。
+	*/
+	eliminate(fdr = .1) {
+		this.fdrLevel = fdr;
+		const threshold = 1 / this.config.alpha;
+		const candidates = [];
+		for (const [id, stream] of this.streams) {
+			const view = stream.view();
+			if (view.eBelow >= threshold) candidates.push({
+				id,
+				eValue: view.eBelow
+			});
+		}
+		const rejected = eBenjaminiHochberg(candidates, fdr);
+		for (const id of rejected) this.forget(id);
+		this.totalEliminations += rejected.length;
+		return rejected;
+	}
+	/** 登记表报告 */
+	report() {
+		let above = 0;
+		let below = 0;
+		let undecided = 0;
+		let strongest = 0;
+		for (const stream of this.streams.values()) {
+			const v = stream.view();
+			if (v.verdict === "above-reference") above += 1;
+			else if (v.verdict === "below-reference") below += 1;
+			else undecided += 1;
+			strongest = Math.max(strongest, v.eAbove, v.eBelow);
+		}
+		const interpretation = this.streams.size === 0 ? "证据登记表为空：流式统计待命（observe 喂入第一条证据）" : below > 0 ? `${below} 个对象被任意时刻有效证据确证低于水位线 ${this.config.reference}（FDR ≤ ${this.fdrLevel} 口径可淘汰）` : undecided === this.streams.size ? `${this.streams.size} 个流尚无确证（诚实的不确定：e-值未达 ${round(1 / this.config.alpha)}）` : `${above} 个对象确证高于水位线，其余待证`;
+		return {
+			streams: this.streams.size,
+			verdicts: {
+				above,
+				below,
+				undecided
+			},
+			totalConfirmations: this.confirmedOnce.size,
+			totalEliminations: this.totalEliminations,
+			strongestEvidence: round(strongest),
+			interpretation
+		};
+	}
+};
+function clamp(x, lo, hi) {
+	return Math.min(hi, Math.max(lo, x));
+}
+/** 六位小数圆整（13.0/16.0 内核复用的展示口径） */
+function round(x) {
+	return Number(x.toFixed(6));
+}
+//#endregion
+//#region src/core/conformal.ts
+/**
+* conformal.ts — 保形校准内核（项目 13.0「预测的不确定性有了保证」质变基座）
+*
+* 升级前的根本局限（世界模型与质量反思的共性天花板）：
+* - 世界模型的预测区间是 sqrt(λ) 泊松近似——**没有覆盖率保证**：
+*   名义 95% 的区间实际覆盖多少，无人知晓（分布偏斜/过散时系统性失准）；
+* - 反思引擎的质量阈值 ±0.02 步进自校准——**没有风险保证**：重试率
+*   会冲到多少全凭运气，重试风暴与漏放低质量交替发生；
+* - 校准失效无法侦测：模型漂移后旧区间继续输出，直到下游连环失误
+*   才间接暴露——预测系统对「自己已经不可信」毫无察觉。
+*
+* 本内核引入保形预测与分布无关风险控制
+* （Vovk; Angelopoulos & Bates; Bates et al. RCPS）：
+*
+* 1. **分裂保形区间（split conformal）**：校准残差 |y−ŷ| 的
+*    ⌈(n+1)(1−α)⌉ 次序统计量为半径 q̂：
+*      P(y ∈ [ŷ−q̂, ŷ+q̂]) ≥ 1−α
+*    **精确有限样本保证，零分布假设**——只需校准集与新样本可交换。
+*    样本不足时区间诚实发散（finite: false），不伪装确定。
+*
+* 2. **覆盖漂移 e-过程监测（建在 12.0 之上）**：被覆盖指示
+*    1{covered} 在校准良好下条件均值 ≥ 1−α → 资本过程
+*    Π(1 + λ(1{covered} − (1−α)))（λ ≤ 0 可预测）是非负上鞅；
+*    e ≥ 1/δ → 以水平 δ 确证**区间正在失准**（欠覆盖），触发重校准。
+*    预测系统第一次拥有「自我怀疑」的合法检验。
+*
+* 3. **风险受控阈值选择（RCPS 思想 + 12.0 固定样本界）**：对候选
+*    阈值网格逐一计算风险上界（经验伯恩斯坦，Bonferroni 分摊置信度），
+*    取风险上界 ≤ 目标 α 的最激进阈值：
+*      P(未来风险 ≤ α) ≥ 1−δ
+*    反思引擎的重试率第一次被钉在数学上限之内。
+*
+* 与 12.0 的关系：12.0 保证「结论」永不夸大，本内核保证「预测与
+* 阈值」永不越界——二者合成预测-决策全链路的分布无关保证。
+* 与 3-11.0 的关系：世界模型的 MAE 校准（经验性的）继续服务趋势
+* 置信度；保形区间作为并行旁路叠加（不替换既有字段语义）。
+*/
+/**
+* 保形分位数（纯函数）：校准分数的 ⌈(n+1)(1−α)⌉ 次序统计量。
+*
+* 有限样本精确覆盖（可交换性下）：P(新样本分数 ≤ q̂) ≥ 1−α。
+* 秩超出 n（校准集太小撑不起该置信度）→ 返回 undefined（诚实发散）。
+*/
+function conformalQuantile(scores, alpha) {
+	const n = scores.length;
+	if (n === 0) return void 0;
+	const rank = Math.ceil((n + 1) * (1 - alpha));
+	if (rank > n) return void 0;
+	return [...scores].sort((a, b) => a - b)[rank - 1];
+}
+/**
+* 覆盖漂移 e-过程监测器（12.0 复用）
+*
+* 语义：校准良好的区间在每个时刻的条件覆盖率 ≥ 1−α。资本过程
+* e_t = Π(1 + λ_i(C_i − (1−α)))，λ_i ≤ 0 可预测，在「覆盖率达标」
+* 零假设下是非负上鞅（Ville：P(∃t: e ≥ 1/δ) ≤ δ）。连续欠覆盖
+* 会让资本指数上升 → e ≥ 1/δ 确证漂移 → 建议重校准。
+*/
+var CoverageDriftMonitor = class {
+	alpha;
+	delta;
+	capital = 1;
+	n = 0;
+	coverageEma;
+	constructor(alpha, delta) {
+		this.alpha = alpha;
+		this.delta = delta;
+	}
+	/** 观测一次预测是否覆盖真值 */
+	observe(covered) {
+		const target = 1 - this.alpha;
+		const indicator = covered ? 1 : 0;
+		const observed = this.coverageEma ?? target;
+		const lambda = Math.max(-.5, Math.min(0, (observed - target) / 4));
+		this.capital *= Math.max(.5, 1 + lambda * (indicator - target));
+		this.n += 1;
+		this.coverageEma = this.coverageEma === void 0 ? indicator : .9 * this.coverageEma + .1 * indicator;
+		return this.view();
+	}
+	/** 当前视图 */
+	view() {
+		return {
+			eValue: round(this.capital),
+			drifting: this.capital >= 1 / this.delta,
+			empiricalCoverage: round(this.coverageEma ?? 0),
+			targetCoverage: round(1 - this.alpha),
+			n: this.n
+		};
+	}
+	/** 重置（重校准后重启监测） */
+	reset() {
+		this.capital = 1;
+		this.n = 0;
+		this.coverageEma = void 0;
+	}
+};
+const DEFAULT_CONFORMAL_CONFIG = {
+	alpha: .1,
+	maxCalibration: 200,
+	driftDelta: .01
+};
+/**
+* 保形区间引擎
+*
+* 数据流：
+*   预测前：interval(pointForecast) → 带 1−α 精确覆盖保证的区间
+*   真值到达：calibrate(|y − ŷ|) 入校准集 + recordCovered(覆盖?) 喂漂移监测
+*   漂移确证：drifting=true → 调用方重校准（resetDrift 重启监测）
+*/
+var ConformalIntervalEngine = class {
+	config;
+	calibration = [];
+	monitor;
+	emitted = 0;
+	coveredCount = 0;
+	constructor(config) {
+		this.config = {
+			...DEFAULT_CONFORMAL_CONFIG,
+			...config
+		};
+		this.monitor = new CoverageDriftMonitor(this.config.alpha, this.config.driftDelta);
+	}
+	/** 名义误覆盖率 */
+	get alpha() {
+		return this.config.alpha;
+	}
+	/** 校准样本量 */
+	get calibrationSize() {
+		return this.calibration.length;
+	}
+	/** 当前保形半径（校准不足时 undefined） */
+	get qhat() {
+		return conformalQuantile(this.calibration, this.config.alpha);
+	}
+	/** 入校准样本（残差 = |真值 − 点预测|） */
+	calibrate(residual) {
+		this.calibration.push(Math.max(0, residual));
+		if (this.calibration.length > this.config.maxCalibration) this.calibration.splice(0, this.calibration.length - this.config.maxCalibration);
+	}
+	/**
+	* 为点预测生成保形区间。
+	*
+	* 校准充足（秩 ≤ n）：[ŷ−q̂, ŷ+q̂]，精确覆盖 ≥ 1−α；
+	* 校准不足：finite=false（lower=−∞/upper=+∞）——诚实承认无法覆盖。
+	*/
+	interval(pointForecast) {
+		this.emitted += 1;
+		const q = conformalQuantile(this.calibration, this.config.alpha);
+		if (q === void 0) return {
+			lower: Number.NEGATIVE_INFINITY,
+			upper: Number.POSITIVE_INFINITY,
+			finite: false,
+			qhat: NaN,
+			calibrationN: this.calibration.length,
+			alpha: this.config.alpha
+		};
+		return {
+			lower: pointForecast - q,
+			upper: pointForecast + q,
+			finite: true,
+			qhat: q,
+			calibrationN: this.calibration.length,
+			alpha: this.config.alpha
+		};
+	}
+	/** 登记一次覆盖结果（漂移监测 + 经验覆盖统计） */
+	recordCovered(covered) {
+		if (covered) this.coveredCount += 1;
+		return this.monitor.observe(covered);
+	}
+	/** 重校准后重启漂移监测（保留校准集——它承载新分布的证据） */
+	resetDrift() {
+		this.monitor.reset();
+	}
+	/** 引擎状态 */
+	status() {
+		const q = conformalQuantile(this.calibration, this.config.alpha);
+		const drift = this.monitor.view();
+		const interpretation = this.calibration.length === 0 ? "保形引擎待校准（calibrate 喂入首批残差后区间生效）" : q === void 0 ? `校准样本 ${this.calibration.length} 不足以支撑 ${(1 - this.config.alpha) * 100}% 覆盖（需 ${Math.ceil(1 / (1 - this.config.alpha)) - 1} 条以上）——区间诚实发散` : drift.drifting ? `覆盖漂移确证：经验覆盖 ${(drift.empiricalCoverage * 100).toFixed(0)}% vs 目标 ${((1 - this.config.alpha) * 100).toFixed(0)}%（e=${drift.eValue.toFixed(1)} ≥ 1/δ）——应重校准` : `区间生效：q̂=${q.toFixed(3)}（${this.calibration.length} 条校准），覆盖监测正常（经验 ${drift.empiricalCoverage.toFixed(2)}）`;
+		return {
+			calibrationN: this.calibration.length,
+			alpha: this.config.alpha,
+			qhat: q === void 0 ? void 0 : round(q),
+			drift,
+			emitted: this.emitted,
+			covered: this.coveredCount,
+			interpretation
+		};
+	}
+};
+/**
+* 风险受控阈值选择（RCPS 思想：固定候选网格 + Bonferroni 分摊
+* + 12.0 经验伯恩斯坦上界）
+*
+* 语义：risk(λ) = P(X < λ)（如质量分低于阈值触发重试的概率）。
+* 对每个 λ ∈ grid 用 1−δ/G 置信上界估计 risk(λ)，取上界 ≤ α 的
+* **最大** λ（最激进/最严格的质量门槛）：
+*   P(未来真实风险 ≤ α) ≥ 1−δ
+*
+* 用于反思引擎重试阈值：保证「重试率 ≤ α」的同时把质量门槛推到
+* 数学允许的最严处——旧 ±0.02 步进启发式被带保证的选择取代。
+*
+* 样本不足（无合格 λ）→ 返回 undefined（调用方回退既有逻辑）。
+*/
+function selectRiskControlledThreshold(samples, grid, options) {
+	const alpha = options?.targetRisk ?? .1;
+	const delta = 1 - (options?.confidence ?? .95);
+	const n = samples.length;
+	if (n < 2 || grid.length === 0) return void 0;
+	const beta = delta / grid.length;
+	let chosen;
+	for (const lambda of grid) {
+		let below = 0;
+		let belowSqMean = 0;
+		for (const s of samples) if (s < lambda) below += 1;
+		const mean = below / n;
+		for (const s of samples) {
+			const d = (s < lambda ? 1 : 0) - mean;
+			belowSqMean += d * d;
+		}
+		const bound = fixedSampleUpperBound(n, mean, belowSqMean / (n - 1), beta);
+		if (bound <= alpha) chosen = {
+			threshold: lambda,
+			empiricalRisk: round(mean),
+			riskBound: round(bound),
+			target: alpha,
+			confidence: 1 - delta,
+			samples: n,
+			grid: grid.length,
+			interpretation: `阈值 ${lambda.toFixed(3)}：经验风险 ${(mean * 100).toFixed(1)}%，上界 ${(bound * 100).toFixed(1)}% ≤ 目标 ${(alpha * 100).toFixed(0)}%（${((1 - delta) * 100).toFixed(0)}% 置信，Bonferroni ×${grid.length}）`
+		};
+	}
+	return chosen;
+}
+//#endregion
 //#region src/reflection-engine.ts
 /** 默认配置 */
 const DEFAULT_REFLECTION_CONFIG = {
@@ -9534,12 +10093,37 @@ var ReflectionEngine = class {
 	lessonCounter = 0;
 	/** 5.0：因果内核（挂载后失败反思自动触发反事实分析） */
 	causal;
+	/** 13.0：风险受控阈值选择配置（挂载后 ±0.02 步进启发式退役） */
+	riskControl;
+	/** 13.0：最近一次阈值选择的风险依据（可观测/可审计） */
+	thresholdBasis;
 	constructor(config) {
 		this.config = {
 			...DEFAULT_REFLECTION_CONFIG,
 			...config
 		};
 		this.currentThreshold = this.config.qualityThreshold;
+	}
+	/**
+	* 13.0：挂载风险受控阈值选择器（幂等）。
+	*
+	* 质变点：阈值自校准从「±0.02 步进启发式」（重试率全凭运气）升级为
+	* 分布无关的**带保证选择**——每轮从历史质量分布中选出「未来重试率
+	* ≤ targetRisk」以 confidence 置信成立的最严格质量门槛：
+	*   P(未来重试率 ≤ targetRisk) ≥ confidence
+	* 质量普遍优秀 → 风险余量大 → 门槛自动收紧；能力不足 → 门槛自动
+	* 让位，但重试率上界永不突破——重试风暴在数学上被封顶。
+	*/
+	attachRiskController(options) {
+		this.riskControl = {
+			targetRisk: options?.targetRisk ?? .1,
+			confidence: options?.confidence ?? .95,
+			gridSteps: options?.gridSteps ?? 18
+		};
+	}
+	/** 13.0：最近一次阈值选择的风险依据（未挂载或未决出时 undefined） */
+	getThresholdBasis() {
+		return this.thresholdBasis;
 	}
 	/** 设置告警回调 */
 	setAlertHandler(handler) {
@@ -9701,7 +10285,8 @@ var ReflectionEngine = class {
 			quality,
 			at: Date.now()
 		});
-		if (history.length > 50) history.shift();
+		const cap = this.riskControl ? 200 : 50;
+		if (history.length > cap) history.shift();
 		this.qualityHistory.set(taskType, history);
 		this.checkDeclineAlert(taskType, history);
 		this.calibrateThreshold(taskType, history);
@@ -9764,7 +10349,8 @@ var ReflectionEngine = class {
 		return {
 			threshold: this.currentThreshold,
 			windowSize: this.trendWindow.length,
-			byType: summary
+			byType: summary,
+			...this.thresholdBasis ? { basis: this.thresholdBasis } : {}
 		};
 	}
 	/** 重试建议：依据教训库与根因判断 */
@@ -9790,14 +10376,34 @@ var ReflectionEngine = class {
 		});
 	}
 	/**
-	* 阈值自校准（4.0 证据化：时间衰减均值）
+	* 阈值自校准
 	*
-	* 校准基准从裸算术均值升级为半衰期 30 天的时间加权均值——旧的
-	* 质量分布（模型更强/更弱时期）自然让位，阈值始终锚定「当前能力」：
-	* 分布整体偏高 → 收紧；偏低 → 放宽。
+	* 13.0 质变（风险受控选择）：挂载 attachRiskController 后，校准从
+	* 「时间衰减均值 ±0.02 步进」升级为分布无关的带保证选择——
+	* 对候选网格逐一计算「质量 < λ 即重试」的风险上界（经验伯恩斯坦 +
+	* Bonferroni 分摊），取上界 ≤ targetRisk 的最严格 λ：
+	*   P(未来重试率 ≤ targetRisk) ≥ confidence
+	* 重试率第一次被钉在数学上限之内；无合格候选（能力全面不足）时
+	* 保持现阈值不动（宁可不调，不可越界）。
+	*
+	* 未挂载时维持 4.0 行为（半衰期 30 天时间加权均值 ±0.02 步进）。
 	*/
 	calibrateThreshold(taskType, history) {
 		if (history.length < this.config.calibrationMinSamples) return;
+		const [min, max] = this.config.thresholdRange;
+		if (this.riskControl) {
+			const grid = [];
+			for (let i = 0; i <= this.riskControl.gridSteps; i += 1) grid.push(Number((min + (max - min) * i / this.riskControl.gridSteps).toFixed(4)));
+			const result = selectRiskControlledThreshold(history.map((h) => h.quality), grid, {
+				targetRisk: this.riskControl.targetRisk,
+				confidence: this.riskControl.confidence
+			});
+			if (result) {
+				this.currentThreshold = result.threshold;
+				this.thresholdBasis = result;
+			} else this.thresholdBasis = void 0;
+			return;
+		}
 		const now = Date.now();
 		let weighted = 0;
 		let totalWeight = 0;
@@ -9807,7 +10413,6 @@ var ReflectionEngine = class {
 			totalWeight += weight;
 		}
 		const avg = totalWeight > 0 ? weighted / totalWeight : .5;
-		const [min, max] = this.config.thresholdRange;
 		if (avg > this.currentThreshold + .15) this.currentThreshold = Math.min(max, this.currentThreshold + this.config.calibrationStep);
 		else if (avg < this.currentThreshold - .15) this.currentThreshold = Math.max(min, this.currentThreshold - this.config.calibrationStep);
 	}
@@ -10150,6 +10755,117 @@ var MetaCognitionEngine = class {
 	metareasoner;
 	abstractionEngine;
 	scientistMind;
+	/** 12.0：KPI 保证层（挂载后退化/恢复判定获得任意时刻有效背书） */
+	anytimeGuards;
+	/** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
+	guardAlpha = .05;
+	/**
+	* 12.0：KPI 情节化状态机（首次确证退化后启用）。
+	*
+	* 全历史 e-过程的资本是只涨难跌的累计证据——确证退化后，即使 KPI
+	* 完全恢复，旧资本也会长期压住「已恢复」的事实（恢复不可检测）。
+	* 状态机改以水位线两侧的**连续 run** 为情节：恢复通道只吃水位线上
+	* 连续批次的证据（e-过程确证 H0: μ ≤ 水位线 被拒，或 CS 下界越过
+	* 水位线）；再劣化通道对称。跨线即重置对侧通道（翻转沿语义，
+	* 稳态不重复打扰）。
+	*
+	* 有效性口径（如实标注）：报警方向（首次确证）始终保持全历史
+	* 任意时刻有效（Ville，偷看免疫）；情节化通道是「重启式监测」——
+	* 每次重启都是合法的水平 α 检验，跨情节的选择效应不具全局有效性
+	* （重启式监测的标准取舍：报警从严，全清从宽）。
+	*/
+	regimeWatches;
+	/** 新建一条情节通道（e-过程 + 置信序列） */
+	newGuardChannel(reference, side) {
+		return {
+			e: new EProcess(reference, side),
+			cs: new EmpiricalBernsteinSequence(this.guardAlpha)
+		};
+	}
+	/**
+	* 12.0：挂载 KPI 保证层（幂等）。
+	*
+	* 为 successRate / avgQuality 各建一条 e-过程证据流，水位线 =
+	* 各自目标线。「低于目标」的告警从此自带数学保证：任意时刻、
+	* 任意频率地读取都不夸大（偷看免疫）。
+	*/
+	attachAnytimeGuards(options) {
+		const alpha = options?.alpha ?? .05;
+		this.guardAlpha = alpha;
+		this.anytimeGuards = /* @__PURE__ */ new Map([["successRate", new AnytimeEvidenceStream({
+			alpha,
+			reference: this.config.successRateTarget
+		})], ["avgQuality", new AnytimeEvidenceStream({
+			alpha,
+			reference: this.config.qualityTarget
+		})]]);
+		this.regimeWatches = /* @__PURE__ */ new Map();
+	}
+	/**
+	* 12.0：保证层检验（每批快照后调用）。
+	*
+	* 阶段一（未确证过）：全历史 e-过程裁决——e ≥ 1/α 才确证退化
+	* （高严重度，证据携带 e-值与任意时刻 p-值），否则诚实不打扰。
+	* 阶段二（确证过至少一次）：情节化状态机跟踪当前状态——恢复与
+	* 再劣化都要求持续越过水位线的证据（e-确证或 CS 交叉），翻转沿
+	* 产出洞察。
+	*/
+	checkGuarantee(kpi, value) {
+		const stream = this.anytimeGuards?.get(kpi);
+		if (!stream) return [];
+		const view = stream.observe(value);
+		const ref = stream.reference;
+		const threshold = 1 / this.guardAlpha;
+		const insights = [];
+		const watch = this.regimeWatches?.get(kpi);
+		if (!watch) {
+			if (view.verdict === "below-reference") {
+				this.regimeWatches?.set(kpi, {
+					regime: "degraded",
+					recovery: this.newGuardChannel(ref, "at-most"),
+					degrade: this.newGuardChannel(ref, "at-least")
+				});
+				insights.push({
+					source: "meta-cognition",
+					category: "kpi-degradation-confirmed",
+					severity: .9,
+					message: `KPI ${kpi} 真实水平低于目标线 ${ref} 已被任意时刻有效证据确证（e=${view.eBelow.toFixed(1)}，anytime-p=${view.anytimeP.toFixed(4)}，${view.n} 样本，偷看免疫）`,
+					suggestion: `退化确证非偷看假象：按 ${kpi} 的因果旋钮排序实施干预，并持续观察保证层裁决`
+				});
+			}
+			return insights;
+		}
+		if (value < ref) {
+			watch.recovery = this.newGuardChannel(ref, "at-most");
+			const e = watch.degrade.e.observe(value);
+			watch.degrade.cs.observe(value);
+			if (watch.regime === "recovered" && (e >= threshold || watch.degrade.cs.bounds().upper <= ref)) {
+				watch.regime = "degraded";
+				insights.push({
+					source: "meta-cognition",
+					category: "kpi-degradation-confirmed",
+					severity: .85,
+					message: `KPI ${kpi} 劣化复发：水位线下连续 ${watch.degrade.e.count} 批证据（e=${e.toFixed(1)}，CS 上界 ${watch.degrade.cs.bounds().upper.toFixed(2)} ≤ 目标线 ${ref}）`,
+					suggestion: "劣化复发：优先检查上一次恢复对应的干预是否被回滚"
+				});
+			}
+		} else {
+			watch.degrade = this.newGuardChannel(ref, "at-least");
+			const e = watch.recovery.e.observe(value);
+			watch.recovery.cs.observe(value);
+			if (watch.regime === "degraded" && (e >= threshold || watch.recovery.cs.bounds().lower >= ref)) {
+				watch.regime = "recovered";
+				insights.push({
+					source: "meta-cognition",
+					category: "kpi-recovery-confirmed",
+					severity: .3,
+					message: `KPI ${kpi} 退出确证退化态：水位线上连续 ${watch.recovery.e.count} 批证据（CS 下界 ${watch.recovery.cs.bounds().lower.toFixed(2)} ≥ 目标线 ${ref}，e=${e.toFixed(1)}）——自愈或干预见效`,
+					suggestion: "保持当前参数并继续观察置信序列走势"
+				});
+			}
+		}
+		return insights;
+	}
 	/**
 	* 5.0：因果旋钮排序 —— 哪个旋钮真正导致了目标 KPI 的改善。
 	*
@@ -10199,6 +10915,10 @@ var MetaCognitionEngine = class {
 		if (this.history.length > this.config.windowSize) this.history.shift();
 		const insights = [];
 		this.settleTuningInterventions(snapshot);
+		if (this.anytimeGuards) {
+			insights.push(...this.checkGuarantee("successRate", snapshot.successRate));
+			insights.push(...this.checkGuarantee("avgQuality", snapshot.avgQuality));
+		}
 		if (this.history.length >= 5) {
 			for (const kpi of [
 				"successRate",
@@ -10264,7 +10984,31 @@ var MetaCognitionEngine = class {
 			cognitiveEconomy: this.metareasoner ? this.metareasoner.cognitiveEconomy() : void 0,
 			abstraction: this.abstractionEngine ? this.abstractionEngine.stats() : void 0,
 			knowledgeFrontier: this.scientistMind ? this.scientistMind.knowledgeFrontier() : void 0,
-			theoryFrontier: this.theoristEngine ? this.theoristEngine.frontier() : void 0
+			theoryFrontier: this.theoristEngine ? this.theoristEngine.frontier() : void 0,
+			guarantees: this.anytimeGuards ? (() => {
+				const streams = [...this.anytimeGuards.entries()].map(([kpi, stream]) => {
+					const v = stream.view();
+					return {
+						kpi,
+						reference: stream.reference,
+						verdict: v.verdict,
+						/** 12.0：情节化当前状态（undefined = 尚未确证过退化） */
+						regime: this.regimeWatches?.get(kpi)?.regime,
+						eBelow: v.eBelow,
+						anytimeP: v.anytimeP,
+						n: v.n,
+						cs: {
+							lower: v.cs.lower,
+							upper: v.cs.upper
+						}
+					};
+				});
+				const degraded = streams.filter((s) => s.regime === "degraded" || s.regime === void 0 && s.verdict === "below-reference");
+				return {
+					streams,
+					interpretation: streams.every((s) => s.n === 0) ? "保证层已挂载，等待首批 KPI 快照" : degraded.length === 0 ? "全部受保护 KPI 未确证退化（任意时刻有效，偷看免疫）" : `${degraded.map((s) => s.kpi).join("、")} 处于确证退化态（全历史 e-过程背书；情节化通道跟踪恢复/复发）`
+				};
+			})() : void 0
 		};
 	}
 	/** 调优历史 */
@@ -10402,6 +11146,193 @@ var MetaCognitionEngine = class {
 	}
 };
 //#endregion
+//#region src/core/quality-diversity.ts
+/**
+* MAP-Elites 归档（泛型网格精英制）
+*
+* place() 准入规则：候选者落入唯一 niche；适应度严格高于现任
+* （或 niche 空缺）即上位。O(1) 放置、O(k) 指标计算（k = 占据数）。
+* 跨 niche 永不比较——多样性的保护是结构性的，不依赖任何阈值。
+*/
+var MapElitesArchive = class {
+	config;
+	elites = /* @__PURE__ */ new Map();
+	placements = 0;
+	promotions = 0;
+	rng;
+	constructor(config) {
+		if (config.bins.length !== config.ranges.length) throw new Error(`quality-diversity: bins(${config.bins.length}) 与 ranges(${config.ranges.length}) 维度不一致`);
+		this.config = config;
+		this.rng = config.rng ?? Math.random;
+	}
+	/** 总 niche 数 */
+	get totalNiches() {
+		return this.config.bins.reduce((a, b) => a * b, 1);
+	}
+	/** 被占据 niche 数 */
+	get occupiedNiches() {
+		return this.elites.size;
+	}
+	/** 候选者 → niche 键（网格坐标），越界坐标饱和到边界格 */
+	nicheOf(candidate) {
+		const coords = this.config.descriptor(candidate);
+		const parts = [];
+		for (let d = 0; d < this.config.bins.length; d += 1) {
+			const [min, max] = this.config.ranges[d];
+			const bins = this.config.bins[d];
+			const normalized = Math.min(1, Math.max(0, (coords[d] - min) / (max - min)));
+			const cell = Math.min(bins - 1, Math.floor(normalized * bins));
+			parts.push(String(cell));
+		}
+		return parts.join(",");
+	}
+	/**
+	* 放置候选者：在其 niche 内挑战现任精英。
+	* 适应度严格超过现任（容差内持平算挑战失败——先到先得，防抖动）
+	* 或 niche 空缺时上位。
+	*/
+	place(candidate) {
+		const niche = this.nicheOf(candidate);
+		const fitness = this.config.fitness(candidate);
+		const current = this.elites.get(niche);
+		this.placements += 1;
+		const tie = this.config.tieTolerance ?? 1e-9;
+		if (!current || fitness > current.fitness + tie) {
+			this.elites.set(niche, {
+				fitness,
+				candidate
+			});
+			this.promotions += 1;
+			return {
+				becameElite: true,
+				displaced: current?.candidate,
+				niche
+			};
+		}
+		return {
+			becameElite: false,
+			niche
+		};
+	}
+	/** 从被占据 niche 均匀采样一位精英（前沿探索；空归档返回 undefined） */
+	sample() {
+		if (this.elites.size === 0) return void 0;
+		const keys = [...this.elites.keys()];
+		const key = keys[Math.floor(this.rng() * keys.length)];
+		return this.elites.get(key).candidate;
+	}
+	/** 全局最优精英（适应度最高；空归档返回 undefined） */
+	best() {
+		let best;
+		for (const elite of this.elites.values()) if (!best || elite.fitness > best.fitness) best = elite;
+		return best?.candidate;
+	}
+	/** 全部现任精英（候选者列表；按 niche 键序） */
+	eliteCandidates() {
+		return [...this.elites.values()].map((e) => e.candidate);
+	}
+	/** QD 指标 */
+	metrics() {
+		let qd = 0;
+		let bestFit = Number.NEGATIVE_INFINITY;
+		for (const elite of this.elites.values()) {
+			qd += elite.fitness;
+			bestFit = Math.max(bestFit, elite.fitness);
+		}
+		return {
+			nichesOccupied: this.elites.size,
+			totalNiches: this.totalNiches,
+			coverage: round$8(this.elites.size / this.totalNiches),
+			qdScore: round$8(qd),
+			meanFitness: this.elites.size > 0 ? round$8(qd / this.elites.size) : 0,
+			bestFitness: this.elites.size > 0 ? round$8(bestFit) : 0,
+			placements: this.placements,
+			promotions: this.promotions
+		};
+	}
+	/** 归档报告 */
+	report() {
+		const elites = [...this.elites.entries()].map(([niche, e]) => ({
+			niche,
+			fitness: round$8(e.fitness),
+			candidate: e.candidate
+		})).sort((a, b) => b.fitness - a.fitness);
+		return {
+			metrics: this.metrics(),
+			elites
+		};
+	}
+};
+/** 策略行为空间（三维，均归一到 [0,1]） */
+const STRATEGY_BEHAVIOR_SPACE = {
+	dims: [
+		"boldness",
+		"frugality",
+		"vigilance"
+	],
+	ranges: [
+		[0, 1],
+		[0, 1],
+		[0, 1]
+	],
+	defaultBins: [
+		4,
+		4,
+		4
+	]
+};
+/** 基因取值边界（与 strategy-evolution.GENE_BOUNDS 同口径） */
+const GENE_BOUNDS$1 = {
+	suppressionWindowMs: {
+		min: 3e4,
+		max: 9e5
+	},
+	failureEscalationThreshold: {
+		min: 1,
+		max: 8
+	},
+	lowConfidenceThreshold: {
+		min: .2,
+		max: .7
+	},
+	costDeferRatio: {
+		min: 1,
+		max: 10
+	},
+	burstOccurrences: {
+		min: 2,
+		max: 12
+	}
+};
+function normalized(gene, value) {
+	const { min, max } = GENE_BOUNDS$1[gene];
+	return Math.min(1, Math.max(0, (value - min) / (max - min)));
+}
+/**
+* 策略基因 → 行为坐标 [boldness, frugality, vigilance]（各维 ∈ [0,1]）
+*
+* - 敢为度 boldness：低置信阈值（敢放行低置信决策）+ 宽重复抑制
+*   （敢重复执行）→ 越大越激进
+* - 节俭度 frugality：成本延迟比越高越省钱 → 越大越节俭
+* - 警觉度 vigilance：失败升级阈值越低 + 突发判定越敏感 → 越大越警觉
+*
+* 三个维度刻画决策策略的「活法」：激进省钱 vs 节俭保守 vs 高敏止损——
+* 归档保证每种活法都保留一个最佳代表。
+*/
+function strategyBehaviorDescriptor(genes) {
+	const boldness = .6 * (1 - normalized("lowConfidenceThreshold", genes.lowConfidenceThreshold)) + .4 * (1 - normalized("suppressionWindowMs", genes.suppressionWindowMs));
+	const frugality = normalized("costDeferRatio", genes.costDeferRatio);
+	const vigilance = .6 * (1 - normalized("failureEscalationThreshold", genes.failureEscalationThreshold)) + .4 * (1 - normalized("burstOccurrences", genes.burstOccurrences));
+	return [
+		Math.min(1, Math.max(0, boldness)),
+		Math.min(1, Math.max(0, frugality)),
+		Math.min(1, Math.max(0, vigilance))
+	];
+}
+function round$8(x) {
+	return Number(x.toFixed(6));
+}
+//#endregion
 //#region src/strategy-evolution.ts
 /** 默认配置 */
 const DEFAULT_STRATEGY_EVOLUTION_CONFIG = {
@@ -10463,6 +11394,15 @@ const OUTCOME_REWARD = {
 * 被 index.ts 持有：决策引擎每次决策前通过 selectGenome() 获取当前基因组
 * （其基因作为决策引擎运行时参数），决策结果经 recordOutcome() 回写适应度，
 * autonomy-loop 定期调用 evolve() 驱动种群进化。
+*
+* 12.0 移植（attachAnytimeEvidence）：适应度从 Wilson 固定样本下界升级为
+* 任意时刻有效置信序列下界（流式统计永不夸大）；pruneProvablyDominated
+* 以 e-BH FDR 控制淘汰「证明确实低于水位线」的基因组——冤案率有数学上限。
+*
+* 14.0 移植（attachQualityDiversity）：selectGenome 的探索从纯 UCB 升级为
+* 「前沿 niche 均匀采样」——每种行为流派（敢为 × 节俭 × 警觉）获得等量
+* 试验预算；evolve 同步维护 MAP-Elites 归档，多样性可审计（coverage/QD-score）。
+* 两个移植均为并行旁路：不 attach 即零漂移。
 */
 var StrategyEvolutionEngine = class {
 	config;
@@ -10472,6 +11412,14 @@ var StrategyEvolutionEngine = class {
 	applicationsSinceEvolution = 0;
 	evolutionHistory = [];
 	rng;
+	/** 12.0：任意时刻证据登记表（attach 后启用） */
+	anytime;
+	/** 12.0：已淘汰基因组的 e-值台账（审计） */
+	anytimeEliminations = [];
+	/** 14.0：MAP-Elites 行为归档（attach 后启用） */
+	qdArchive;
+	/** 14.0：前沿 niche 采样概率（探索预算占比） */
+	qdExploreRate = .25;
 	constructor(config) {
 		this.config = {
 			...DEFAULT_STRATEGY_EVOLUTION_CONFIG,
@@ -10481,6 +11429,33 @@ var StrategyEvolutionEngine = class {
 		this.seedPopulation();
 	}
 	/**
+	* 12.0：挂载任意时刻证据内核（幂等；挂载后适应度用置信序列下界，
+	* recordOutcome 的收益同时喂入该基因组的 e-过程）。
+	*/
+	attachAnytimeEvidence(options) {
+		this.anytime = new AnytimeEvidenceRegistry({
+			alpha: options?.alpha,
+			reference: options?.reference
+		});
+	}
+	/**
+	* 14.0：挂载质量-多样性内核（幂等；挂载后 selectGenome 以
+	* qdExploreRate 概率从行为归档均匀采样探索，evolve 同步维护归档）。
+	*/
+	attachQualityDiversity(options) {
+		const bins = options?.bins ?? STRATEGY_BEHAVIOR_SPACE.defaultBins;
+		this.qdExploreRate = options?.exploreRate ?? .25;
+		this.qdArchive = new MapElitesArchive({
+			bins,
+			ranges: STRATEGY_BEHAVIOR_SPACE.ranges,
+			descriptor: (g) => strategyBehaviorDescriptor(g.genes),
+			fitness: (g) => this.fitness(g),
+			rng: options?.rng ?? this.rng,
+			tieTolerance: 1e-9
+		});
+		for (const genome of this.population) this.qdArchive.place(genome);
+	}
+	/**
 	* UCB1 选择当前基因组（探索-利用平衡；4.0 利用项 = 证据化适应度）
 	*
 	* 利用项与适应度同源（Wilson 下界 × 置信折扣），探索项保持 UCB1
@@ -10488,6 +11463,10 @@ var StrategyEvolutionEngine = class {
 	* @returns 选中的基因组
 	*/
 	selectGenome() {
+		if (this.qdArchive && this.qdArchive.occupiedNiches > 1 && this.rng() < this.qdExploreRate) {
+			const sampled = this.qdArchive.sample();
+			if (sampled && this.population.includes(sampled)) return sampled;
+		}
 		const totalApplications = this.population.reduce((sum, g) => sum + g.applications, 0);
 		let best = this.population[0];
 		let bestScore = -Infinity;
@@ -10516,6 +11495,7 @@ var StrategyEvolutionEngine = class {
 		const now = Date.now();
 		if (!genome.evidence) genome.evidence = initEvidence(0, 0, now);
 		observeWeightedEvidence(genome.evidence, reward, now);
+		this.anytime?.observe(genomeId, reward);
 		this.applicationsSinceEvolution += 1;
 	}
 	/**
@@ -10549,6 +11529,7 @@ var StrategyEvolutionEngine = class {
 			report.born.push(child.id);
 		}
 		while (this.population.length > this.config.populationSize) this.population.pop();
+		if (this.qdArchive) for (const genome of this.population) this.qdArchive.place(genome);
 		this.applicationsSinceEvolution = 0;
 		this.evolutionHistory.push(report);
 		if (this.evolutionHistory.length > 50) this.evolutionHistory.shift();
@@ -10578,12 +11559,80 @@ var StrategyEvolutionEngine = class {
 				genes: g.genes
 			})),
 			bestGenome: this.bestGenome().id,
-			recentEvolutions: this.evolutionHistory.slice(-5)
+			recentEvolutions: this.evolutionHistory.slice(-5),
+			qd: this.qdArchive?.metrics(),
+			anytime: this.anytime?.report()
 		};
 	}
 	/** 进化历史 */
 	getEvolutionHistory() {
 		return [...this.evolutionHistory];
+	}
+	/**
+	* 证明性淘汰（12.0）：e-BH FDR 控制地移除「任意时刻有效证据确证
+	* 收益低于水位线」的基因组。
+	*
+	* 语义：只删 e-过程确证（e ≥ 1/α）且通过多重校正的对象——
+	* 「确实差」才淘汰，冤案率（FDR）≤ fdr；淘汰后由幸存者变异后代
+	* 顶替（种群规模不缩水）。未挂载内核时返回空报告（零漂移）。
+	*
+	* @returns 被淘汰的基因组及定罪 e-值（审计台账）
+	*/
+	pruneProvablyDominated(fdr = .1) {
+		if (!this.anytime) return [];
+		const evidenceSnapshot = /* @__PURE__ */ new Map();
+		for (const genome of this.population) {
+			const view = this.anytime.viewOf(genome.id);
+			if (view) evidenceSnapshot.set(genome.id, view.eBelow);
+		}
+		const rejected = this.anytime.eliminate(fdr);
+		const eliminated = [];
+		for (const id of rejected) {
+			const genome = this.population.find((g) => g.id === id);
+			if (!genome) continue;
+			const record = {
+				id,
+				eValue: evidenceSnapshot.get(id) ?? 0,
+				at: Date.now()
+			};
+			eliminated.push(record);
+			this.anytimeEliminations.push(record);
+			if (this.population.length > 2) {
+				const index = this.population.indexOf(genome);
+				if (index >= 0) this.population.splice(index, 1);
+				const parent = this.tournamentSelect(this.population);
+				const child = this.mutate(parent);
+				this.population.push(child);
+				if (this.qdArchive) this.qdArchive.place(child);
+			}
+		}
+		return eliminated;
+	}
+	/** 12.0：任意时刻证据报告（含历史淘汰台账） */
+	anytimeReport() {
+		return {
+			...this.anytime?.report() ?? {
+				streams: 0,
+				verdicts: {
+					above: 0,
+					below: 0,
+					undecided: 0
+				},
+				totalConfirmations: 0,
+				totalEliminations: 0,
+				strongestEvidence: 0,
+				interpretation: "未挂载任意时刻证据内核（attachAnytimeEvidence 启用）"
+			},
+			eliminations: [...this.anytimeEliminations]
+		};
+	}
+	/** 12.0：指定基因组的当前证据视图（未挂载或未观测返回 undefined） */
+	anytimeViewOf(genomeId) {
+		return this.anytime?.viewOf(genomeId);
+	}
+	/** 14.0：QD 指标（未挂载返回 undefined） */
+	qdMetrics() {
+		return this.qdArchive?.metrics();
 	}
 	/** 初始种群：基准基因组 + 扰动变体 */
 	seedPopulation() {
@@ -10607,14 +11656,17 @@ var StrategyEvolutionEngine = class {
 		};
 	}
 	/**
-	* 适应度（4.0 证据化）：证据后验 Wilson 置信下界 × 小样本置信折扣
+	* 适应度（4.0 证据化 → 12.0 任意时刻有效化）
 	*
-	* 有时间加权证据的基因组用 Wilson 下界（小样本保守、防侥幸、旧结果
-	* 自然衰减）；无证据（未观测/旧数据）回退 meanReward × 折扣。
+	* 挂载任意时刻内核且流样本 ≥ 3：置信序列下界 × 折扣（时间一致
+	* 覆盖——连续监控下读适应度永不夸大）；否则回退 Wilson 下界
+	* （4.0 口径，固定样本语义）；无证据回退 meanReward × 折扣。
 	*/
 	fitness(genome) {
 		if (genome.applications === 0) return 0;
 		const confidenceFactor = Math.min(1, genome.applications / this.config.minApplicationsForElite);
+		const anytimeView = this.anytime?.viewOf(genome.id);
+		if (anytimeView && anytimeView.n >= 3) return Math.max(0, anytimeView.cs.lower) * confidenceFactor;
 		if (genome.evidence) return wilsonLowerBound(genome.evidence.weightedSuccesses, genome.evidence.weightedFailures) * confidenceFactor;
 		return genome.meanReward * confidenceFactor;
 	}
@@ -13832,6 +14884,8 @@ var WorldModel = class {
 	pendingPredictions = /* @__PURE__ */ new Map();
 	/** 5.0：因果内核（可选挂载） */
 	causal;
+	/** 13.0：保形校准引擎（可选挂载） */
+	conformalEngine;
 	constructor(config) {
 		this.config = {
 			...DEFAULT_WORLD_MODEL_CONFIG,
@@ -13848,6 +14902,21 @@ var WorldModel = class {
 	attachCausalKernel(kernel) {
 		this.causal = kernel;
 		for (const corr of this.getCorrelations(.05)) for (let k = 0; k < Math.min(corr.coOccurrences, 20); k += 1) kernel.observe(`signal:${corr.typeA}`, `signal:${corr.typeB}`, true, true);
+	}
+	/**
+	* 13.0：挂载保形校准引擎（幂等）。
+	*
+	* 挂载后 predictArrivals 的区间从 sqrt(λ) 泊松近似升级为保形区间：
+	* 精确有限样本覆盖 ≥ 1−α，零分布假设（可交换性即可）；每次
+	* settleCalibrations 的残差自动入校准集，覆盖漂移由 e-过程监测
+	* （失准确证 → status().drift.drifting，应重校准）。
+	*/
+	attachConformalCalibrator(engine) {
+		this.conformalEngine = engine;
+	}
+	/** 13.0：保形校准状态（未挂载返回 undefined） */
+	getConformalStatus() {
+		return this.conformalEngine?.status();
 	}
 	/**
 	* 5.0：因果预见 ——「若实施 do(action)，目标指标期望如何变化」。
@@ -13905,18 +14974,49 @@ var WorldModel = class {
 			const adjusted = ratePerMs * horizonMs * trendFactor * this.hourFactor(entry, now + horizonMs / 2);
 			const spread = Math.sqrt(Math.max(adjusted, .5));
 			const confidence = this.calibrationConfidence(type);
-			predictions.push({
-				type,
-				expectedCount: Number(adjusted.toFixed(2)),
-				lowerBound: Math.max(0, Number((adjusted - spread).toFixed(2))),
-				upperBound: Number((adjusted + spread).toFixed(2)),
-				confidence,
-				trend
-			});
-			this.pendingPredictions.set(type, {
-				predicted: adjusted,
-				windowEnd: now + horizonMs
-			});
+			let prediction;
+			if (this.conformalEngine) {
+				const interval = this.conformalEngine.interval(adjusted);
+				prediction = {
+					type,
+					expectedCount: Number(adjusted.toFixed(2)),
+					lowerBound: interval.finite ? Number(Math.max(0, interval.lower).toFixed(2)) : Math.max(0, Number((adjusted - spread).toFixed(2))),
+					upperBound: interval.finite ? Number(Math.max(0, interval.upper).toFixed(2)) : Number((adjusted + spread).toFixed(2)),
+					confidence,
+					trend,
+					conformal: {
+						lower: interval.finite ? Number(Math.max(0, interval.lower).toFixed(2)) : Number.POSITIVE_INFINITY,
+						upper: interval.finite ? Number(Math.max(0, interval.upper).toFixed(2)) : Number.POSITIVE_INFINITY,
+						finite: interval.finite,
+						qhat: interval.qhat,
+						calibrationN: interval.calibrationN,
+						alpha: interval.alpha
+					}
+				};
+				this.pendingPredictions.set(type, {
+					predicted: adjusted,
+					windowEnd: now + horizonMs,
+					conformalInterval: interval.finite ? {
+						lower: interval.lower,
+						upper: interval.upper,
+						finite: true
+					} : void 0
+				});
+			} else {
+				prediction = {
+					type,
+					expectedCount: Number(adjusted.toFixed(2)),
+					lowerBound: Math.max(0, Number((adjusted - spread).toFixed(2))),
+					upperBound: Number((adjusted + spread).toFixed(2)),
+					confidence,
+					trend
+				};
+				this.pendingPredictions.set(type, {
+					predicted: adjusted,
+					windowEnd: now + horizonMs
+				});
+			}
+			predictions.push(prediction);
 		}
 		return predictions.sort((a, b) => b.expectedCount - a.expectedCount);
 	}
@@ -13940,6 +15040,10 @@ var WorldModel = class {
 			};
 			this.calibrations.push(record);
 			settled.push(record);
+			if (this.conformalEngine) {
+				this.conformalEngine.calibrate(record.error);
+				if (pending.conformalInterval?.finite) this.conformalEngine.recordCovered(actualCount >= pending.conformalInterval.lower && actualCount <= pending.conformalInterval.upper);
+			}
 			this.pendingPredictions.delete(type);
 		}
 		if (this.calibrations.length > 200) this.calibrations.splice(0, this.calibrations.length - 200);
@@ -14010,7 +15114,8 @@ var WorldModel = class {
 				observationalStrength: e.observationalAssociation,
 				causalEffect: e.ate,
 				divergence: e.divergence
-			})) : void 0
+			})) : void 0,
+			conformal: this.conformalEngine ? this.conformalEngine.status() : void 0
 		};
 	}
 	/** 平均校准误差（MAE） */
@@ -14297,16 +15402,16 @@ var CausalKernel = class {
 		return {
 			from,
 			to,
-			ate: round$6(ate),
-			lower: round$6(Math.max(-1, conservativeLower)),
-			upper: round$6(Math.min(1, conservativeUpper)),
-			pDo: round$6(pDo),
-			pDoNot: round$6(pDoNot),
+			ate: round$7(ate),
+			lower: round$7(Math.max(-1, conservativeLower)),
+			upper: round$7(Math.min(1, conservativeUpper)),
+			pDo: round$7(pDo),
+			pDoNot: round$7(pDoNot),
 			interventionalSamples,
 			observationalSamples: obsAll,
-			observationalAssociation: round$6(obsAssociation),
-			confounding: round$6(confounding),
-			confidence: round$6(confidence),
+			observationalAssociation: round$7(obsAssociation),
+			confounding: round$7(confounding),
+			confidence: round$7(confidence),
 			direction,
 			established
 		};
@@ -14343,7 +15448,7 @@ var CausalKernel = class {
 			const divergence = Math.abs(eff.observationalAssociation - eff.ate);
 			if (divergence >= this.config.confoundingThreshold) flagged.push({
 				...eff,
-				divergence: round$6(divergence)
+				divergence: round$7(divergence)
 			});
 		}
 		return flagged.sort((a, b) => b.divergence - a.divergence);
@@ -14370,7 +15475,7 @@ var CausalKernel = class {
 		const xm = this.effect(from, mediator, now);
 		const my = this.effect(mediator, to, now);
 		const xy = this.effect(from, to, now);
-		const total = round$6(xy.ate);
+		const total = round$7(xy.ate);
 		const indirect = xm.ate * my.ate;
 		const direct = total - indirect;
 		const share = Math.abs(total) > .05 ? Math.min(1, Math.abs(indirect) / Math.abs(total)) : 0;
@@ -14386,7 +15491,7 @@ var CausalKernel = class {
 			total,
 			indirect,
 			direct,
-			share: round$6(share),
+			share: round$7(share),
 			path: {
 				xm,
 				my,
@@ -14411,15 +15516,15 @@ var CausalKernel = class {
 		const estimatedProb = altEffect.pDo;
 		let verdict;
 		if (samples < 4) verdict = `证据不足（${samples} 样本）：「若选 ${actionAlternative}」暂无法可靠回答，建议登记为因果实验`;
-		else if (actualY && estimatedProb - actualProb > .1) verdict = `反事实遗憾：${actionAlternative} 的估计成功概率（${round$6(estimatedProb)}）高于实际路径（${round$6(actualProb)}）`;
-		else if (!actualY && estimatedProb > .6) verdict = `反事实教训：失败路径下 ${actionAlternative} 估计成功概率 ${round$6(estimatedProb)}，下次优先`;
-		else verdict = `实际选择已接近最优（${actionAlternative} 估计 ${round$6(estimatedProb)} vs 实际 ${round$6(actualProb)}）`;
+		else if (actualY && estimatedProb - actualProb > .1) verdict = `反事实遗憾：${actionAlternative} 的估计成功概率（${round$7(estimatedProb)}）高于实际路径（${round$7(actualProb)}）`;
+		else if (!actualY && estimatedProb > .6) verdict = `反事实教训：失败路径下 ${actionAlternative} 估计成功概率 ${round$7(estimatedProb)}，下次优先`;
+		else verdict = `实际选择已接近最优（${actionAlternative} 估计 ${round$7(estimatedProb)} vs 实际 ${round$7(actualProb)}）`;
 		return {
 			alternative: actionAlternative,
-			estimatedProb: round$6(estimatedProb),
-			lower: round$6(Math.max(0, estimatedProb - margin)),
-			upper: round$6(Math.min(1, estimatedProb + margin)),
-			actualProb: round$6(actualProb),
+			estimatedProb: round$7(estimatedProb),
+			lower: round$7(Math.max(0, estimatedProb - margin)),
+			upper: round$7(Math.min(1, estimatedProb + margin)),
+			actualProb: round$7(actualProb),
 			evidenceSamples: samples,
 			verdict
 		};
@@ -14443,9 +15548,9 @@ var CausalKernel = class {
 				from: edge.from,
 				to: edge.to,
 				suggestedArm: eff.ate >= 0 || eff.observationalAssociation >= 0,
-				infoGain: round$6(infoGain),
-				hypothesis: `假设：对 ${edge.from} 实施 do=${eff.ate >= 0 || eff.observationalAssociation >= 0 ? "启用" : "停用"} 将使 ${edge.to} ${eff.ate >= 0 || eff.observationalAssociation >= 0 ? "提升" : "下降"}（当前不确定区间 [${round$6(eff.lower)}, ${round$6(eff.upper)}]）`,
-				uncertainty: round$6(uncertainty)
+				infoGain: round$7(infoGain),
+				hypothesis: `假设：对 ${edge.from} 实施 do=${eff.ate >= 0 || eff.observationalAssociation >= 0 ? "启用" : "停用"} 将使 ${edge.to} ${eff.ate >= 0 || eff.observationalAssociation >= 0 ? "提升" : "下降"}（当前不确定区间 [${round$7(eff.lower)}, ${round$7(eff.upper)}]）`,
+				uncertainty: round$7(uncertainty)
 			});
 		}
 		return candidates.sort((a, b) => b.infoGain - a.infoGain).slice(0, budget);
@@ -14591,7 +15696,7 @@ function shapleyValues(contributors) {
 				if (subset & 1 << bit) sMask |= 1 << j;
 				bit += 1;
 			}
-			const sSize = popcount(sMask);
+			const sSize = popcount$1(sMask);
 			const weight = factorials[sSize] * factorials[n - sSize - 1] / factorials[n];
 			phi += weight * (valueOf(sMask | 1 << i) - valueOf(sMask));
 		}
@@ -14599,7 +15704,7 @@ function shapleyValues(contributors) {
 	}
 	return result;
 }
-function popcount(x) {
+function popcount$1(x) {
 	let c = 0;
 	while (x) {
 		x &= x - 1;
@@ -14607,7 +15712,7 @@ function popcount(x) {
 	}
 	return c;
 }
-function round$6(x) {
+function round$7(x) {
 	return Number(x.toFixed(4));
 }
 //#endregion
@@ -14747,14 +15852,14 @@ var FreeEnergyEngine = class {
 		const efe = pragmatic - this.config.epistemicWeight * epistemic;
 		return {
 			actionId: action.id,
-			pragmatic: round$5(pragmatic),
-			epistemic: round$5(epistemic),
-			efe: round$5(efe),
-			alpha: round$5(alpha),
-			beta: round$5(beta),
+			pragmatic: round$6(pragmatic),
+			epistemic: round$6(epistemic),
+			efe: round$6(efe),
+			alpha: round$6(alpha),
+			beta: round$6(beta),
 			boltzmannProb: 0,
-			curiosityShare: round$5(pragmatic + epistemic > 1e-9 ? epistemic / (pragmatic + epistemic) : 0),
-			expectedUncertaintyReduction: round$5(epistemic / Math.max(1e-9, h0))
+			curiosityShare: round$6(pragmatic + epistemic > 1e-9 ? epistemic / (pragmatic + epistemic) : 0),
+			expectedUncertaintyReduction: round$6(epistemic / Math.max(1e-9, h0))
 		};
 	}
 	/**
@@ -14772,7 +15877,7 @@ var FreeEnergyEngine = class {
 		const weights = evals.map((e) => Math.exp(-(e.efe - minG) / T));
 		const sum = weights.reduce((a, b) => a + b, 0);
 		evals.forEach((e, i) => {
-			e.boltzmannProb = round$5(weights[i] / sum);
+			e.boltzmannProb = round$6(weights[i] / sum);
 		});
 		return evals.sort((a, b) => a.efe - b.efe);
 	}
@@ -14792,7 +15897,7 @@ var FreeEnergyEngine = class {
 			const p = Math.min(1 - eps, Math.max(eps, a.pSuccess));
 			const strength = a.interventionalSamples + .5 * a.observationalSamples;
 			const theta = sampleBeta(p * strength + 1, (1 - p) * strength + 1);
-			samples[a.id] = round$5(theta);
+			samples[a.id] = round$6(theta);
 			if (theta > best) {
 				best = theta;
 				winner = a.id;
@@ -14852,14 +15957,14 @@ var FreeEnergyEngine = class {
 			total += kl;
 			perBelief.push({
 				id: b.id,
-				beliefProb: round$5(b.beliefProb),
-				modelProb: round$5(p),
-				kl: round$5(kl)
+				beliefProb: round$6(b.beliefProb),
+				modelProb: round$6(p),
+				kl: round$6(kl)
 			});
 		}
 		const worstEntry = [...perBelief].sort((a, b) => b.kl - a.kl)[0];
 		return {
-			totalFreeEnergy: round$5(total),
+			totalFreeEnergy: round$6(total),
 			perBelief: perBelief.sort((a, b) => b.kl - a.kl),
 			driftDetected: total >= this.config.driftThreshold,
 			worst: worstEntry ? {
@@ -14900,7 +16005,7 @@ function gaussian() {
 	while (v === 0) v = Math.random();
 	return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
-function round$5(x) {
+function round$6(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -15048,7 +16153,7 @@ var DeliberationEngine = class {
 			abstractInfo = {
 				source: prior.source,
 				strength: prior.strength,
-				mean: round$4(prior.mean)
+				mean: round$5(prior.mean)
 			};
 		} else {
 			alpha = 1 + successes;
@@ -15067,12 +16172,12 @@ var DeliberationEngine = class {
 		return {
 			state,
 			action,
-			pSuccess: round$4(p),
+			pSuccess: round$5(p),
 			alpha,
 			beta,
 			evidence: successes + failures,
-			lower: round$4(Math.max(0, p - 1.645 * sigma)),
-			upper: round$4(Math.min(1, p + 1.645 * sigma)),
+			lower: round$5(Math.max(0, p - 1.645 * sigma)),
+			upper: round$5(Math.min(1, p + 1.645 * sigma)),
 			successor,
 			abstract: abstractInfo
 		};
@@ -15121,12 +16226,12 @@ var DeliberationEngine = class {
 				state,
 				action,
 				nextState: post.successor,
-				pStep: round$4(p),
-				evidence: round$4(post.evidence + lambda),
-				pragmatic: round$4(pragmatic),
-				epistemic: round$4(epistemic),
-				efe: round$4(efe),
-				discounted: round$4(discounted)
+				pStep: round$5(p),
+				evidence: round$5(post.evidence + lambda),
+				pragmatic: round$5(pragmatic),
+				epistemic: round$5(epistemic),
+				efe: round$5(efe),
+				discounted: round$5(discounted)
 			});
 			totalEfe += discounted;
 			undiscounted += efe;
@@ -15139,16 +16244,16 @@ var DeliberationEngine = class {
 			const before = steps.slice(0, s.step).reduce((prod, x) => prod * x.pStep, 1);
 			return {
 				step: s.step,
-				pFailAt: round$4(before * (1 - s.pStep))
+				pFailAt: round$5(before * (1 - s.pStep))
 			};
 		});
 		return {
 			startState,
 			actions: [...actions],
 			states,
-			totalEfe: round$4(totalEfe),
-			undiscountedEfe: round$4(undiscounted),
-			pAllSuccess: round$4(pAll),
+			totalEfe: round$5(totalEfe),
+			undiscountedEfe: round$5(undiscounted),
+			pAllSuccess: round$5(pAll),
 			steps,
 			riskProfile,
 			epistemicMonotone: checkEpistemicMonotone(steps)
@@ -15238,8 +16343,8 @@ var DeliberationEngine = class {
 		if (existing) {
 			existing.usages += 1;
 			existing.successes += 1;
-			existing.value = round$4(.7 * existing.value + .3 * value);
-			existing.reliability = round$4(.7 * existing.reliability + .3 * reliability);
+			existing.value = round$5(.7 * existing.value + .3 * value);
+			existing.reliability = round$5(.7 * existing.reliability + .3 * reliability);
 			existing.confidence = Math.min(1, .5 + existing.usages * .1);
 			existing.lastUsedAt = Date.now();
 			return existing;
@@ -15253,8 +16358,8 @@ var DeliberationEngine = class {
 			id: `skill-${++this.skillCounter}`,
 			initiation,
 			actions: [...actions],
-			value: round$4(value),
-			reliability: round$4(reliability),
+			value: round$5(value),
+			reliability: round$5(reliability),
 			confidence: .5,
 			usages: 1,
 			successes: 1,
@@ -15270,8 +16375,8 @@ var DeliberationEngine = class {
 		const existing = this.skills.find((s) => s.initiation === initiation && s.actions.join("|") === signature);
 		if (!existing) return;
 		existing.usages += 1;
-		existing.value = round$4(existing.value - penalty);
-		existing.reliability = round$4(Math.max(0, existing.reliability * .8));
+		existing.value = round$5(existing.value - penalty);
+		existing.reliability = round$5(Math.max(0, existing.reliability * .8));
 		existing.confidence = Math.min(1, .5 + existing.usages * .1);
 	}
 	/**
@@ -15330,10 +16435,10 @@ var DeliberationEngine = class {
 				step: i,
 				state,
 				action,
-				predicted: round$4(predicted),
+				predicted: round$5(predicted),
 				actual,
-				surprisal: round$4(surprisal),
-				error: round$4(error)
+				surprisal: round$5(surprisal),
+				error: round$5(error)
 			});
 			surprisalSum += surprisal;
 			errorSum += error;
@@ -15368,15 +16473,15 @@ var DeliberationEngine = class {
 		return {
 			steps,
 			overallSuccess,
-			meanSurprisal: round$4(plan.length > 0 ? surprisalSum / plan.length : 0),
-			calibrationEma: round$4(this.calibrationEma ?? 0),
+			meanSurprisal: round$5(plan.length > 0 ? surprisalSum / plan.length : 0),
+			calibrationEma: round$5(this.calibrationEma ?? 0),
 			skillAction,
 			skillId
 		};
 	}
 	/** 梦校准误差（EMA；未对账过时 undefined） */
 	currentCalibration() {
-		return this.calibrationEma === void 0 ? void 0 : round$4(this.calibrationEma);
+		return this.calibrationEma === void 0 ? void 0 : round$5(this.calibrationEma);
 	}
 	/** 已对账计划数（可观测） */
 	settledCount() {
@@ -15445,20 +16550,20 @@ var DeliberationEngine = class {
 			state: prefix.state,
 			action,
 			nextState,
-			pStep: round$4(p),
-			evidence: round$4(post.evidence + lambda),
-			pragmatic: round$4(pragmatic),
-			epistemic: round$4(epistemic),
-			efe: round$4(efe),
-			discounted: round$4(discounted)
+			pStep: round$5(p),
+			evidence: round$5(post.evidence + lambda),
+			pragmatic: round$5(pragmatic),
+			epistemic: round$5(epistemic),
+			efe: round$5(efe),
+			discounted: round$5(discounted)
 		};
 		return {
 			state: nextState,
 			actions: [...prefix.actions, action],
 			states: [...prefix.states, nextState],
 			steps: [...prefix.steps, step],
-			totalEfe: round$4(prefix.totalEfe + discounted),
-			pSuccess: round$4(prefix.pSuccess * p),
+			totalEfe: round$5(prefix.totalEfe + discounted),
+			pSuccess: round$5(prefix.pSuccess * p),
 			imaginedUses
 		};
 	}
@@ -15490,12 +16595,12 @@ var DeliberationEngine = class {
 			actions: node.actions,
 			states: node.states,
 			totalEfe: node.totalEfe,
-			undiscountedEfe: round$4(node.steps.reduce((s, x) => s + x.efe, 0)),
+			undiscountedEfe: round$5(node.steps.reduce((s, x) => s + x.efe, 0)),
 			pAllSuccess: node.pSuccess,
 			steps: node.steps,
 			riskProfile: node.steps.map((s) => ({
 				step: s.step,
-				pFailAt: round$4(before(s.step) * (1 - s.pStep))
+				pFailAt: round$5(before(s.step) * (1 - s.pStep))
 			})),
 			epistemicMonotone: checkEpistemicMonotone(node.steps)
 		};
@@ -15515,7 +16620,7 @@ function checkEpistemicMonotone(steps) {
 	}
 	return true;
 }
-function round$4(x) {
+function round$5(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -15624,11 +16729,11 @@ var RationalMetareasoner = class {
 			state,
 			mode: "reactive",
 			actions: [best.action],
-			costNat: round$3(singles.length * this.config.natPerNode),
+			costNat: round$4(singles.length * this.config.natPerNode),
 			nodesExpanded: singles.length,
 			depthStopped: 1,
 			firstActionStable: true,
-			reactiveGap: round$3(gap === Infinity ? 0 : gap),
+			reactiveGap: round$4(gap === Infinity ? 0 : gap),
 			rationale: singles.length === 1 ? `唯一候选 → 直接反应（${best.action}）` : `优劣悬殊（gap ${gap.toFixed(3)} ≥ ${this.dynamicGap.toFixed(3)} nat，证据 ${best.evidence.toFixed(0)}）→ 深思不会改变选择，VOC ≈ 0`
 		});
 		const search = this.searchAnytime(state, candidates, preference, opts?.useSkills, opts?.advance);
@@ -15637,11 +16742,11 @@ var RationalMetareasoner = class {
 			mode: "deliberative",
 			actions: search.report.actions,
 			report: search.report,
-			costNat: round$3(search.nodes * this.config.natPerNode),
+			costNat: round$4(search.nodes * this.config.natPerNode),
 			nodesExpanded: search.nodes,
 			depthStopped: search.depthStopped,
 			firstActionStable: search.stable,
-			reactiveGap: round$3(gap === Infinity ? 0 : gap),
+			reactiveGap: round$4(gap === Infinity ? 0 : gap),
 			rationale: search.stable ? `深思收敛：首行动 ${search.report.actions[0]} 连续 ${search.stableRounds} 层不变（深度 ${search.depthStopped} 早停，省 ${((this.config.maxDepth - search.depthStopped) * candidates.length).toFixed(0)} 节点）` : `深思预算耗尽（${search.nodes} 节点 / ${this.config.budgetNat} nat），首行动 ${search.report.actions[0]}（未收敛，结果存疑）`
 		});
 	}
@@ -15740,7 +16845,7 @@ var RationalMetareasoner = class {
 						actions: [...taken],
 						consecutiveSuccesses: candidate.successes,
 						usages: 0,
-						reliability: round$3(reliability),
+						reliability: round$4(reliability),
 						createdAt: Date.now(),
 						lastUsedAt: Date.now()
 					});
@@ -15756,7 +16861,7 @@ var RationalMetareasoner = class {
 	}
 	/** 当前动态反应门槛（元学习可观测） */
 	currentDecisivenessGap() {
-		return round$3(this.dynamicGap);
+		return round$4(this.dynamicGap);
 	}
 	/** 习惯库只读视图（审计） */
 	allHabits() {
@@ -15769,10 +16874,10 @@ var RationalMetareasoner = class {
 	/** 认知经济报告：思考的价格与价值的统一核算 */
 	cognitiveEconomy() {
 		const decisions = this.modeCounts.habit + this.modeCounts.reactive + this.modeCounts.deliberative;
-		const share = (m) => decisions === 0 ? 0 : round$3(this.modeCounts[m] / decisions);
-		const avgDepth = this.deliberationDepths.length > 0 ? round$3(this.deliberationDepths.reduce((a, b) => a + b, 0) / this.deliberationDepths.length) : 0;
+		const share = (m) => decisions === 0 ? 0 : round$4(this.modeCounts[m] / decisions);
+		const avgDepth = this.deliberationDepths.length > 0 ? round$4(this.deliberationDepths.reduce((a, b) => a + b, 0) / this.deliberationDepths.length) : 0;
 		const modeSuccessRate = {};
-		for (const [mode, stat] of Object.entries(this.modeOutcomes)) if (stat.ema !== void 0) modeSuccessRate[mode] = round$3(stat.ema);
+		for (const [mode, stat] of Object.entries(this.modeOutcomes)) if (stat.ema !== void 0) modeSuccessRate[mode] = round$4(stat.ema);
 		const interpretation = decisions === 0 ? "尚未决策：元推理待命" : this.staleHabitRegrets > 0 ? `习惯失灵 ${this.staleHabitRegrets} 次：世界在漂移，摊销经验需重建（已自动作废）` : this.habitHitRate(decisions) > .5 ? `认知经济健康：${(this.habitHitRate(decisions) * 100).toFixed(0)}% 决策走习惯直答，累计省 ${this.habitSavingsNat.toFixed(2)} nat` : this.modeCounts.reactive > this.modeCounts.deliberative * 3 ? "反应主导：多数决策证据充分，深思预算集中用在疑难处" : "深思主导：局势不确定，思考是主要开销——观察收敛深度是否下降";
 		return {
 			decisions,
@@ -15781,11 +16886,11 @@ var RationalMetareasoner = class {
 				reactive: share("reactive"),
 				deliberative: share("deliberative")
 			},
-			habitSavingsNat: round$3(this.habitSavingsNat),
-			totalSpendNat: round$3(this.totalSpendNat),
+			habitSavingsNat: round$4(this.habitSavingsNat),
+			totalSpendNat: round$4(this.totalSpendNat),
 			totalNodes: this.totalNodes,
 			habits: this.habits.size,
-			habitHitRate: round$3(this.habitHitRate(decisions)),
+			habitHitRate: round$4(this.habitHitRate(decisions)),
 			staleHabitRegrets: this.staleHabitRegrets,
 			reactiveFailures: this.reactiveFailures,
 			modeSuccessRate,
@@ -15798,7 +16903,7 @@ var RationalMetareasoner = class {
 	}
 	/** 同长度深思的成本估算（习惯节省额入账口径） */
 	estimateDeliberationCost(steps) {
-		return round$3(steps * this.config.beamBreadth * this.config.natPerNode * 2);
+		return round$4(steps * this.config.beamBreadth * this.config.natPerNode * 2);
 	}
 	/** 决策入账（pending 登记 + 认知经济计数） */
 	record(input) {
@@ -15839,7 +16944,7 @@ var RationalMetareasoner = class {
 function budgetExhausted(nodes, config) {
 	return nodes * config.natPerNode >= config.budgetNat;
 }
-function round$3(x) {
+function round$4(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -16106,7 +17211,7 @@ var AbstractionEngine = class {
 				actions: [...entry.actions],
 				domains: entry.domains.size,
 				successes: entry.successes,
-				value: round$2(entry.successes / (entry.successes + 1))
+				value: round$3(entry.successes / (entry.successes + 1))
 			});
 		} else {
 			entry.domains.delete(domain);
@@ -16232,7 +17337,7 @@ function decompose(state) {
 		hasSkeleton: true
 	};
 }
-function round$2(x) {
+function round$3(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -16357,16 +17462,16 @@ var ScientistMind = class {
 				from: q.from,
 				to: q.to,
 				arm: best.arm,
-				armEig: round$1(best.eig),
-				confoundingBonus: round$1(bonus),
-				lawBonus: round$1(lawBonus),
-				totalEig: round$1(totalEig),
-				netValue: round$1(netValue),
+				armEig: round$2(best.eig),
+				confoundingBonus: round$2(bonus),
+				lawBonus: round$2(lawBonus),
+				totalEig: round$2(totalEig),
+				netValue: round$2(netValue),
 				priorAlpha: best.alpha,
 				priorBeta: best.beta,
-				predictedP: round$1(best.p),
+				predictedP: round$2(best.p),
 				hypothesis: `假设：do(${q.from}=${best.arm ? "启用" : "停用"}) 对 ${q.to} 的效应将落在当前后验 ${best.p.toFixed(2)} 附近（混杂分歧 ${divergence.toFixed(2)}${divergence > 0 ? "，唯有干预可裁决" : ""}）`,
-				rationale: divergence > 0 ? `混杂加成 +${round$1(bonus)} nat：观测关联 ${eff.observationalAssociation.toFixed(2)} vs 干预效应 ${eff.ate.toFixed(2)} 背离——该边因果问题只能由干预裁决` : lawBonus > 0 ? `定律试验 +${round$1(lawBonus)} nat：该边在定律 ${law.id}（${law.members.length} 条边，P≈${law.lawP.toFixed(2)}）作用域内——一次实验校准整个作用域` : `最优臂 do=${best.arm}：一步期望熵收缩 ${best.eig.toFixed(3)} nat（另一臂 ${(best.eig === evals[0].eig ? evals[1].eig : evals[0].eig).toFixed(3)} nat）`
+				rationale: divergence > 0 ? `混杂加成 +${round$2(bonus)} nat：观测关联 ${eff.observationalAssociation.toFixed(2)} vs 干预效应 ${eff.ate.toFixed(2)} 背离——该边因果问题只能由干预裁决` : lawBonus > 0 ? `定律试验 +${round$2(lawBonus)} nat：该边在定律 ${law.id}（${law.members.length} 条边，P≈${law.lawP.toFixed(2)}）作用域内——一次实验校准整个作用域` : `最优臂 do=${best.arm}：一步期望熵收缩 ${best.eig.toFixed(3)} nat（另一臂 ${(best.eig === evals[0].eig ? evals[1].eig : evals[0].eig).toFixed(3)} nat）`
 			});
 		}
 		designs.sort((a, b) => b.netValue - a.netValue);
@@ -16407,9 +17512,9 @@ var ScientistMind = class {
 			to: design.to,
 			arm: design.arm,
 			observedY,
-			promisedEig: round$1(design.totalEig),
-			realizedInfo: round$1(realized),
-			surprisal: round$1(surprisal),
+			promisedEig: round$2(design.totalEig),
+			realizedInfo: round$2(realized),
+			surprisal: round$2(surprisal),
 			settledAt: now
 		};
 		this.ledger.push(entry);
@@ -16432,12 +17537,12 @@ var ScientistMind = class {
 		return {
 			questions: this.questions.size,
 			confoundedQuestions: confounded,
-			residualEntropyNat: round$1(residual),
+			residualEntropyNat: round$2(residual),
 			experimentsRun: this.ledger.length,
-			cumulativePromisedNat: round$1(this.cumulativePromised),
-			cumulativeRealizedNat: round$1(this.cumulativeRealized),
-			deliveryRate: round$1(delivered),
-			designCalibration: round$1(this.calibrationEma ?? 0),
+			cumulativePromisedNat: round$2(this.cumulativePromised),
+			cumulativeRealizedNat: round$2(this.cumulativeRealized),
+			deliveryRate: round$2(delivered),
+			designCalibration: round$2(this.calibrationEma ?? 0),
 			interpretation
 		};
 	}
@@ -16465,7 +17570,7 @@ function eigOfBeta(alpha, beta) {
 function clampProb(p) {
 	return Math.min(1 - 1e-6, Math.max(1e-6, p));
 }
-function round$1(x) {
+function round$2(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -16614,7 +17719,7 @@ var TheoristEngine = class {
 			theories: this.cached.length,
 			compressedEdges: compressed,
 			outlierEdges: outliers,
-			compressionNat: round(compression),
+			compressionNat: round$1(compression),
 			zeroShotPredictions: this.zeroShotCount,
 			paradigmShifts: this.paradigmShiftCount,
 			interpretation
@@ -16628,17 +17733,17 @@ var TheoristEngine = class {
 		const lawLogMl = lnBeta(1 + S, 1 + F);
 		const compressionNat = lawLogMl - members.reduce((a, m) => a + m.standaloneLogMlNat, 0);
 		for (const m of members) {
-			m.fitsLawNat = round(lawLogMl - lnBeta(1 + S - m.successes, 1 + F - m.failures) - m.standaloneLogMlNat);
+			m.fitsLawNat = round$1(lawLogMl - lnBeta(1 + S - m.successes, 1 + F - m.failures) - m.standaloneLogMlNat);
 			m.anomalous = m.fitsLawNat <= 0;
 		}
 		return {
 			lawAlpha: 1 + S,
 			lawBeta: 1 + F,
-			lawP: round(lawP),
-			lawLower: round(wilsonLowerBound(S, F)),
-			lawUpper: round(wilsonUpperBound(S, F)),
+			lawP: round$1(lawP),
+			lawLower: round$1(wilsonLowerBound(S, F)),
+			lawUpper: round$1(wilsonUpperBound(S, F)),
 			members,
-			compressionNat: round(compressionNat),
+			compressionNat: round$1(compressionNat),
 			status: members.some((m) => m.anomalous) ? "contested" : "law",
 			inducedAt: 0
 		};
@@ -16653,7 +17758,7 @@ function familyOf(id) {
 	const idx = id.indexOf(":");
 	return idx > 0 ? id.slice(0, idx) : id;
 }
-function round(x) {
+function round$1(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -16893,6 +17998,249 @@ var CuriosityEngine = class {
 	}
 };
 //#endregion
+//#region src/core/runtime-verification.ts
+/**
+* 缺省安全规约集（治理器语义的形式化镜像）
+*
+* 1. failure-storm（critical）：60s 窗口失败 ≤ 5 次——熔断阈值的
+*    时序化重述，违规即风暴确证 → Kill Switch；
+* 2. breaker-stuck（warn）：熔断打开后 10 分钟内必须闭合——
+*    「卡死的熔断」比没有熔断更糟（假安全）；
+* 3. kill-switch-left-on（info）：Kill Switch 挂起 24h 内必须解除——
+*    无人认领的紧急停止本身是运维事故。
+*/
+function defaultSafetySpecs(failureThreshold = 5) {
+	return [
+		{
+			id: "failure-storm",
+			pattern: "bounded-recurrence",
+			trigger: "action-failed",
+			maxCount: failureThreshold,
+			windowMs: 6e4,
+			severity: "critical",
+			description: `失败风暴上限：60 秒窗口内 action-failed 至多 ${failureThreshold} 次`
+		},
+		{
+			id: "breaker-stuck",
+			pattern: "response-deadline",
+			trigger: "breaker-opened",
+			responder: "breaker-closed",
+			withinMs: 6e5,
+			severity: "warn",
+			description: "熔断打开后 10 分钟内必须恢复闭合（卡死的熔断 = 假安全）"
+		},
+		{
+			id: "kill-switch-left-on",
+			pattern: "response-deadline",
+			trigger: "kill-switch-engaged",
+			responder: "kill-switch-disengaged",
+			withinMs: 864e5,
+			severity: "info",
+			description: "Kill Switch 挂起 24 小时内必须解除或人工认领"
+		}
+	];
+}
+/**
+* 规约监视器（模式专用 DFA；违规后终态）
+*
+* 每个监视器独立持有最小状态；step() 纯事件驱动，tick() 处理
+* 期限到期（deadline 类模式的「沉默违规」——不响应也是违规）。
+*/
+var SafetyMonitor = class {
+	spec;
+	status = "monitoring";
+	pendingDeadlines = [];
+	windowEvents = [];
+	sawTrigger = false;
+	recentTrace = [];
+	constructor(spec) {
+		this.spec = spec;
+	}
+	/** 当前状态（violated 为终态，直到 reset） */
+	get monitorStatus() {
+		return this.status;
+	}
+	/** 是否仍在监视（未违规） */
+	get active() {
+		return this.status === "monitoring";
+	}
+	/**
+	* 推进一个事件；返回该步产生的违规（至多一条）。
+	* 已终态（violated）的监视器静默吞事件（违规只报一次）。
+	*/
+	step(event) {
+		this.remember(event);
+		if (this.status === "violated") return void 0;
+		switch (this.spec.pattern) {
+			case "absence":
+				if (event.type === this.spec.trigger) return this.violate(event, `禁止事件 ${this.spec.trigger} 发生`, [event]);
+				return;
+			case "response-deadline":
+				if (event.type === this.spec.trigger) this.pendingDeadlines.push({
+					since: event.at,
+					events: [event]
+				});
+				else if (event.type === this.spec.responder) this.pendingDeadlines = [];
+				return;
+			case "bounded-recurrence":
+				if (event.type === this.spec.trigger) {
+					const windowMs = this.spec.windowMs ?? 6e4;
+					this.windowEvents = this.windowEvents.filter((e) => e.at > event.at - windowMs);
+					this.windowEvents.push(event);
+					const max = this.spec.maxCount ?? 1;
+					if (this.windowEvents.length > max) return this.violate(event, `窗口 ${windowMs}ms 内 ${this.spec.trigger} 达 ${this.windowEvents.length} 次（上限 ${max}）`, [...this.windowEvents]);
+				}
+				return;
+			case "precedence":
+				if (event.type === this.spec.trigger) this.sawTrigger = true;
+				else if (event.type === this.spec.responder && !this.sawTrigger) return this.violate(event, `${this.spec.responder} 出现但此前从未发生 ${this.spec.trigger}`, [event]);
+				return;
+			default: return;
+		}
+	}
+	/**
+	* 期限检查（沉默违规）：response-deadline 的未决义务到期未响应。
+	* 由 Verifier.observe 在每个事件后以当前时间调用。
+	*/
+	tick(now) {
+		if (this.status === "violated" || this.spec.pattern !== "response-deadline") return void 0;
+		const withinMs = this.spec.withinMs ?? 6e4;
+		const expired = this.pendingDeadlines.filter((d) => now - d.since > withinMs);
+		if (expired.length === 0) return void 0;
+		const witness = expired.flatMap((d) => d.events);
+		this.pendingDeadlines = [];
+		return this.violate({
+			type: "deadline-expired",
+			at: now
+		}, `${this.spec.trigger} 后 ${withinMs}ms 内未出现 ${this.spec.responder}（${expired.length} 项义务到期）`, witness);
+	}
+	/** 重置监视器（运维动作：规约解除后重新武装） */
+	reset() {
+		this.status = "monitoring";
+		this.pendingDeadlines = [];
+		this.windowEvents = [];
+		this.sawTrigger = false;
+		this.recentTrace = [];
+	}
+	/** 未决义务数（response-deadline 的在途压力；运维可观测） */
+	get pendingObligations() {
+		return this.pendingDeadlines.length;
+	}
+	remember(event) {
+		this.recentTrace.push(event);
+		if (this.recentTrace.length > 16) this.recentTrace.shift();
+	}
+	violate(at, message, witness) {
+		this.status = "violated";
+		return {
+			specId: this.spec.id,
+			pattern: this.spec.pattern,
+			severity: this.spec.severity ?? "warn",
+			at: at.at,
+			message,
+			witness,
+			spec: this.spec
+		};
+	}
+};
+/**
+* 运行时验证器
+*
+* observe(event) 单口进食：内部先跑各监视器 tick（期限到期检查），
+* 再 step（事件推进）；返回本步产生的全部违规（按严重级降序）。
+* 违规的监视器进入终态（同一规约只报一次），运维可 resetMonitor
+* 重新武装。全部判定确定性可重放：同一事件流 → 同一违规集。
+*/
+var RuntimeVerifier = class {
+	monitors = [];
+	violations = [];
+	eventsObserved = 0;
+	constructor(specs = defaultSafetySpecs()) {
+		for (const spec of specs) this.monitors.push(new SafetyMonitor(spec));
+	}
+	/** 注册附加规约（动态扩展；幂等 by id） */
+	register(spec) {
+		if (this.monitors.some((m) => m.spec.id === spec.id)) return;
+		this.monitors.push(new SafetyMonitor(spec));
+	}
+	/** 移除规约 */
+	unregister(specId) {
+		const index = this.monitors.findIndex((m) => m.spec.id === specId);
+		if (index < 0) return false;
+		this.monitors.splice(index, 1);
+		return true;
+	}
+	/** 规约清单（只读） */
+	get specs() {
+		return this.monitors.map((m) => m.spec);
+	}
+	/**
+	* 观察一个事件：期限检查 → 事件推进 → 收集违规。
+	* @returns 本步产生的违规（critical 优先；通常为空）
+	*/
+	observe(event) {
+		const enriched = {
+			...event,
+			at: event.at ?? Date.now()
+		};
+		this.eventsObserved += 1;
+		const produced = [];
+		for (const monitor of this.monitors) {
+			const deadlineViolation = monitor.tick(enriched.at);
+			if (deadlineViolation) produced.push(deadlineViolation);
+			const eventViolation = monitor.step(enriched);
+			if (eventViolation) produced.push(eventViolation);
+		}
+		if (produced.length > 0) {
+			this.violations.push(...produced);
+			produced.sort((a, b) => severityRank(b.severity) - severityRank(a.severity));
+		}
+		return produced;
+	}
+	/** 重新武装一条规约（终态 → 监视） */
+	resetMonitor(specId) {
+		const monitor = this.monitors.find((m) => m.spec.id === specId);
+		if (!monitor) return false;
+		monitor.reset();
+		return true;
+	}
+	/** 全部违规历史（审计通道；proof-carrying） */
+	get violationHistory() {
+		return [...this.violations];
+	}
+	/** 验证器状态 */
+	status() {
+		const bySeverity = {
+			info: 0,
+			warn: 0,
+			critical: 0
+		};
+		for (const v of this.violations) bySeverity[v.severity] += 1;
+		const active = this.monitors.filter((m) => m.active);
+		const violated = this.monitors.filter((m) => !m.active);
+		const lastViolations = [...this.violations].reverse().slice(0, 5).map((v) => ({
+			specId: v.specId,
+			severity: v.severity,
+			message: v.message
+		}));
+		const interpretation = this.monitors.length === 0 ? "运行时验证器空载（register 注册安全规约）" : this.violations.length === 0 ? `${this.monitors.length} 条规约全部在监（${this.eventsObserved} 事件，零违规）` : bySeverity.critical > 0 ? `已确证 critical 违规 ${bySeverity.critical} 次（应触发 Kill Switch 通道）` : `违规 ${this.violations.length} 次（warn ${bySeverity.warn} / info ${bySeverity.info}），${active.length} 条规约在监`;
+		return {
+			specs: this.monitors.length,
+			activeMonitors: active.length,
+			violatedMonitors: violated.length,
+			totalViolations: this.violations.length,
+			bySeverity,
+			eventsObserved: this.eventsObserved,
+			pendingObligations: this.monitors.reduce((sum, m) => sum + m.pendingObligations, 0),
+			lastViolations,
+			interpretation
+		};
+	}
+};
+function severityRank(severity) {
+	return severity === "critical" ? 3 : severity === "warn" ? 2 : 1;
+}
+//#endregion
 //#region src/safety-governor.ts
 /**
 * safety-governor.ts — 安全治理器（自主智能"边界"支柱）
@@ -16923,6 +18271,15 @@ var CuriosityEngine = class {
 *   未配置的动作沿用共享全局窗口（与升级前行为一致）
 * - 预算/审计持久化：persistPath 配置后，token/成本累计与审计尾部
 *   落盘重启恢复——升级前纯内存，重启即预算清零、审计丢失
+*
+* 15.0 升级（形式语义闭环）：
+* - attachRuntimeVerifier() 挂载运行时验证器后，治理器把自身全部
+*   关键迁移（动作失败/熔断开闭/Kill Switch 启停）作为事件流喂给
+*   LTLf 安全规约监视器——治理器从「标量门控的集合」升级为
+*   「被形式规约监视的守卫」；
+* - 违规升级通道：critical 违规（如失败风暴）→ 自动触发 Kill Switch
+*   （形式裁决获得治理的牙齿）；warn 违规 → 记入失败压力推动熔断；
+*   info → 仅审计。规约可配置声明、违规报告携带可重放见证轨迹。
 */
 /** 默认配置 */
 const DEFAULT_SAFETY_GOVERNOR_CONFIG = {
@@ -16962,12 +18319,46 @@ var SafetyGovernor = class {
 	audit = [];
 	/** 4.0：持久化防抖定时器 */
 	persistTimer;
+	/** 15.0：运行时验证器（挂载后治理迁移成为被监视的事件流） */
+	verifier;
+	/** 15.0：形式违规升级计数（审计可观测） */
+	formalViolations = {
+		critical: 0,
+		warn: 0,
+		info: 0
+	};
 	constructor(config) {
 		this.config = {
 			...DEFAULT_SAFETY_GOVERNOR_CONFIG,
 			...config
 		};
 		this.loadPersisted();
+	}
+	/**
+	* 15.0：挂载运行时验证器（幂等；缺省规约集以治理器自身的
+	* circuitFailureThreshold 参数化——失败风暴规约与熔断阈值同源）。
+	*
+	* 挂载后治理器的全部关键迁移自动喂入规约监视器：
+	* action-failed / breaker-opened / breaker-closed /
+	* kill-switch-engaged / kill-switch-disengaged。
+	*
+	* @param specs 安全规约集（缺省 defaultSafetySpecs(circuitFailureThreshold)）
+	* @returns 挂载的验证器（可继续 register 附加规约）
+	*/
+	attachRuntimeVerifier(specs) {
+		if (!this.verifier) this.verifier = new RuntimeVerifier(specs ?? defaultSafetySpecs(this.config.circuitFailureThreshold));
+		else if (specs && specs.length > 0) for (const spec of specs) this.verifier.register(spec);
+		return this.verifier;
+	}
+	/** 15.0：动态注册一条安全规约（需先挂载验证器） */
+	registerSafetySpec(spec) {
+		if (!this.verifier) this.attachRuntimeVerifier();
+		this.verifier.register(spec);
+		return true;
+	}
+	/** 15.0：运行时验证状态（未挂载时 undefined） */
+	getVerificationStatus() {
+		return this.verifier?.status();
 	}
 	/**
 	* 治理裁决：判定一个自主动作能否执行
@@ -17088,16 +18479,20 @@ var SafetyGovernor = class {
 			if (this.circuitState === "half-open") {
 				this.circuitState = "closed";
 				this.halfOpenProbeInFlight = false;
+				this.emit("breaker-closed", { via: "half-open-probe-success" });
 			}
 		} else {
 			this.consecutiveFailures += 1;
+			this.emit("action-failed", { consecutiveFailures: this.consecutiveFailures });
 			if (this.circuitState === "half-open") {
 				this.halfOpenProbeInFlight = false;
 				this.circuitState = "open";
 				this.circuitOpenedAt = Date.now();
+				this.emit("breaker-opened", { via: "half-open-probe-failure" });
 			} else if (this.consecutiveFailures >= this.config.circuitFailureThreshold && this.circuitState !== "open") {
 				this.circuitState = "open";
 				this.circuitOpenedAt = Date.now();
+				this.emit("breaker-opened", { via: `consecutive-failures-${this.consecutiveFailures}` });
 			}
 		}
 		this.schedulePersist();
@@ -17131,11 +18526,13 @@ var SafetyGovernor = class {
 	/** 启用 Kill Switch */
 	engageKillSwitch() {
 		this.killSwitchEngaged = true;
+		this.emit("kill-switch-engaged");
 		this.schedulePersist();
 	}
 	/** 解除 Kill Switch */
 	disengageKillSwitch() {
 		this.killSwitchEngaged = false;
+		this.emit("kill-switch-disengaged");
 		this.schedulePersist();
 	}
 	/** Kill Switch 状态 */
@@ -17144,9 +18541,11 @@ var SafetyGovernor = class {
 	}
 	/** 手动重置熔断器 */
 	resetCircuit() {
+		const wasNonClosed = this.circuitState !== "closed";
 		this.circuitState = "closed";
 		this.consecutiveFailures = 0;
 		this.halfOpenProbeInFlight = false;
+		if (wasNonClosed) this.emit("breaker-closed", { via: "manual-reset" });
 		this.schedulePersist();
 	}
 	/** 熔断器状态 */
@@ -17166,7 +18565,11 @@ var SafetyGovernor = class {
 				costUsed: Number(this.totalCost.toFixed(4)),
 				costBudget: this.config.costBudget
 			},
-			recentAudit: this.audit.slice(-10)
+			recentAudit: this.audit.slice(-10),
+			verification: this.verifier ? {
+				formalViolations: { ...this.formalViolations },
+				...this.verifier.status()
+			} : void 0
 		};
 	}
 	/** 审计日志 */
@@ -17203,6 +18606,41 @@ var SafetyGovernor = class {
 			this.persistTimer = void 0;
 		}
 		this.writePersist();
+	}
+	/**
+	* 15.0：治理事件流出口（挂载验证器时生效）。
+	*
+	* 事件喂入规约监视器；产出的违规按严重级升级：
+	* - critical → Kill Switch（形式裁决获得治理的牙齿）；
+	* - warn → 计入失败压力（推动熔断器开路）；
+	* - info → 仅计数审计。
+	*/
+	emit(type, detail) {
+		if (!this.verifier) return;
+		const violations = this.verifier.observe({
+			type,
+			at: Date.now(),
+			detail
+		});
+		for (const violation of violations) this.escalate(violation);
+	}
+	/** 形式违规升级通道 */
+	escalate(violation) {
+		this.formalViolations[violation.severity] += 1;
+		this.audit.push({
+			timestamp: violation.at,
+			action: "autonomous-execute",
+			verdict: {
+				allowed: false,
+				reason: `[formal] 规约 ${violation.specId} 违规（${violation.severity}）：${violation.message}`,
+				blockedBy: violation.severity === "critical" ? "kill-switch" : "circuit-breaker"
+			}
+		});
+		if (this.audit.length > this.config.auditLimit) this.audit.splice(0, this.audit.length - this.config.auditLimit);
+		if (violation.severity === "critical") {
+			this.killSwitchEngaged = true;
+			this.schedulePersist();
+		} else if (violation.severity === "warn") this.consecutiveFailures += 1;
 	}
 	/** 记录审计日志 */
 	logAudit(action, verdict) {
@@ -20327,6 +21765,333 @@ var KeyHealthManager = class {
 	}
 };
 //#endregion
+//#region src/core/shapley.ts
+/**
+* shapley.ts — Shapley 公平归因内核（项目 16.0「功劳分配有了公理根基」质变基座）
+*
+* 升级前的根本局限（多智能体协作的分配黑洞）：
+* - 「谁创造了价值」全靠启发式：均分（大锅饭）、末次触达（抢功）、
+*   出现计数（可刷）——三种启发式对同一份协作产出给出三种互相矛盾的
+*   分配，谁也说不清哪种「对」，因为它们不满足任何公平公理；
+* - 全部可被策略性操纵：搭便车者（不干活但出现）与末位冲刺者
+*   （在结果即将敲定时蹭最后一手）拿走真实贡献者的报酬——
+*   归因体系没有抗操纵的数学骨架；
+* - 点估计无不确定性：「模型 A 贡献 0.37」与「我们对 0.37 一无所知」
+*   在报表上无法区分。
+*
+* 本内核引入合作博弈论的 Shapley 值（Shapley 1953；2012 诺贝尔经济学奖）：
+*
+* 1. **公理化唯一性**：Shapley 值是同时满足四条公平公理的唯一分配——
+*    - 效率（efficiency）：Σφᵢ = V(N)，价值全额分发无遗漏；
+*    - 对称（symmetry）：对所有联盟边际贡献相同的两玩家分配相等；
+*    - 虚拟（dummy）：对所有联盟边际贡献为零者恰好分得 0
+*      ——搭便车在数学上无利可图，归因第一次拥有抗操纵性；
+*    - 可加（additivity）：两博弈的 Shapley 分配之和 = 联合博弈的分配。
+*
+* 2. **精确枚举（n ≤ exactThreshold）**：2ⁿ 联盟值全枚举 + 记忆化 +
+*    标准加权公式 φᵢ = Σ_{S⊆N∖{i}} |S|!(n−|S|−1)!/n!·[V(S∪{i})−V(S)]。
+*
+* 3. **排列采样 + 任意时刻有效置信区间（建在 12.0 之上）**：
+*    随机排列的边际贡献是 Shapley 值的无偏估计（Bourgaine–Friedgut）；
+*    每次排列为每个玩家产出一份边际样本，喂入经验伯恩斯坦置信序列
+*    （边际值域 [−1,1] 仿射缩放到 [0,1] 后观测，区间映射回来）——
+*    **偷看安全**：任意时刻读区间均有效，采样随停随用；
+*    提前停止：相邻名次玩家的置信区间分离（上者下界 > 下者上界）
+*    即停——「排定座次」本身成为受控事件，不再烧完预算才出结果。
+*
+* 4. **协同检测（synergy）**：V(A∪B) − V(A) − V(B) > 0 的玩家对
+*    存在正协同（1+1>2）——团队组建与编排亲和的量化依据；
+*    负协同（互相拆台）同样曝光，负协同对在编排上应被拆散。
+*
+* 5. **关键性指数（Banzhaf swing）**：玩家在多少联盟中是「摇摆者」
+*    （边际贡献 > 容差即改变局面）——比 Shapley 更尖锐的
+*    「关键人/不可替代节点」检测，供共生经济识别单点依赖。
+*
+* 与 12.0 的关系：Shapley 采样的不确定性由 12.0 的置信序列背书——
+* 归因数字第一次自带「这个数可信到什么程度」的数学答案。
+* 与 3-15.0 的关系：证据内核（3.0）记录「谁参与了什么」，因果内核
+* （5.0）回答「干预效应几何」，本内核回答「合作剩余如何公平分割」——
+* 参与 → 效应 → 分配，三层递进构成完整的多智能体问责链。
+*/
+const DEFAULT_SHAPLEY_CONFIG = {
+	exactThreshold: 8,
+	maxPermutations: 2e3,
+	alpha: .05,
+	minPermutations: 30,
+	tolerance: 1e-9
+};
+/**
+* Shapley 公平归因引擎
+*
+* 用法：
+*   const engine = new ShapleyAttributionEngine(valueFunction, config);
+*   const report = engine.attribute(['model-a', 'model-b', 'model-c']);
+*
+* 价值函数约定：值域 [0,1]（成功率/质量分/归一化收益等天然满足）；
+* 边际贡献因此落在 [−1,1]，采样模式经仿射缩放喂入 12.0 置信序列。
+*/
+var ShapleyAttributionEngine = class {
+	config;
+	valueOf;
+	rng;
+	/** 联盟值缓存（key = 排序后玩家逗号连接；跨调用复用——价值函数可能是昂贵查询） */
+	cache = /* @__PURE__ */ new Map();
+	constructor(valueFunction, config) {
+		this.config = {
+			...DEFAULT_SHAPLEY_CONFIG,
+			...config
+		};
+		this.valueOf = valueFunction;
+		this.rng = this.config.rng ?? Math.random;
+	}
+	/** 缓存命中的联盟值数（可观测：昂贵价值函数的节省程度） */
+	get cacheHits() {
+		return this.cache.size;
+	}
+	/**
+	* 公平归因主入口。
+	*
+	* n ≤ exactThreshold：2ⁿ 全枚举（精确，含 Banzhaf 关键性与协同对）；
+	* 否则：排列采样 + 12.0 置信区间（提前停止：名次分离即停）。
+	*/
+	attribute(players) {
+		const unique = [...new Set(players)];
+		if (unique.length === 0) return {
+			players: 0,
+			totalValue: 0,
+			attributions: [],
+			synergies: [],
+			exact: true,
+			permutations: 0,
+			efficiencyResidual: 0,
+			stopReason: "exact",
+			interpretation: "无玩家参与（空博弈，无价值可分）"
+		};
+		if (unique.length <= this.config.exactThreshold) return this.attributeExact(unique);
+		return this.attributeSampled(unique);
+	}
+	attributeExact(players) {
+		const n = players.length;
+		const totalValue = this.coalition(players);
+		const size = 1 << n;
+		const values = new Float64Array(size);
+		for (let mask = 0; mask < size; mask += 1) {
+			const coalition = [];
+			for (let i = 0; i < n; i += 1) if (mask & 1 << i) coalition.push(players[i]);
+			values[mask] = this.coalition(coalition);
+		}
+		const tolerance = this.config.tolerance;
+		const factorials = precomputedFactorials(n);
+		const shapleyValues = new Float64Array(n);
+		const swings = new Int32Array(n);
+		for (let i = 0; i < n; i += 1) {
+			let phi = 0;
+			const bit = 1 << i;
+			for (let s = 0; s < size; s += 1) {
+				if (s & bit) continue;
+				const marginal = values[s | bit] - values[s];
+				const sSize = popcount(s);
+				const weight = factorials[sSize] * factorials[n - sSize - 1] / factorials[n];
+				phi += weight * marginal;
+				if (marginal > tolerance) swings[i] += 1;
+			}
+			shapleyValues[i] = phi;
+		}
+		const order = [...players.keys()].sort((a, b) => shapleyValues[b] - shapleyValues[a]);
+		const sumPhi = shapleyValues.reduce((a, b) => a + b, 0);
+		const attributions = order.map((index, rank) => {
+			const phi = shapleyValues[index];
+			return {
+				playerId: players[index],
+				shapley: round(phi),
+				lower: round(phi),
+				upper: round(phi),
+				share: totalValue > tolerance ? round(Math.max(0, phi / totalValue)) : 0,
+				rank: rank + 1,
+				exact: true,
+				samples: 1 << n - 1,
+				criticality: round(swings[index] / (size / 2)),
+				isDummy: Math.abs(phi) <= tolerance,
+				provablyPositive: phi > tolerance
+			};
+		});
+		normalizeShares(attributions, totalValue, tolerance);
+		return {
+			players: n,
+			totalValue: round(totalValue),
+			attributions,
+			synergies: this.detectSynergies(players),
+			exact: true,
+			permutations: 0,
+			efficiencyResidual: round(sumPhi - totalValue),
+			stopReason: "exact",
+			interpretation: this.interpretExact(attributions, sumPhi, totalValue)
+		};
+	}
+	attributeSampled(players) {
+		const n = players.length;
+		const totalValue = this.coalition(players);
+		const tolerance = this.config.tolerance;
+		const streams = /* @__PURE__ */ new Map();
+		const criticalCount = /* @__PURE__ */ new Map();
+		for (const p of players) {
+			streams.set(p, new EmpiricalBernsteinSequence(this.config.alpha));
+			criticalCount.set(p, 0);
+		}
+		let permutations = 0;
+		let stopReason = "budget";
+		const working = [...players];
+		while (permutations < this.config.maxPermutations) {
+			for (let i = working.length - 1; i > 0; i -= 1) {
+				const j = Math.floor(this.rng() * (i + 1));
+				[working[i], working[j]] = [working[j], working[i]];
+			}
+			const prefix = [];
+			let prefixValue = this.coalition(prefix);
+			for (const player of working) {
+				prefix.push(player);
+				const newPrefixValue = this.coalition(prefix);
+				const marginal = newPrefixValue - prefixValue;
+				streams.get(player).observe((marginal + 1) / 2);
+				if (marginal > tolerance) criticalCount.set(player, criticalCount.get(player) + 1);
+				prefixValue = newPrefixValue;
+			}
+			permutations += 1;
+			if (permutations >= this.config.minPermutations && this.rankingDecided(streams, players)) {
+				stopReason = "ranking-decided";
+				break;
+			}
+		}
+		const estimates = players.map((p) => {
+			const bounds = streams.get(p).bounds();
+			return {
+				playerId: p,
+				shapley: round(2 * bounds.mean - 1),
+				lower: round(Math.max(-1, 2 * bounds.lower - 1)),
+				upper: round(Math.min(1, 2 * bounds.upper - 1)),
+				samples: bounds.n
+			};
+		});
+		estimates.sort((a, b) => b.shapley - a.shapley);
+		const sumPhi = estimates.reduce((a, e) => a + e.shapley, 0);
+		const attributions = estimates.map((e, rank) => ({
+			playerId: e.playerId,
+			shapley: e.shapley,
+			lower: e.lower,
+			upper: e.upper,
+			share: totalValue > tolerance && sumPhi > tolerance ? round(Math.max(0, e.shapley / sumPhi)) : 0,
+			rank: rank + 1,
+			exact: false,
+			samples: e.samples,
+			criticality: round(criticalCount.get(e.playerId) / permutations),
+			isDummy: e.upper <= tolerance,
+			provablyPositive: e.lower > tolerance
+		}));
+		normalizeShares(attributions, totalValue, tolerance);
+		const synergies = this.detectSynergies(players);
+		const decided = stopReason === "ranking-decided";
+		return {
+			players: n,
+			totalValue: round(totalValue),
+			attributions,
+			synergies,
+			exact: false,
+			permutations,
+			efficiencyResidual: round(sumPhi - totalValue),
+			stopReason,
+			interpretation: decided ? `${permutations} 次排列后名次已统计分离（任意时刻有效，偷看安全）——第 1 名 ${attributions[0].playerId}（φ̂=${attributions[0].shapley.toFixed(3)}）` : `预算耗尽（${permutations} 次排列）：座次部分未决，区间仍任意时刻有效——头部 ${attributions[0].playerId}（φ̂=${attributions[0].shapley.toFixed(3)}，CI [${attributions[0].lower.toFixed(3)}, ${attributions[0].upper.toFixed(3)}]）`
+		};
+	}
+	/**
+	* 名次分离判定：按当前中心估计排序后，所有相邻对
+	* （上者置信下界 > 下者置信上界）均分离 → 座次统计上已定。
+	* 置信序列任意时刻有效——这一判定本身偷看安全。
+	*/
+	rankingDecided(streams, players) {
+		if (players.length < 2) return true;
+		const views = players.map((p) => {
+			const b = streams.get(p).bounds();
+			return {
+				mean: 2 * b.mean - 1,
+				lower: 2 * b.lower - 1,
+				upper: 2 * b.upper - 1
+			};
+		});
+		views.sort((a, b) => b.mean - a.mean);
+		for (let i = 1; i < views.length; i += 1) if (views[i - 1].lower <= views[i].upper) return false;
+		return true;
+	}
+	/**
+	* 两两协同分析：V(A∪B) − V(A) − V(B)。
+	* 正协同对应组队增益，负协同对应互相拆台——均只保留超容差者。
+	*/
+	detectSynergies(players) {
+		const tolerance = this.config.tolerance;
+		const pairs = [];
+		for (let i = 0; i < players.length; i += 1) for (let j = i + 1; j < players.length; j += 1) {
+			const a = players[i];
+			const b = players[j];
+			const synergy = this.coalition([a, b]) - this.coalition([a]) - this.coalition([b]);
+			if (Math.abs(synergy) <= tolerance) continue;
+			pairs.push({
+				a,
+				b,
+				synergy: round(synergy),
+				kind: synergy > 0 ? "positive" : "negative"
+			});
+		}
+		pairs.sort((x, y) => Math.abs(y.synergy) - Math.abs(x.synergy));
+		return pairs;
+	}
+	/** 联盟值查询（排序记忆化：同一玩家集合只估值一次） */
+	coalition(members) {
+		const key = [...members].sort().join(",");
+		const cached = this.cache.get(key);
+		if (cached !== void 0) return cached;
+		const value = this.valueOf(members);
+		this.cache.set(key, value);
+		return value;
+	}
+	interpretExact(attributions, sumPhi, totalValue) {
+		const top = attributions[0];
+		const dummies = attributions.filter((a) => a.isDummy);
+		const parts = [`精确 Shapley（${attributions.length} 玩家，Σφ=${sumPhi.toFixed(3)}=V(N)）——第 1 名 ${top.playerId}（φ=${top.shapley.toFixed(3)}，份额 ${(top.share * 100).toFixed(1)}%）`];
+		if (dummies.length > 0) parts.push(`虚拟玩家 ${dummies.length} 名（数学上分得 0，搭便车无利可图）`);
+		return parts.join("；");
+	}
+};
+/** 预计算阶乘表 0!..n! */
+function precomputedFactorials(n) {
+	const f = [1];
+	for (let i = 1; i <= n; i += 1) f.push(f[i - 1] * i);
+	return f;
+}
+/** 位计数（popcount） */
+function popcount(x) {
+	let count = 0;
+	while (x) {
+		x &= x - 1;
+		count += 1;
+	}
+	return count;
+}
+/**
+* 份额归一（效率公理落地）：非 dummy 玩家的份额按 Σφ 比例缩放，
+* 使 Σ share = 1 精确成立；负 Shapley（拆台者）份额钉 0。
+*/
+function normalizeShares(attributions, totalValue, tolerance) {
+	if (totalValue <= tolerance) {
+		for (const a of attributions) a.share = 0;
+		return;
+	}
+	const sumPositive = attributions.filter((a) => a.shapley > tolerance).reduce((s, a) => s + a.shapley, 0);
+	if (sumPositive <= tolerance) {
+		for (const a of attributions) a.share = 0;
+		return;
+	}
+	for (const a of attributions) a.share = a.shapley > tolerance ? round(a.shapley / sumPositive) : 0;
+}
+//#endregion
 //#region src/index.ts
 /**
 * index.ts — dsh-proactive 核心插件入口（集成层）
@@ -21044,6 +22809,26 @@ function apply(ctx, config) {
 		metaCognition.attachTheoristEngine(theoristEngine);
 		scientistMind?.attachTheorist(theoristEngine);
 	}
+	if (cfg.autonomy?.anytimeEvidence?.enabled === true) {
+		strategyEvolution.attachAnytimeEvidence({
+			alpha: cfg.autonomy.anytimeEvidence.alpha,
+			reference: cfg.autonomy.anytimeEvidence.reference
+		});
+		metaCognition.attachAnytimeGuards({ alpha: cfg.autonomy.anytimeEvidence.alpha });
+	}
+	const conformalCfg = cfg.autonomy?.conformal;
+	if (conformalCfg?.enabled === true) {
+		const conformalEngine = new ConformalIntervalEngine({
+			alpha: conformalCfg.alpha,
+			maxCalibration: conformalCfg.maxCalibration
+		});
+		worldModel.attachConformalCalibrator(conformalEngine);
+		reflectionEngine.attachRiskController({
+			targetRisk: conformalCfg.thresholdTargetRisk,
+			confidence: conformalCfg.thresholdConfidence
+		});
+	}
+	if (cfg.autonomy?.qualityDiversity?.enabled === true) strategyEvolution.attachQualityDiversity({ exploreRate: cfg.autonomy.qualityDiversity.exploreRate });
 	if (activeInferenceEnabled) {
 		modelScheduler.attachFreeEnergy(freeEnergyEngine);
 		modelScheduler.updateConfig({
@@ -21052,6 +22837,10 @@ function apply(ctx, config) {
 		});
 	}
 	const governor = new SafetyGovernor(cfg.autonomy?.governor);
+	if (cfg.autonomy?.runtimeVerification?.enabled === true) {
+		const verifier = governor.attachRuntimeVerifier();
+		for (const spec of cfg.autonomy.runtimeVerification.specs ?? []) verifier.register(spec);
+	}
 	/** KPI 采集器：从真实引擎状态聚合 KPI 快照 */
 	const collectKpi = () => {
 		const modelStatuses = llm.getModelStatuses();
@@ -22635,4 +24424,4 @@ Object.defineProperty(pluginEntry, "name", { value: name });
 pluginEntry.Config = Config;
 pluginEntry.provide = ["scheduler", "schedulerTools"];
 //#endregion
-export { AbstractionEngine, AgentBase, AliasMap, AppError, AutonomyLoop, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, BeliefMarket, BenchmarkEngine, CHANNEL_GROUPS, CausalKernel, CircuitBreaker, CircuitBreakerRegistry, CognitiveMarket, Config, ConfigError, CryptoEngine, CryptoError, CuriosityEngine, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, DecisionEngine, DeliberationEngine, DistributedSync, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EnergyLedger, EvolverAgent, ExecutionError, FreeEnergyEngine, GoalEngine, HotReloadEngine, INCINERATOR, JsonMemoryBackend, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMError, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, MemoryAgent, MemoryError, MemoryGraph, MetaCognitionEngine, MetaCognitiveController, MigrationTool, ModelAgent, ModelScheduler, NetworkError, Optimizer, OptimizerAgent, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PolicyEvolver, PolicySimulator, ProgressBroadcaster, RaftEngine, RationalMetareasoner, ReflectionEngine, Reflector, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, SafetyGovernor, Sandbox, ScientistMind, SelfModel, Sentinel, SqliteMemoryBackend, StrategyEvolutionEngine, SymbiosisBridge, SymbiosisRuntime, TREASURY, TaskExecutor, TenantManager, TheoristEngine, TimeoutError, ToolError, ToolRegistry, WorldModel, abortableSleep, apply, attachDashboard, backoffDelayMs, bernoulliKL, betaEntropy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, classifyError, coalitionValue, computeHomeostasis, cosineSimilarity, createBaselinePolicy, createMemoryBackend, decayFactor, decompose, pluginEntry as default, digamma, emptyMemoryStore, evaluateMemoryCondition, evidenceRankScore, extractReplayTasks, generateAdversarialTasks, initEvidence, isTradeListener, lessonsToInsights, listingsOf, lnGamma, matchesMemoryConditions, modelAgentId, modelSignalKey, name, normalizePolicyParams, observeEvidence, parseJSONLoose, policyParamsWithinBounds, policyRuleMatches, readEvidence, renderSankeyHtml, resolveEffectiveParams, sampleBeta, sanitizeMemoryStore, scoreModelWithPolicy, segment, setChineseTokenizer, shapleyValues, sqliteAvailable, sqlitePathFor, toSparseVector, tokenizeChinese, wilsonLowerBound };
+export { AbstractionEngine, AgentBase, AliasMap, AnytimeEvidenceRegistry, AnytimeEvidenceStream, AppError, AutonomyLoop, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, BeliefMarket, BenchmarkEngine, CHANNEL_GROUPS, CausalKernel, CircuitBreaker, CircuitBreakerRegistry, CognitiveMarket, Config, ConfigError, ConformalIntervalEngine, CoverageDriftMonitor, CryptoEngine, CryptoError, CuriosityEngine, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, DecisionEngine, DeliberationEngine, DistributedSync, EProcess, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EnergyLedger, EvolverAgent, ExecutionError, FreeEnergyEngine, GoalEngine, HotReloadEngine, INCINERATOR, JsonMemoryBackend, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMError, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, MapElitesArchive, MemoryAgent, MemoryError, MemoryGraph, MetaCognitionEngine, MetaCognitiveController, MigrationTool, ModelAgent, ModelScheduler, NetworkError, Optimizer, OptimizerAgent, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PolicyEvolver, PolicySimulator, ProgressBroadcaster, RaftEngine, RationalMetareasoner, ReflectionEngine, Reflector, RuntimeVerifier, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafetyGovernor, SafetyMonitor, Sandbox, ScientistMind, SelfModel, Sentinel, ShapleyAttributionEngine, SqliteMemoryBackend, StrategyEvolutionEngine, SymbiosisBridge, SymbiosisRuntime, TREASURY, TaskExecutor, TenantManager, TheoristEngine, TimeoutError, ToolError, ToolRegistry, WorldModel, abortableSleep, apply, attachDashboard, backoffDelayMs, bernoulliKL, betaEntropy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, classifyError, coalitionValue, computeHomeostasis, conformalQuantile, cosineSimilarity, createBaselinePolicy, createMemoryBackend, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, eBenjaminiHochberg, emptyMemoryStore, evaluateMemoryCondition, evidenceRankScore, extractReplayTasks, fixedSampleUpperBound, generateAdversarialTasks, initEvidence, isTradeListener, lessonsToInsights, listingsOf, lnGamma, matchesMemoryConditions, modelAgentId, modelSignalKey, name, normalizePolicyParams, observeEvidence, parseJSONLoose, policyParamsWithinBounds, policyRuleMatches, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, sanitizeMemoryStore, scoreModelWithPolicy, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, toSparseVector, tokenizeChinese, wilsonLowerBound };

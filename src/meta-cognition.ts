@@ -17,6 +17,12 @@
 
 import type { Insight } from './goal-engine.js';
 import type { CausalEffect, CausalKernel } from './core/causal-kernel.js';
+import {
+  AnytimeEvidenceStream,
+  EProcess,
+  EmpiricalBernsteinSequence,
+  type AnytimeVerdict,
+} from './core/anytime-evidence.js';
 
 /** KPI 快照 */
 export interface KpiSnapshot {
@@ -127,6 +133,30 @@ export interface HealthReport {
    * 世界→计划→心智→泛化→求知→体系化。
    */
   theoryFrontier?: import('./core/theorist.js').TheoryFrontier;
+  /**
+   * 12.0：KPI 保证层（任意时刻有效裁决——退化判定的数学背书）。
+   *
+   * z-score/连续计数是固定样本统计，反复读取会累积假阳性（偷看悖论）；
+   * 保证层为关键 KPI 维护 e-过程证据流，以目标线为水位线：
+   * 「KPI 真实水平低于目标」这一结论在**任意时刻**读取都有效
+   * （e ≥ 1/α 才确证，否则诚实 undecided）——退化告警第一次
+   * 免疫偷看，恢复确证同理。KPI 第七层：世界→计划→心智→泛化→
+   * 求知→体系化→结论本身的可信度。
+   */
+  guarantees?: {
+    streams: Array<{
+      kpi: string;
+      reference: number;
+      verdict: AnytimeVerdict;
+      /** 情节化当前状态：degraded = 确证退化中；recovered = 已确证恢复；undefined = 尚未确证过 */
+      regime?: 'degraded' | 'recovered';
+      eBelow: number;
+      anytimeP: number;
+      n: number;
+      cs: { lower: number; upper: number };
+    }>;
+    interpretation: string;
+  };
 }
 
 /** 元认知配置 */
@@ -224,6 +254,127 @@ export class MetaCognitionEngine {
   private metareasoner?: import('./core/metareasoning.js').RationalMetareasoner;
   private abstractionEngine?: import('./core/abstraction.js').AbstractionEngine;
   private scientistMind?: import('./core/scientist.js').ScientistMind;
+  /** 12.0：KPI 保证层（挂载后退化/恢复判定获得任意时刻有效背书） */
+  private anytimeGuards?: Map<string, AnytimeEvidenceStream>;
+  /** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
+  private guardAlpha = 0.05;
+  /**
+   * 12.0：KPI 情节化状态机（首次确证退化后启用）。
+   *
+   * 全历史 e-过程的资本是只涨难跌的累计证据——确证退化后，即使 KPI
+   * 完全恢复，旧资本也会长期压住「已恢复」的事实（恢复不可检测）。
+   * 状态机改以水位线两侧的**连续 run** 为情节：恢复通道只吃水位线上
+   * 连续批次的证据（e-过程确证 H0: μ ≤ 水位线 被拒，或 CS 下界越过
+   * 水位线）；再劣化通道对称。跨线即重置对侧通道（翻转沿语义，
+   * 稳态不重复打扰）。
+   *
+   * 有效性口径（如实标注）：报警方向（首次确证）始终保持全历史
+   * 任意时刻有效（Ville，偷看免疫）；情节化通道是「重启式监测」——
+   * 每次重启都是合法的水平 α 检验，跨情节的选择效应不具全局有效性
+   * （重启式监测的标准取舍：报警从严，全清从宽）。
+   */
+  private regimeWatches?: Map<
+    string,
+    {
+      regime: 'degraded' | 'recovered';
+      recovery: { e: EProcess; cs: EmpiricalBernsteinSequence };
+      degrade: { e: EProcess; cs: EmpiricalBernsteinSequence };
+    }
+  >;
+
+  /** 新建一条情节通道（e-过程 + 置信序列） */
+  private newGuardChannel(reference: number, side: 'at-most' | 'at-least') {
+    return { e: new EProcess(reference, side), cs: new EmpiricalBernsteinSequence(this.guardAlpha) };
+  }
+
+  /**
+   * 12.0：挂载 KPI 保证层（幂等）。
+   *
+   * 为 successRate / avgQuality 各建一条 e-过程证据流，水位线 =
+   * 各自目标线。「低于目标」的告警从此自带数学保证：任意时刻、
+   * 任意频率地读取都不夸大（偷看免疫）。
+   */
+  attachAnytimeGuards(options?: { alpha?: number }): void {
+    const alpha = options?.alpha ?? 0.05;
+    this.guardAlpha = alpha;
+    this.anytimeGuards = new Map([
+      ['successRate', new AnytimeEvidenceStream({ alpha, reference: this.config.successRateTarget })],
+      ['avgQuality', new AnytimeEvidenceStream({ alpha, reference: this.config.qualityTarget })],
+    ]);
+    this.regimeWatches = new Map();
+  }
+
+  /**
+   * 12.0：保证层检验（每批快照后调用）。
+   *
+   * 阶段一（未确证过）：全历史 e-过程裁决——e ≥ 1/α 才确证退化
+   * （高严重度，证据携带 e-值与任意时刻 p-值），否则诚实不打扰。
+   * 阶段二（确证过至少一次）：情节化状态机跟踪当前状态——恢复与
+   * 再劣化都要求持续越过水位线的证据（e-确证或 CS 交叉），翻转沿
+   * 产出洞察。
+   */
+  private checkGuarantee(kpi: string, value: number): Insight[] {
+    const stream = this.anytimeGuards?.get(kpi);
+    if (!stream) return [];
+    const view = stream.observe(value); // 全历史流持续积累（健康报告口径）
+    const ref = stream.reference;
+    const threshold = 1 / this.guardAlpha;
+    const insights: Insight[] = [];
+    const watch = this.regimeWatches?.get(kpi);
+
+    if (!watch) {
+      // 阶段一：全历史任意时刻有效确证（偷看免疫）
+      if (view.verdict === 'below-reference') {
+        this.regimeWatches?.set(kpi, {
+          regime: 'degraded',
+          recovery: this.newGuardChannel(ref, 'at-most'),
+          degrade: this.newGuardChannel(ref, 'at-least'),
+        });
+        insights.push({
+          source: 'meta-cognition',
+          category: 'kpi-degradation-confirmed',
+          severity: 0.9,
+          message: `KPI ${kpi} 真实水平低于目标线 ${ref} 已被任意时刻有效证据确证（e=${view.eBelow.toFixed(1)}，anytime-p=${view.anytimeP.toFixed(4)}，${view.n} 样本，偷看免疫）`,
+          suggestion: `退化确证非偷看假象：按 ${kpi} 的因果旋钮排序实施干预，并持续观察保证层裁决`,
+        });
+      }
+      return insights;
+    }
+
+    // 阶段二：情节化状态机（水位线两侧的连续 run 裁决当前状态）
+    if (value < ref) {
+      // 线下证据：中断恢复 run（恢复证据清零），积累劣化 run
+      watch.recovery = this.newGuardChannel(ref, 'at-most');
+      const e = watch.degrade.e.observe(value);
+      watch.degrade.cs.observe(value);
+      if (watch.regime === 'recovered' && (e >= threshold || watch.degrade.cs.bounds().upper <= ref)) {
+        watch.regime = 'degraded';
+        insights.push({
+          source: 'meta-cognition',
+          category: 'kpi-degradation-confirmed',
+          severity: 0.85,
+          message: `KPI ${kpi} 劣化复发：水位线下连续 ${watch.degrade.e.count} 批证据（e=${e.toFixed(1)}，CS 上界 ${watch.degrade.cs.bounds().upper.toFixed(2)} ≤ 目标线 ${ref}）`,
+          suggestion: '劣化复发：优先检查上一次恢复对应的干预是否被回滚',
+        });
+      }
+    } else {
+      // 线上证据：中断劣化 run（劣化证据清零），积累恢复 run
+      watch.degrade = this.newGuardChannel(ref, 'at-least');
+      const e = watch.recovery.e.observe(value);
+      watch.recovery.cs.observe(value);
+      if (watch.regime === 'degraded' && (e >= threshold || watch.recovery.cs.bounds().lower >= ref)) {
+        watch.regime = 'recovered';
+        insights.push({
+          source: 'meta-cognition',
+          category: 'kpi-recovery-confirmed',
+          severity: 0.3,
+          message: `KPI ${kpi} 退出确证退化态：水位线上连续 ${watch.recovery.e.count} 批证据（CS 下界 ${watch.recovery.cs.bounds().lower.toFixed(2)} ≥ 目标线 ${ref}，e=${e.toFixed(1)}）——自愈或干预见效`,
+          suggestion: '保持当前参数并继续观察置信序列走势',
+        });
+      }
+    }
+    return insights;
+  }
 
   /**
    * 5.0：因果旋钮排序 —— 哪个旋钮真正导致了目标 KPI 的改善。
@@ -284,6 +435,12 @@ export class MetaCognitionEngine {
 
     // 0. 5.0：调参干预对账（上批调参 → 本批 KPI 即实验读数）
     this.settleTuningInterventions(snapshot);
+
+    // 0.5 12.0：KPI 保证层检验（任意时刻有效裁决的翻转沿洞察）
+    if (this.anytimeGuards) {
+      insights.push(...this.checkGuarantee('successRate', snapshot.successRate));
+      insights.push(...this.checkGuarantee('avgQuality', snapshot.avgQuality));
+    }
 
     // 1. z-score 异常检测（窗口足够时）
     if (this.history.length >= 5) {
@@ -359,6 +516,35 @@ export class MetaCognitionEngine {
       knowledgeFrontier: this.scientistMind ? this.scientistMind.knowledgeFrontier() : undefined,
       // 11.0：理论前沿 KPI（挂载理论内核时输出）
       theoryFrontier: this.theoristEngine ? this.theoristEngine.frontier() : undefined,
+      // 12.0：KPI 保证层（挂载 anytime 守卫后输出）
+      guarantees: this.anytimeGuards
+        ? (() => {
+            const streams = [...this.anytimeGuards!.entries()].map(([kpi, stream]) => {
+              const v = stream.view();
+              return {
+                kpi,
+                reference: stream.reference,
+                verdict: v.verdict,
+                /** 12.0：情节化当前状态（undefined = 尚未确证过退化） */
+                regime: this.regimeWatches?.get(kpi)?.regime,
+                eBelow: v.eBelow,
+                anytimeP: v.anytimeP,
+                n: v.n,
+                cs: { lower: v.cs.lower, upper: v.cs.upper },
+              };
+            });
+            const degraded = streams.filter(
+              (s) => s.regime === 'degraded' || (s.regime === undefined && s.verdict === 'below-reference'),
+            );
+            const interpretation =
+              streams.every((s) => s.n === 0)
+                ? '保证层已挂载，等待首批 KPI 快照'
+                : degraded.length === 0
+                  ? '全部受保护 KPI 未确证退化（任意时刻有效，偷看免疫）'
+                  : `${degraded.map((s) => s.kpi).join('、')} 处于确证退化态（全历史 e-过程背书；情节化通道跟踪恢复/复发）`;
+            return { streams, interpretation };
+          })()
+        : undefined,
     };
   }
 

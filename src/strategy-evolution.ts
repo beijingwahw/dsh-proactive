@@ -26,6 +26,8 @@
 
 import type { DecisionEngineConfig } from './decision-engine.js';
 import { initEvidence, observeWeightedEvidence, wilsonLowerBound, type MemoryEvidence } from './core/evidence.js';
+import { AnytimeEvidenceRegistry, type AnytimeEvidenceRegistryReport, type AnytimeEvidenceView } from './core/anytime-evidence.js';
+import { MapElitesArchive, STRATEGY_BEHAVIOR_SPACE, strategyBehaviorDescriptor, type QualityDiversityMetrics } from './core/quality-diversity.js';
 
 /** 基因组基因（决策引擎可调超参数子集） */
 export interface StrategyGenes {
@@ -129,6 +131,10 @@ export interface EvolutionStatusReport {
   genomes: Array<{ id: string; generation: number; applications: number; meanReward: number; genes: StrategyGenes }>;
   bestGenome: string;
   recentEvolutions: EvolutionReport[];
+  /** 14.0：质量-多样性指标（attachQualityDiversity 后输出） */
+  qd?: QualityDiversityMetrics;
+  /** 12.0：任意时刻证据报告（attachAnytimeEvidence 后输出） */
+  anytime?: AnytimeEvidenceRegistryReport;
 }
 
 /**
@@ -137,6 +143,15 @@ export interface EvolutionStatusReport {
  * 被 index.ts 持有：决策引擎每次决策前通过 selectGenome() 获取当前基因组
  * （其基因作为决策引擎运行时参数），决策结果经 recordOutcome() 回写适应度，
  * autonomy-loop 定期调用 evolve() 驱动种群进化。
+ *
+ * 12.0 移植（attachAnytimeEvidence）：适应度从 Wilson 固定样本下界升级为
+ * 任意时刻有效置信序列下界（流式统计永不夸大）；pruneProvablyDominated
+ * 以 e-BH FDR 控制淘汰「证明确实低于水位线」的基因组——冤案率有数学上限。
+ *
+ * 14.0 移植（attachQualityDiversity）：selectGenome 的探索从纯 UCB 升级为
+ * 「前沿 niche 均匀采样」——每种行为流派（敢为 × 节俭 × 警觉）获得等量
+ * 试验预算；evolve 同步维护 MAP-Elites 归档，多样性可审计（coverage/QD-score）。
+ * 两个移植均为并行旁路：不 attach 即零漂移。
  */
 export class StrategyEvolutionEngine {
   private config: StrategyEvolutionConfig;
@@ -146,11 +161,45 @@ export class StrategyEvolutionEngine {
   private applicationsSinceEvolution = 0;
   private evolutionHistory: EvolutionReport[] = [];
   private rng: () => number;
+  /** 12.0：任意时刻证据登记表（attach 后启用） */
+  private anytime?: AnytimeEvidenceRegistry;
+  /** 12.0：已淘汰基因组的 e-值台账（审计） */
+  private anytimeEliminations: Array<{ id: string; eValue: number; at: number }> = [];
+  /** 14.0：MAP-Elites 行为归档（attach 后启用） */
+  private qdArchive?: MapElitesArchive<StrategyGenome>;
+  /** 14.0：前沿 niche 采样概率（探索预算占比） */
+  private qdExploreRate = 0.25;
 
   constructor(config?: Partial<StrategyEvolutionConfig>) {
     this.config = { ...DEFAULT_STRATEGY_EVOLUTION_CONFIG, ...config };
     this.rng = this.config.rng ?? Math.random;
     this.seedPopulation();
+  }
+
+  /**
+   * 12.0：挂载任意时刻证据内核（幂等；挂载后适应度用置信序列下界，
+   * recordOutcome 的收益同时喂入该基因组的 e-过程）。
+   */
+  attachAnytimeEvidence(options?: { alpha?: number; reference?: number }): void {
+    this.anytime = new AnytimeEvidenceRegistry({ alpha: options?.alpha, reference: options?.reference });
+  }
+
+  /**
+   * 14.0：挂载质量-多样性内核（幂等；挂载后 selectGenome 以
+   * qdExploreRate 概率从行为归档均匀采样探索，evolve 同步维护归档）。
+   */
+  attachQualityDiversity(options?: { bins?: number[]; exploreRate?: number; rng?: () => number }): void {
+    const bins = options?.bins ?? STRATEGY_BEHAVIOR_SPACE.defaultBins;
+    this.qdExploreRate = options?.exploreRate ?? 0.25;
+    this.qdArchive = new MapElitesArchive<StrategyGenome>({
+      bins,
+      ranges: STRATEGY_BEHAVIOR_SPACE.ranges,
+      descriptor: (g) => strategyBehaviorDescriptor(g.genes),
+      fitness: (g) => this.fitness(g),
+      rng: options?.rng ?? this.rng,
+      tieTolerance: 1e-9,
+    });
+    for (const genome of this.population) this.qdArchive.place(genome);
   }
 
   /**
@@ -161,6 +210,12 @@ export class StrategyEvolutionEngine {
    * @returns 选中的基因组
    */
   selectGenome(): StrategyGenome {
+    // 14.0：前沿 niche 采样探索——以 qdExploreRate 概率从行为归档均匀
+    // 抽一个「活法流派」的代表（每个流派等量试验预算；空归档自动跳过）
+    if (this.qdArchive && this.qdArchive.occupiedNiches > 1 && this.rng() < this.qdExploreRate) {
+      const sampled = this.qdArchive.sample();
+      if (sampled && this.population.includes(sampled)) return sampled;
+    }
     const totalApplications = this.population.reduce((sum, g) => sum + g.applications, 0);
     let best: StrategyGenome = this.population[0];
     let bestScore = -Infinity;
@@ -194,6 +249,8 @@ export class StrategyEvolutionEngine {
     const now = Date.now();
     if (!genome.evidence) genome.evidence = initEvidence(0, 0, now);
     observeWeightedEvidence(genome.evidence, reward, now);
+    // 12.0：同一观测喂入任意时刻证据流（e-过程在任意停止时刻合法）
+    this.anytime?.observe(genomeId, reward);
     this.applicationsSinceEvolution += 1;
   }
 
@@ -240,6 +297,12 @@ export class StrategyEvolutionEngine {
     // 种群规模收敛
     while (this.population.length > this.config.populationSize) this.population.pop();
 
+    // 14.0：进化后同步归档——每个行为 niche 保留种群内最优代表
+    // （全局平庸但本地独特的基因组获得结构性生存权）
+    if (this.qdArchive) {
+      for (const genome of this.population) this.qdArchive.place(genome);
+    }
+
     this.applicationsSinceEvolution = 0;
     this.evolutionHistory.push(report);
     if (this.evolutionHistory.length > 50) this.evolutionHistory.shift();
@@ -276,12 +339,81 @@ export class StrategyEvolutionEngine {
         })),
       bestGenome: this.bestGenome().id,
       recentEvolutions: this.evolutionHistory.slice(-5),
+      qd: this.qdArchive?.metrics(),
+      anytime: this.anytime?.report(),
     };
   }
 
   /** 进化历史 */
   getEvolutionHistory(): EvolutionReport[] {
     return [...this.evolutionHistory];
+  }
+
+  // ─────────────────────────── 12.0 任意时刻证据移植 ───────────────────────────
+
+  /**
+   * 证明性淘汰（12.0）：e-BH FDR 控制地移除「任意时刻有效证据确证
+   * 收益低于水位线」的基因组。
+   *
+   * 语义：只删 e-过程确证（e ≥ 1/α）且通过多重校正的对象——
+   * 「确实差」才淘汰，冤案率（FDR）≤ fdr；淘汰后由幸存者变异后代
+   * 顶替（种群规模不缩水）。未挂载内核时返回空报告（零漂移）。
+   *
+   * @returns 被淘汰的基因组及定罪 e-值（审计台账）
+   */
+  pruneProvablyDominated(fdr = 0.1): Array<{ id: string; eValue: number; at: number }> {
+    if (!this.anytime) return [];
+    // 淘汰前快照各基因组 e-值（eliminate 后流被 forget，无法回查）
+    const evidenceSnapshot = new Map<string, number>();
+    for (const genome of this.population) {
+      const view = this.anytime.viewOf(genome.id);
+      if (view) evidenceSnapshot.set(genome.id, view.eBelow);
+    }
+    const rejected = this.anytime.eliminate(fdr);
+    const eliminated: Array<{ id: string; eValue: number; at: number }> = [];
+    for (const id of rejected) {
+      const genome = this.population.find((g) => g.id === id);
+      if (!genome) continue;
+      const record = { id, eValue: evidenceSnapshot.get(id) ?? 0, at: Date.now() };
+      eliminated.push(record);
+      this.anytimeEliminations.push(record);
+      // 从种群移除（保底 2 个——进化不能失去变异素材）
+      if (this.population.length > 2) {
+        const index = this.population.indexOf(genome);
+        if (index >= 0) this.population.splice(index, 1);
+        // 幸存者变异顶替（规模不缩水；新基因组从零积累证据）
+        const parent = this.tournamentSelect(this.population);
+        const child = this.mutate(parent);
+        this.population.push(child);
+        if (this.qdArchive) this.qdArchive.place(child);
+      }
+    }
+    return eliminated;
+  }
+
+  /** 12.0：任意时刻证据报告（含历史淘汰台账） */
+  anytimeReport(): AnytimeEvidenceRegistryReport & { eliminations: Array<{ id: string; eValue: number; at: number }> } {
+    const base = this.anytime?.report() ?? {
+      streams: 0,
+      verdicts: { above: 0, below: 0, undecided: 0 },
+      totalConfirmations: 0,
+      totalEliminations: 0,
+      strongestEvidence: 0,
+      interpretation: '未挂载任意时刻证据内核（attachAnytimeEvidence 启用）',
+    };
+    return { ...base, eliminations: [...this.anytimeEliminations] };
+  }
+
+  /** 12.0：指定基因组的当前证据视图（未挂载或未观测返回 undefined） */
+  anytimeViewOf(genomeId: string): AnytimeEvidenceView | undefined {
+    return this.anytime?.viewOf(genomeId);
+  }
+
+  // ─────────────────────────── 14.0 质量-多样性移植 ───────────────────────────
+
+  /** 14.0：QD 指标（未挂载返回 undefined） */
+  qdMetrics(): QualityDiversityMetrics | undefined {
+    return this.qdArchive?.metrics();
   }
 
   // ─────────────────────────── 内部实现 ───────────────────────────
@@ -311,14 +443,19 @@ export class StrategyEvolutionEngine {
   }
 
   /**
-   * 适应度（4.0 证据化）：证据后验 Wilson 置信下界 × 小样本置信折扣
+   * 适应度（4.0 证据化 → 12.0 任意时刻有效化）
    *
-   * 有时间加权证据的基因组用 Wilson 下界（小样本保守、防侥幸、旧结果
-   * 自然衰减）；无证据（未观测/旧数据）回退 meanReward × 折扣。
+   * 挂载任意时刻内核且流样本 ≥ 3：置信序列下界 × 折扣（时间一致
+   * 覆盖——连续监控下读适应度永不夸大）；否则回退 Wilson 下界
+   * （4.0 口径，固定样本语义）；无证据回退 meanReward × 折扣。
    */
   private fitness(genome: StrategyGenome): number {
     if (genome.applications === 0) return 0;
     const confidenceFactor = Math.min(1, genome.applications / this.config.minApplicationsForElite);
+    const anytimeView = this.anytime?.viewOf(genome.id);
+    if (anytimeView && anytimeView.n >= 3) {
+      return Math.max(0, anytimeView.cs.lower) * confidenceFactor;
+    }
     if (genome.evidence) {
       return wilsonLowerBound(genome.evidence.weightedSuccesses, genome.evidence.weightedFailures) * confidenceFactor;
     }

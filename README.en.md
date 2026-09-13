@@ -5,7 +5,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-339933?logo=nodedotjs&logoColor=white)](#installation)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-8250df)](https://github.com/topics/dsh-plugin)
 
-> **Proactive Intelligence scheduling plugin** — a multi-model collaborative scheduling system for the DeepSeek Harness (DSH) ecosystem: it perceives, decides, and evolves on its own, with a built-in **Scientist / Theorist dual mind** and a **cognitive energy symbiosis economy**.
+> **Proactive Intelligence scheduling plugin** — a multi-model collaborative scheduling system for the DeepSeek Harness (DSH) ecosystem: it perceives, decides, and evolves on its own, with a built-in **Scientist / Theorist dual mind**, a **cognitive energy symbiosis economy**, and **fourteen phase-change kernels (evidence → guarantee layer: anytime-valid / conformal / quality-diversity / formal safety / fair attribution)**.
 >
 > English | [中文](./README.md)
 
@@ -33,10 +33,12 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 │  Operational: signal→decide→execute→reflect 10-step pipeline │
 │  Evolution: policy evolver + sandbox + canary (policy/)      │
 │  Meta outer: self-model → conservative tune → rollback (meta/)│
-├─ Kernel Stack (core/) — nine kernels, 3.0 → 11.0 ────────────┤
+├─ Kernel Stack (core/) — fourteen kernels, 3.0 → 16.0 ────────┤
 │  Evidence 3.0  Resilience 4.0  Causal 5.0  Free-Energy 6.0   │
 │  Deliberation 7.0  Metareasoning 8.0  Abstraction 9.0        │
 │  Scientist 10.0  Theorist 11.0                               │
+│  Anytime Evidence 12.0  Conformal 13.0  Quality-Diversity 14.0│
+│  Runtime Verification 15.0  Shapley Attribution 16.0          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -51,7 +53,14 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 - **Scientist kernel** ([core/scientist.ts](./src/core/scientist.ts)): Bayesian optimal experiment design — pricing "knowledge acquisition itself". True EIG (nats) to value an experiment's information, confounding bonus (experiment-exclusive value), budget arbitration (netValue = EIG − cost), information-ledger calibration, knowledge-frontier contraction
 - **Theorist kernel** ([core/theorist.ts](./src/core/theorist.ts)): hierarchical Bayes + MDL (understanding as compression) — compressing data into laws. Same-family edges converge into laws (borrowing-strength shrinkage), compression pricing (log Bayes factor), zero-shot prediction, anomaly detection, paradigm shifts (Kuhn leap)
 
-### Kernel Stack (core/, 3.0 → 11.0)
+### Anytime Evidence / Conformal / Diversity / Formal Safety / Fair Attribution (12.0 → 16.0)
+- **Anytime-evidence kernel** ([core/anytime-evidence.ts](./src/core/anytime-evidence.ts)): confidence sequences + e-processes — **peeking is legal at any moment**. Time-uniform confidence intervals (stitched CS) are valid whenever read; e-process capital adjudicates hypotheses via Ville's inequality, and genome eliminations go through the e-BH process with an FDR cap (a mathematical bound on wrongful eliminations); once mounted on the meta-cognition KPI guarantee layer, degradation/recovery verdicts upgrade to an episodic regime state machine (evidence accumulates separately on each side of the watermark, resetting on crossing — peeking-immune, recovery-detectable)
+- **Conformal kernel** ([core/conformal.ts](./src/core/conformal.ts)): distribution-free exact coverage — **prediction intervals with zero distributional assumptions**. Split conformal intervals give finite-sample exact guarantees (P(actual ∈ interval) ≥ 1−α); a coverage-drift monitor detects miscalibration via a predictable-λ betting e-process; threshold self-calibration upgrades to risk-controlled selection (empirical Bernstein upper bounds + Bonferroni, P(future retry rate ≤ target) ≥ confidence)
+- **Quality-diversity kernel** ([core/quality-diversity.ts](./src/core/quality-diversity.ts)): MAP-Elites behavioral archive — **diversity collapse is structurally blocked**. Strategy genomes fall into niche grids by behavioral descriptors (daring / frugal / vigilant), every school gets an equal trial budget (uniform frontier sampling); the QD-score measures quality and coverage together, so evolution no longer converges to a single solution
+- **Runtime-verification kernel** ([core/runtime-verification.ts](./src/core/runtime-verification.ts)): LTLf specification monitoring — **safety specs made formal, verdicts carry proofs**. The default spec set (no failure storms / commands must be answered / periodic heartbeat / authorize-before-execute) compiles into four monitor atoms; violation reports carry full evidence traces and counterexample witnesses; severity-based escalation (critical → Kill Switch, warn → circuit breaker, info → audit)
+- **Shapley kernel** ([core/shapley.ts](./src/core/shapley.ts)): axiomatic fair attribution — **value split backed by a mathematical theorem**. Efficiency / symmetry / dummy / additivity axioms all hold exactly; permutation sampling with anytime-valid confidence intervals (bounds while you sample, guaranteed whether you stop or not); synergy detection automatically flags 1+1>2 positive synergies and free-riding negative ones
+
+### Kernel Stack (core/, 3.0 → 16.0)
 | Kernel | Version | In one line |
 |------|------|--------|
 | evidence.ts | 3.0 | Unified evidence language: Wilson bounds / time decay / evidence ranking, spread across all memory layers |
@@ -63,6 +72,11 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 | abstraction.ts | 9.0 | Abstraction: state-skeleton decomposition + structural analogy, cross-domain "learning by analogy" |
 | scientist.ts | 10.0 | Scientist mind: Bayesian optimal experiment design (see above) |
 | theorist.ts | 11.0 | Theorist mind: hierarchical Bayes + MDL law induction (see above) |
+| anytime-evidence.ts | 12.0 | Anytime evidence: confidence sequences + e-processes + e-BH FDR (see above) |
+| conformal.ts | 13.0 | Conformal: distribution-free intervals + risk-controlled thresholds (see above) |
+| quality-diversity.ts | 14.0 | Quality-diversity: MAP-Elites behavioral archive (see above) |
+| runtime-verification.ts | 15.0 | Runtime verification: LTLf spec monitoring + proof-carrying verdicts (see above) |
+| shapley.ts | 16.0 | Shapley: axiomatic fair attribution + anytime-valid confidence intervals (see above) |
 
 ### Cognitive Energy Symbiosis Economy (symbiosis/)
 - **Energy ledger** (ledger.ts): cognitive energy cannot be forged — global conservation via double-entry bookkeeping, every transfer sha256-chained for audit and replay, a Gini coefficient measures ecosystem health
@@ -142,7 +156,7 @@ pnpm build
 - **Multi-key failover**: when several candidate keys exist for a vendor, auth failures (401/403) or quota exhaustion (429) automatically rotate to the next candidate key, upgraded with **health-aware routing** — keys are selected by success/failure statistics, with a 1-minute cooldown for 429 and a 5-minute cooldown for 401/403, auto-recovering on success; users can reorder key usage via the `manage_keys` tool (persisted across restarts); startup logs report each model's key sources (never the key values), and runtime key health is inspectable via `query_memory keys`;
 - For a single vendor only, use the per-vendor patches under `patches/domestic-models/`; regenerate with `pnpm generate:patches`.
 
-All runtime options (sentinel / encryption / sync / consensus / hot reload / tenants / autonomy loop `autonomy` / host fusion `hostFusion`) are likewise built into [cordis.patch.yml](./cordis.patch.yml) and need no changes; symbiosis options live under `autonomy.symbiosis` (futarchy voting, energy feedback, etc., off by default).
+All runtime options (sentinel / encryption / sync / consensus / hot reload / tenants / autonomy loop `autonomy` / host fusion `hostFusion`) are likewise built into [cordis.patch.yml](./cordis.patch.yml) and need no changes; symbiosis options live under `autonomy.symbiosis` (futarchy voting, energy feedback, etc., off by default). Guarantee-layer kernel options 12.0-16.0 are also off by default (zero drift): `autonomy.anytimeEvidence` (α / reference watermark), `autonomy.conformal` (α / calibration capacity / threshold risk & confidence), `autonomy.qualityDiversity` (explore rate), `autonomy.runtimeVerification` (additional `specs`).
 
 ## Tool Catalog (18)
 
@@ -175,7 +189,7 @@ Other common operations:
 - `manage_autonomy`: `start` / `stop` / `tick` / `kill-switch` / `revive` / `reset-circuit`
 - `query_memory`: `world-model` / `curiosity` / `governance` / `patterns` / `lessons` / `keys`, etc.
 
-## Offline Verification (24, zero API keys)
+## Offline Verification (29, zero API keys)
 
 Every kernel and subsystem has an offline end-to-end verification script (`node scripts/verify-*.mjs`):
 
@@ -184,12 +198,15 @@ node scripts/verify-scientist.mjs      # Scientist: EIG pricing / budget arbitra
 node scripts/verify-theorist.mjs       # Theorist: law induction / zero-shot prediction / paradigm shift
 node scripts/verify-symbiosis.mjs      # Symbiosis: ledger / market / 3-agent 6-heartbeat closed loop
 node scripts/verify-self-evolution.mjs # Self-evolution: adoption / fast path / three hedging mechanisms
+node scripts/verify-anytime-evidence.mjs # Anytime evidence: CS time-uniformity / e-process verdicts / e-BH FDR
+node scripts/verify-shapley.mjs        # Shapley: four axioms / confidence intervals / synergy detection
 ```
 
 | Group | Scripts |
 |------|------|
 | Dual mind | verify-scientist · verify-theorist |
 | Kernel stack | verify-unified-evidence · verify-resilience-governance · verify-causal-kernel · verify-active-inference · verify-deliberation · verify-metareasoning · verify-abstraction |
+| Guarantee-layer kernels 12.0-16.0 | verify-anytime-evidence · verify-conformal · verify-quality-diversity · verify-runtime-verification · verify-shapley |
 | Symbiosis economy | verify-symbiosis · verify-symbiosis-bridge · verify-belief-market · verify-futarchy · verify-energy-feedback · verify-full-agents · verify-observability |
 | Learning & evolution | verify-self-evolution · verify-self-evolution-v2 · verify-knowledge-distillation · verify-policy-evolution · verify-meta-cognition · verify-meta-cognition-v2 · verify-meta-edge · verify-consensus-sync |
 
@@ -222,7 +239,7 @@ Config section `hostFusion`: `enabled` / `observeToolResults` / `governToolCalls
 ├── cordis.patch.yml              # Bundle config layer (dsh.bundle.patch target, all domestic models, zero keys)
 ├── symbiosis-sankey-demo.html    # Cognitive-ecosystem energy-flow Sankey panorama (zero-dependency, self-contained)
 ├── patches/domestic-models/      # Optional per-vendor patches (9 vendors + all-domestic.yml)
-├── scripts/                      # Patch generator + 24 offline verification scripts
+├── scripts/                      # Patch generator + 29 offline verification scripts
 └── src/
     ├── index.ts                  # Plugin entry: 10-step pipeline orchestration + 18 tool registrations
     ├── types.ts / errors.ts      # Shared type layer / unified error hierarchy (stable machine-readable codes)
@@ -245,7 +262,7 @@ Config section `hostFusion`: `enabled` / `observeToolResults` / `governToolCalls
     ├── autonomy-loop.ts          # Autonomy loop: 11-step heartbeat orchestration
     ├── host-fusion.ts            # Host fusion layer: whole-host observability + safety governance
     ├── dsh-host.ts               # DSH host integration: LLM client / model catalog / key injection
-    ├── core/                     # Kernel stack: nine kernels from evidence 3.0 to theorist 11.0
+    ├── core/                     # Kernel stack: fourteen kernels from evidence 3.0 to shapley 16.0
     ├── meta/                     # Meta-cognition layer: self-model + meta-controller (dual-loop outer ring)
     ├── policy/                   # Policy evolver + sandbox: population evolution / canary deployment
     ├── symbiosis/                # Cognitive energy symbiosis: ledger / market / belief market / agents / runtime / Sankey
