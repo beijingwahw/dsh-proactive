@@ -46,6 +46,7 @@
 
 import { betaEntropy, FreeEnergyEngine } from './free-energy.js';
 import type { AbstractionEngine } from './abstraction.js';
+import { UctSearch, type MctsDomain, type MctsResult } from './mcts.js';
 
 // ─────────────────────────── 数据结构 ───────────────────────────
 
@@ -164,6 +165,8 @@ export interface DeliberationResult {
   expandedNodes: number;
   /** 技能种子是否参与（时间抽象生效） */
   skillSeeded: boolean;
+  /** 29.0：UCT 搜索元数据（searchMcts 专属；beam search 不出现） */
+  mcts?: MctsResult;
 }
 
 // ─────────────────────────── 配置 ───────────────────────────
@@ -528,6 +531,114 @@ export class DeliberationEngine {
       .slice(0, Math.max(breadth, 3));
 
     return { ranked: reports, best: reports[0], expandedNodes, skillSeeded };
+  }
+
+  /**
+   * 29.0：UCT 前瞻搜索（beam search 的序贯决策升级口径）。
+   *
+   * beam search 按轨迹 G 剪枝（宽度即资源上限）；本方法把「搜索预算的
+   * 分配」本身交给 UCT——每条转移边按 Beta 后验采样伯努利成败（失败即
+   * 终局零回报），回报 = 逐步折扣的成功指示（与 pAllSuccess 同族），
+   * UCB1 在「利用证据多的边」与「探索证据少的边」之间自动平衡。
+   * 迭代/时间预算耗尽即读出（任意时刻性），根动作按访问证据排序；
+   * 每条报告沿 MCTS 主变化线展开完整 ImaginationReport（口径与
+   * search() 一致，可互查对账）。未挂载消费方不调用即零漂移。
+   */
+  searchMcts(
+    startState: string,
+    candidates: string[] | ((state: string) => string[]),
+    opts?: {
+      /** UCT 迭代预算（缺省 600） */
+      iterations?: number;
+      /** UCB1 探索常数（缺省 √2） */
+      explorationC?: number;
+      /** 折扣 γ（缺省 0.95） */
+      discount?: number;
+      /** 输出报告条数（缺省 beamBreadth） */
+      topK?: number;
+      preference?: number;
+      /** 状态推进覆盖（与 search 同义） */
+      advance?: (ctx: { state: string; action: string; step: number; successor: string }) => string;
+    },
+  ): DeliberationResult & { mcts: MctsResult } {
+    const preference = opts?.preference ?? 0.9;
+    const topK = Math.max(1, opts?.topK ?? this.config.beamBreadth);
+    const actionsAt = (state: string): string[] =>
+      typeof candidates === 'function' ? candidates(state) : candidates;
+    const eps = this.config.probEpsilon;
+    const advance = opts?.advance;
+
+    const domain: MctsDomain = {
+      actions: actionsAt,
+      step: (state, action, rng) => {
+        const post = this.posterior(state, action);
+        const p = Math.min(1 - eps, Math.max(eps, post.pSuccess));
+        if (rng() >= p) {
+          return { state: `${state}#mcts-fail`, reward: 0, terminal: true };
+        }
+        const nextState = advance
+          ? advance({ state, action, step: 0, successor: post.successor })
+          : post.successor;
+        return { state: nextState, reward: 1, terminal: false };
+      },
+    };
+    const searcher = new UctSearch(
+      { explorationC: opts?.explorationC, discount: opts?.discount },
+      domain,
+    );
+    const mcts = searcher.search(startState, { iterations: opts?.iterations ?? 600 });
+
+    // 报告生成：最优根动作用 MCTS 主变化线，其余按均值排序 + 贪心后继展开
+    const depthCap = Math.max(1, Math.min(this.config.maxDepth, 12));
+    const buildPlan = (rootAction: string, usePv: boolean): string[] => {
+      const plan: string[] = [rootAction];
+      if (usePv) {
+        for (const a of mcts.principalVariation.slice(1)) {
+          plan.push(a);
+          if (plan.length >= depthCap) break;
+        }
+        return plan.slice(0, depthCap);
+      }
+      let state = this.posterior(startState, rootAction).successor;
+      if (advance) state = advance({ state: startState, action: rootAction, step: 0, successor: state });
+      while (plan.length < depthCap) {
+        const actions = actionsAt(state);
+        if (actions.length === 0) break;
+        let bestAction = actions[0]!;
+        let bestP = -1;
+        for (const a of actions) {
+          const p = this.posterior(state, a).pSuccess;
+          if (p > bestP) {
+            bestP = p;
+            bestAction = a;
+          }
+        }
+        plan.push(bestAction);
+        let next = this.posterior(state, bestAction).successor;
+        if (advance) next = advance({ state, action: bestAction, step: plan.length - 1, successor: next });
+        state = next;
+      }
+      return plan;
+    };
+
+    const ranked: ImaginationReport[] = [];
+    const seen = new Set<string>();
+    const order = [...mcts.children].sort((a, b) => b.meanValue - a.meanValue || b.visits - a.visits);
+    for (let i = 0; i < Math.min(topK, order.length); i += 1) {
+      const entry = order[i]!;
+      const plan = buildPlan(entry.action, i === 0);
+      const sig = plan.join('|');
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      ranked.push(this.nodeToReport(this.expandPrefix(startState, plan, preference)));
+    }
+    return {
+      ranked,
+      best: ranked[0],
+      expandedNodes: mcts.treeNodes,
+      skillSeeded: false,
+      mcts,
+    };
   }
 
   // ─────────────────────────── 技能库（时间抽象） ───────────────────────────

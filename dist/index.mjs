@@ -6816,6 +6816,10 @@ var RobustStream = class {
 	get size() {
 		return this.buffer.length;
 	}
+	/** 缓冲副本（28.0 EVT 等下游内核的原料通道；不影响内部状态） */
+	toSamples() {
+		return [...this.buffer];
+	}
 	read() {
 		const n = this.buffer.length;
 		const plainMean = n === 0 ? 0 : this.buffer.reduce((s, x) => s + x, 0) / n;
@@ -7051,6 +7055,14 @@ var LLMClient = class {
 			this.robustStreams.set(modelId, stream);
 		}
 		return stream;
+	}
+	/**
+	* 28.0：取模型的原始延迟样本（毫秒）。
+	* 仅配置 robustLatency 时有值（否则 undefined，零开销零漂移）——
+	* 尾部风险监视器（POT/GPD）与 23.0 稳健估计共用同一条流。
+	*/
+	getLatencySamples(modelId) {
+		return this.robustStreams.get(modelId)?.toSamples();
 	}
 	/** 获取并发槽位（必要时排队） */
 	acquireSlot(state) {
@@ -8692,12 +8704,30 @@ var Optimizer = class {
 	*/
 	deliberativeRecommendation(taskType, candidateActions, stages, opts) {
 		if (!this.deliberation || candidateActions.length === 0 || stages < 1) return void 0;
+		if (this.mctsOptions) return this.deliberation.searchMcts(`${taskType}#s0`, candidateActions, {
+			iterations: this.mctsOptions.iterations,
+			explorationC: this.mctsOptions.explorationC,
+			discount: this.mctsOptions.discount,
+			topK: opts?.breadth,
+			preference: opts?.preference,
+			advance: ({ step }) => `${taskType}#s${step + 1}`
+		});
 		return this.deliberation.search(`${taskType}#s0`, candidateActions, {
 			depth: stages,
 			breadth: opts?.breadth,
 			preference: opts?.preference,
 			advance: ({ step }) => `${taskType}#s${step + 1}`
 		});
+	}
+	/** 29.0 MCTS 搜索参数（attachMctsSearch 后深思推荐走 UCT；undefined = 原 beam search） */
+	mctsOptions;
+	/**
+	* 29.0：挂载 UCT 搜索口径（幂等；撤除传 null）。
+	* 深思推荐从 beam search 切换为 MCTS——转移边按 Beta 后验采样成败，
+	* UCB1 平衡利用/探索，迭代预算耗尽即读出（任意时刻性）。
+	*/
+	attachMctsSearch(options) {
+		this.mctsOptions = options === null ? void 0 : options ?? {};
 	}
 	/**
 	* 8.0：元认知推荐 —— 理性元推理的冷启动序列建议。
@@ -11690,6 +11720,277 @@ function round$15(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
+//#region src/core/kalman-filter.ts
+function matMul(A, B) {
+	const n = A.length;
+	const m = B[0].length;
+	const k = B.length;
+	const C = Array.from({ length: n }, () => new Array(m).fill(0));
+	for (let i = 0; i < n; i += 1) for (let j = 0; j < m; j += 1) {
+		let sum = 0;
+		for (let t = 0; t < k; t += 1) sum += A[i][t] * B[t][j];
+		C[i][j] = sum;
+	}
+	return C;
+}
+function matT(A) {
+	return A[0].map((_, j) => A.map((row) => row[j]));
+}
+function matAdd(A, B) {
+	return A.map((row, i) => row.map((v, j) => v + B[i][j]));
+}
+function matSub(A, B) {
+	return A.map((row, i) => row.map((v, j) => v - B[i][j]));
+}
+function identity$1(n) {
+	return Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => i === j ? 1 : 0));
+}
+function asMatrix(v) {
+	return v.map((x) => [x]);
+}
+function asVec(m) {
+	return m.map((row) => row[0]);
+}
+/** 常用 (df, p) 精确分位数；其余 Wilson-Hilferty 近似（误差 < 0.5%） */
+const CHI2_TABLE = {
+	"1:0.90": 2.7055,
+	"1:0.95": 3.8415,
+	"1:0.99": 6.6349,
+	"1:0.997": 8.8097,
+	"2:0.90": 4.6052,
+	"2:0.95": 5.9915,
+	"2:0.99": 9.2103,
+	"2:0.997": 11.6193
+};
+/** 逆正态 CDF（Acklam 有理逼近，|误差| < 1.15e-9） */
+function normalQuantile(p) {
+	const a = [
+		-39.69683028665376,
+		220.9460984245205,
+		-275.9285104469687,
+		138.357751867269,
+		-30.66479806614716,
+		2.506628277459239
+	];
+	const b = [
+		-54.47609879822406,
+		161.5858368580409,
+		-155.6989798598866,
+		66.80131188771972,
+		-13.28068155288572
+	];
+	const c = [
+		-.007784894002430293,
+		-.3223964580411365,
+		-2.400758277161838,
+		-2.549732539343734,
+		4.374664141464968,
+		2.938163982698783
+	];
+	const d = [
+		.007784695709041462,
+		.3224671290700398,
+		2.445134137142996,
+		3.754408661907416
+	];
+	const pLow = .02425;
+	const pp = Math.min(Math.max(p, 1e-20), 1);
+	if (pp < pLow) {
+		const q = Math.sqrt(-2 * Math.log(pp));
+		return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+	}
+	if (pp <= .97575) {
+		const q = pp - .5;
+		const r = q * q;
+		return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+	}
+	const q = Math.sqrt(-2 * Math.log(1 - pp));
+	return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+}
+/** χ² 分布分位数（自由度 df、上侧概率 p） */
+function chiSquareQuantile(p, df) {
+	const hit = CHI2_TABLE[`${df}:${p}`];
+	if (hit !== void 0) return hit;
+	const a = 2 / (9 * df);
+	return df * Math.pow(1 - a + normalQuantile(p) * Math.sqrt(a), 3);
+}
+/**
+* 线性高斯卡尔曼滤波器（dim ≤ 3 的小矩阵实现，标量观测）。
+*
+* predict()/update() 分离（无观测的心跳可只预测），step(z) = 预测 + 更新 +
+* 门控判定。所有数值在线更新，无历史缓冲（内存 O(dim²)）。
+*/
+var KalmanFilter = class {
+	model;
+	gateQuantile;
+	gateThreshold;
+	x;
+	P;
+	constructor(model, gateP = .997) {
+		this.model = model;
+		this.gateQuantile = gateP;
+		this.gateThreshold = chiSquareQuantile(gateP, model.H.length);
+		this.x = [...model.x0];
+		this.P = model.P0.map((row) => [...row]);
+	}
+	/** 一步预测（不更新） */
+	predict() {
+		const F = this.model.F;
+		this.x = asVec(matMul(F, asMatrix(this.x)));
+		this.P = matAdd(matMul(matMul(F, this.P), matT(F)), this.model.Q);
+	}
+	/** 一步预测 + 观测更新 + NIS 门控 */
+	step(z) {
+		this.predict();
+		return this.update(z);
+	}
+	/** 观测更新（假设已 predict） */
+	update(z) {
+		const { H, R } = this.model;
+		const innovation = z - asVec(matMul(H, asMatrix(this.x)))[0];
+		const S = matMul(matMul(H, this.P), matT(H))[0][0] + R[0][0];
+		const K = matMul(this.P, matT(H)).map((row) => row.map((v) => v / S));
+		this.x = asVec(matAdd(asMatrix(this.x), matMul(K, [[innovation]])));
+		const KH = matMul(K, H);
+		this.P = matMul(matSub(identity$1(this.x.length), KH), this.P);
+		const nis = innovation * innovation / Math.max(1e-12, S);
+		const logLikelihood = -.5 * (Math.log(2 * Math.PI * Math.max(1e-12, S)) + nis);
+		return {
+			x: [...this.x],
+			innovation,
+			innovationVar: S,
+			nis,
+			logLikelihood,
+			gated: nis > this.gateThreshold
+		};
+	}
+	get state() {
+		return [...this.x];
+	}
+	get covariance() {
+		return this.P.map((row) => [...row]);
+	}
+	get gate() {
+		return {
+			p: this.gateQuantile,
+			threshold: this.gateThreshold
+		};
+	}
+};
+/**
+* 随机游走 + 白噪观测的稳态滤波方差（精确闭式）：
+*   P∞ = (√(q² + 4·q·r) − q) / 2,  K∞ = P∞ / (P∞ + r)
+* （Riccati 稳态方程 P² + q·P − q·r = 0 的正根；验证锚点：迭代收敛于此值）
+*/
+function randomWalkSteadyState(q, r) {
+	const pInf = (Math.sqrt(q * q + 4 * q * r) - q) / 2;
+	return {
+		pInf,
+		kInf: pInf / (pInf + r)
+	};
+}
+const DEFAULT_TREND_FILTER_CONFIG = {
+	qLevel: 1e-4,
+	qSlope: 1e-6,
+	r: 2e-4,
+	gateP: .997,
+	p0Level: 1,
+	p0Slope: .01
+};
+/**
+* 局部线性趋势滤波器（constant-velocity 模型，标量序列）：
+*
+*   状态 [level, slope]ᵀ,  F = [[1,1],[0,1]],  H = [1, 0]
+*   Q = diag(q_level, q_slope),  R = r
+*
+* 用途: KPI 序列的去噪读数（level）、缓慢漂移的早期读数（slope）、
+* 突变的假设检验（NIS 门控）。历史保留 filter 状态序列以支持 RTS 平滑。
+*/
+var LocalLinearTrendFilter = class {
+	config;
+	filter;
+	history = [];
+	last;
+	constructor(config) {
+		this.config = {
+			...DEFAULT_TREND_FILTER_CONFIG,
+			...config
+		};
+		this.filter = new KalmanFilter({
+			F: [[1, 1], [0, 1]],
+			H: [[1, 0]],
+			Q: [[this.config.qLevel, 0], [0, this.config.qSlope]],
+			R: [[this.config.r]],
+			x0: [0, 0],
+			P0: [[this.config.p0Level, 0], [0, this.config.p0Slope]]
+		}, this.config.gateP);
+	}
+	/** 喂入一个观测（自动先验初始化：首个观测把水平初始化为 z，收敛更快） */
+	observe(z) {
+		if (this.history.length === 0) this.filter = new KalmanFilter({
+			F: [[1, 1], [0, 1]],
+			H: [[1, 0]],
+			Q: [[this.config.qLevel, 0], [0, this.config.qSlope]],
+			R: [[this.config.r]],
+			x0: [z, 0],
+			P0: [[this.config.p0Level, 0], [0, this.config.p0Slope]]
+		}, this.config.gateP);
+		const r = this.filter.step(z);
+		this.history.push({
+			x: r.x,
+			P: this.filter.covariance,
+			innovation: r.innovation,
+			innovationVar: r.innovationVar,
+			nis: r.nis,
+			z
+		});
+		if (this.history.length > 256) this.history.shift();
+		this.last = {
+			level: r.x[0],
+			slope: r.x[1],
+			innovation: r.innovation,
+			nis: r.nis,
+			threshold: this.filter.gate.threshold,
+			gated: r.gated,
+			levelVar: this.filter.covariance[0][0],
+			logLikelihood: r.logLikelihood
+		};
+		return this.last;
+	}
+	/** 最近一次滤波读数（纯读取；无观测时 undefined） */
+	get lastRead() {
+		return this.last;
+	}
+	/**
+	* RTS 平滑（批量后向回看）：用全部历史给出每个时刻的事后最优
+	* (level, slope)。缓慢漂移的确认比纯滤波更早、更稳。
+	*/
+	smooth() {
+		const n = this.history.length;
+		if (n === 0) return [];
+		const xs = this.history.map((h) => [...h.x]);
+		const Ps = this.history.map((h) => h.P.map((row) => [...row]));
+		const F = [[1, 1], [0, 1]];
+		for (let t = n - 2; t >= 0; t -= 1) {
+			const xPred = asVec(matMul(F, asMatrix(xs[t])));
+			const PPred = matAdd(matMul(matMul(F, Ps[t]), matT(F)), [[this.config.qLevel, 0], [0, this.config.qSlope]]);
+			const det = PPred[0][0] * PPred[1][1] - PPred[0][1] * PPred[1][0];
+			if (Math.abs(det) < 1e-15) continue;
+			const PPredInv = [[PPred[1][1] / det, -PPred[0][1] / det], [-PPred[1][0] / det, PPred[0][0] / det]];
+			const G = matMul(matMul(Ps[t], matT(F)), PPredInv);
+			xs[t] = asVec(matAdd(asMatrix(xs[t]), matMul(G, matSub(asMatrix(xs[t + 1]), asMatrix(xPred)))));
+			Ps[t] = matAdd(Ps[t], matMul(matMul(G, matSub(Ps[t + 1], PPred)), matT(G)));
+		}
+		return xs.map((x) => ({
+			level: x[0],
+			slope: x[1]
+		}));
+	}
+	get size() {
+		return this.history.length;
+	}
+};
+//#endregion
 //#region src/meta-cognition.ts
 /** 默认配置 */
 const DEFAULT_META_COGNITION_CONFIG = {
@@ -11765,6 +12066,10 @@ var MetaCognitionEngine = class {
 	transportDrift;
 	/** 17.0：各 KPI 的上次漂移态（翻转沿触发洞察） */
 	transportDriftState = /* @__PURE__ */ new Map();
+	/** 27.0：KPI 局部线性趋势滤波器（挂载后异常判定升级为 NIS 假设检验） */
+	kalmanFilters;
+	/** 27.0：各 KPI 的上次门控态（翻转沿触发洞察） */
+	kalmanGateState = /* @__PURE__ */ new Map();
 	/** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
 	guardAlpha = .05;
 	/**
@@ -11852,6 +12157,58 @@ var MetaCognitionEngine = class {
 	/** 17.0：各 KPI 的当前形状漂移视图（纯读取；未挂载返回 undefined） */
 	transportDriftView(kpi) {
 		return this.transportDrift?.get(kpi)?.drift();
+	}
+	/**
+	* 27.0：挂载 KPI 卡尔曼滤波层（幂等；缺省覆盖 successRate / avgQuality /
+	* avgLatency / cacheHitRate）。
+	*
+	* 1 号 z-score 检查是窗口内无记忆比较；本层把整条历史压进 (level, slope)
+	* 充分统计量——异常判定从启发式升级为 NIS 假设检验（新息平方和超出
+	* χ²(1) 99.7% 分位才报警），缓慢漂移由滤波斜率给出早期读数。
+	* 不 attach 即零漂移。
+	*/
+	attachKalmanAnomaly(options) {
+		const kpis = options?.kpis ?? [
+			"successRate",
+			"avgQuality",
+			"avgLatency",
+			"cacheHitRate"
+		];
+		const filterOptions = {};
+		for (const key of [
+			"qLevel",
+			"qSlope",
+			"r",
+			"gateP",
+			"p0Level",
+			"p0Slope"
+		]) {
+			const v = options?.[key];
+			if (typeof v === "number" && Number.isFinite(v)) filterOptions[key] = v;
+		}
+		this.kalmanFilters = /* @__PURE__ */ new Map();
+		for (const kpi of kpis) this.kalmanFilters.set(kpi, new LocalLinearTrendFilter(filterOptions));
+	}
+	/** 27.0：KPI 的当前滤波读数（纯读取；未挂载返回 undefined） */
+	kalmanView(kpi) {
+		return this.kalmanFilters?.get(kpi)?.lastRead;
+	}
+	/** 27.0：NIS 门控检验（每批快照后调用；进入门控的翻转沿产出洞察） */
+	checkKalman(kpi, value) {
+		const filter = this.kalmanFilters?.get(kpi);
+		if (!filter || !Number.isFinite(value)) return [];
+		const read = filter.observe(value);
+		const last = this.kalmanGateState.get(kpi) ?? false;
+		this.kalmanGateState.set(kpi, read.gated);
+		if (!read.gated || last) return [];
+		if (!(kpi === "avgLatency" ? read.innovation > 0 : read.innovation < 0)) return [];
+		return [{
+			source: "meta-cognition",
+			category: "kpi-innovation-gate",
+			severity: Math.min(.9, .55 + Math.min(.35, Math.log10(Math.max(10, read.nis)) / 12)),
+			message: `KPI ${kpi} 新息门控触发：观测 ${value.toFixed(3)} 偏离滤波预测 ${read.level.toFixed(3)}（NIS=${read.nis.toFixed(1)} > χ²阈值 ${read.threshold.toFixed(1)}），突变在模型方差下 99.7% 不该发生`,
+			suggestion: "单点冲击先观察（可能是突发负载）；连续门控 = 状态转移模型失配，结合 17.0 形状漂移与 12.0 保证层三口径定位根因"
+		}];
 	}
 	/**
 	* 12.0：保证层检验（每批快照后调用）。
@@ -11976,6 +12333,11 @@ var MetaCognitionEngine = class {
 			if (monitor === void 0 || !Number.isFinite(value)) continue;
 			insights.push(...this.checkTransportDrift(kpi, value));
 		}
+		if (this.kalmanFilters) for (const kpi of this.kalmanFilters.keys()) {
+			const value = kpi === "avgLatency" ? snapshot.avgLatency : kpi === "cacheHitRate" ? snapshot.cacheHitRate : kpi === "successRate" ? snapshot.successRate : snapshot.avgQuality;
+			if (!Number.isFinite(value)) continue;
+			insights.push(...this.checkKalman(kpi, value));
+		}
 		if (this.history.length >= 5) {
 			for (const kpi of [
 				"successRate",
@@ -12042,6 +12404,30 @@ var MetaCognitionEngine = class {
 			abstraction: this.abstractionEngine ? this.abstractionEngine.stats() : void 0,
 			knowledgeFrontier: this.scientistMind ? this.scientistMind.knowledgeFrontier() : void 0,
 			theoryFrontier: this.theoristEngine ? this.theoristEngine.frontier() : void 0,
+			kalman: this.kalmanFilters ? (() => {
+				const streams = [...this.kalmanFilters.entries()].map(([kpi, filter]) => {
+					const r = filter.lastRead;
+					return r ? {
+						kpi,
+						level: Number(r.level.toFixed(4)),
+						slope: Number(r.slope.toFixed(5)),
+						nis: Number(r.nis.toFixed(2)),
+						threshold: Number(r.threshold.toFixed(2)),
+						gated: r.gated
+					} : {
+						kpi,
+						level: 0,
+						slope: 0,
+						nis: 0,
+						threshold: 0,
+						gated: false
+					};
+				});
+				return {
+					streams,
+					interpretation: streams.filter((s) => s.gated).length > 0 ? "存在新息门控触发中的 KPI：观测偏离滤波预测超出 χ² 99.7% 分位——突变正在发生" : "全部 KPI 新息在模型方差内：状态转移模型仍解释世界"
+				};
+			})() : void 0,
 			guarantees: this.anytimeGuards ? (() => {
 				const streams = [...this.anytimeGuards.entries()].map(([kpi, stream]) => {
 					const v = stream.view();
@@ -13137,6 +13523,8 @@ var AutonomyLoop = class {
 	symbiosis;
 	/** 25.0：容量规划顾问（可选注入；心跳 2.5 段消费，缺省零改动） */
 	capacityAdvisor;
+	/** 28.0：尾部风险顾问（可选注入；心跳 2.7 段消费，缺省零改动） */
+	tailRiskAdvisor;
 	worldModel;
 	curiosity;
 	governor;
@@ -13166,6 +13554,7 @@ var AutonomyLoop = class {
 		this.metaCognitionBridge = params.metaCognitionBridge;
 		this.symbiosis = params.symbiosis;
 		this.capacityAdvisor = params.capacityAdvisor;
+		this.tailRiskAdvisor = params.tailRiskAdvisor;
 		this.worldModel = params.worldModel;
 		this.curiosity = params.curiosity;
 		this.governor = params.governor;
@@ -13270,6 +13659,12 @@ var AutonomyLoop = class {
 			if (this.capacityAdvisor) {
 				const capacityInsights = this.capacityAdvisor();
 				if (capacityInsights && capacityInsights.length > 0) insights.push(...capacityInsights);
+			}
+		} catch {}
+		try {
+			if (this.tailRiskAdvisor) {
+				const tailInsights = this.tailRiskAdvisor();
+				if (tailInsights && tailInsights.length > 0) insights.push(...tailInsights);
 			}
 		} catch {}
 		try {
@@ -16278,7 +16673,347 @@ const JUDGE_METRIC_LABELS = {
 	survivalRate: "新策略存活率"
 };
 //#endregion
+//#region src/core/gaussian-process.ts
+const DEFAULT_GP_CONFIG = {
+	kernel: "rbf",
+	sigmaF: 1,
+	lengthScale: .3,
+	sigmaN: .1,
+	maxPoints: 64,
+	tuneHyperparams: true
+};
+/** Cholesky 分解（下三角），失败时抖动逐级升级，全失败返回 undefined */
+function choleskyLower(A) {
+	const n = A.length;
+	for (const jitter of [
+		0,
+		1e-10,
+		1e-8,
+		1e-6
+	]) {
+		const L = Array.from({ length: n }, () => new Array(n).fill(0));
+		let ok = true;
+		for (let i = 0; i < n && ok; i += 1) for (let j = 0; j <= i; j += 1) {
+			let sum = A[i][j] + (i === j ? jitter : 0);
+			for (let k = 0; k < j; k += 1) sum -= L[i][k] * L[j][k];
+			if (i === j) {
+				if (sum <= 0) {
+					ok = false;
+					break;
+				}
+				L[i][j] = Math.sqrt(sum);
+			} else L[i][j] = sum / L[j][j];
+		}
+		if (ok) return {
+			L,
+			jitter
+		};
+	}
+}
+/** 解 L·Lᵀ·x = b（前代 + 回代） */
+function solveCholesky(L, b) {
+	const n = L.length;
+	const y = new Array(n).fill(0);
+	for (let i = 0; i < n; i += 1) {
+		let sum = b[i];
+		for (let k = 0; k < i; k += 1) sum -= L[i][k] * y[k];
+		y[i] = sum / L[i][i];
+	}
+	const x = new Array(n).fill(0);
+	for (let i = n - 1; i >= 0; i -= 1) {
+		let sum = y[i];
+		for (let k = i + 1; k < n; k += 1) sum -= L[k][i] * x[k];
+		x[i] = sum / L[i][i];
+	}
+	return x;
+}
+/** 标准正态 CDF（Abramowitz-Stegun 7.1.26 有理逼近，|误差| < 7.5e-8） */
+function normalCdf(z) {
+	const t = 1 / (1 + .2316419 * Math.abs(z));
+	const poly = t * (.31938153 + t * (-.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+	const p = 1 - Math.exp(-.5 * z * z) / Math.sqrt(2 * Math.PI) * poly;
+	return z >= 0 ? p : 1 - p;
+}
+/** 标准正态 PDF */
+function normalPdf(z) {
+	return Math.exp(-.5 * z * z) / Math.sqrt(2 * Math.PI);
+}
+/** Matérn-5/2 核（k = σf²(1+√5r+5r²/3)exp(−√5r), r = |x−x'|/ℓ） */
+function matern52(d, lengthScale, sigmaF) {
+	const r = Math.abs(d) / lengthScale;
+	const s = Math.sqrt(5) * r;
+	return sigmaF * sigmaF * (1 + s + s * s / 3) * Math.exp(-s);
+}
+/**
+* 一维高斯过程回归器。
+*
+* fit() 内部完成 y 标准化 + x 归一；tuneHyperparams 时在
+* ℓ ∈ logspace(−2, 0.7, 8) × σf ∈ {0.5, 1, 2} 网格上取 LML 最大者。
+* predict() 返回原始尺度的均值/标准差（不确定度随距离数据远近伸缩）。
+*/
+var GaussianProcess = class {
+	config;
+	xs = [];
+	ys = [];
+	yMean = 0;
+	yStd = 1;
+	xMin = 0;
+	xMax = 1;
+	L;
+	alpha = [];
+	fitReport;
+	constructor(config) {
+		this.config = {
+			...DEFAULT_GP_CONFIG,
+			...config
+		};
+	}
+	/** 拟合（重复调用为全量重拟合；数据先按 maxPoints 截尾） */
+	fit(xs, ys) {
+		const n = Math.min(xs.length, ys.length);
+		if (n < 2) return void 0;
+		let sx = xs.slice(-n);
+		let sy = ys.slice(-n);
+		if (n > this.config.maxPoints) {
+			sx = sx.slice(sx.length - this.config.maxPoints);
+			sy = sy.slice(sy.length - this.config.maxPoints);
+		}
+		this.xs = sx;
+		this.ys = sy;
+		const m = this.xs.length;
+		this.yMean = this.ys.reduce((s, v) => s + v, 0) / m;
+		this.yStd = Math.max(1e-9, Math.sqrt(this.ys.reduce((s, v) => s + (v - this.yMean) ** 2, 0) / Math.max(1, m - 1)));
+		this.xMin = Math.min(...this.xs);
+		this.xMax = Math.max(...this.xs);
+		if (!(this.xMax - this.xMin > 1e-12)) this.xMax = this.xMin + 1;
+		const zy = this.ys.map((v) => (v - this.yMean) / this.yStd);
+		const nx = this.xs.map((x) => this.normalize(x));
+		const lmlOf = (ell, sf) => {
+			const { L } = choleskyLower(this.kernelMatrix(nx, ell, sf).map((row, i) => row.map((v, j) => v + (i === j ? this.config.sigmaN ** 2 : 0)))) ?? {};
+			if (!L) return Number.NEGATIVE_INFINITY;
+			const alpha = solveCholesky(L, zy);
+			let quad = 0;
+			for (let i = 0; i < m; i += 1) quad += zy[i] * alpha[i];
+			let logDet = 0;
+			for (let i = 0; i < m; i += 1) logDet += Math.log(Math.max(1e-300, L[i][i]));
+			return -.5 * quad - logDet - m / 2 * Math.log(2 * Math.PI);
+		};
+		let bestEll = this.config.lengthScale;
+		let bestSf = this.config.sigmaF;
+		let bestLml = lmlOf(bestEll, bestSf);
+		let tuned = false;
+		if (this.config.tuneHyperparams) {
+			tuned = true;
+			for (let e = 0; e < 8; e += 1) {
+				const ell = 10 ** (-2 + .7 * e / 7);
+				for (const sf of [
+					.5,
+					1,
+					2
+				]) {
+					const lml = lmlOf(ell, sf);
+					if (lml > bestLml) {
+						bestLml = lml;
+						bestEll = ell;
+						bestSf = sf;
+					}
+				}
+			}
+		}
+		const decomp = choleskyLower(this.kernelMatrix(nx, bestEll, bestSf).map((row, i) => row.map((v, j) => v + (i === j ? this.config.sigmaN ** 2 : 0))));
+		if (!decomp) return void 0;
+		this.L = decomp.L;
+		this.alpha = solveCholesky(this.L, zy);
+		this.fitReport = {
+			points: m,
+			lengthScale: bestEll,
+			sigmaF: bestSf,
+			logMarginalLikelihood: bestLml,
+			tuned
+		};
+		return this.fitReport;
+	}
+	/** 后验预测（原始尺度；未拟合时 undefined） */
+	predict(x) {
+		if (!this.L || this.xs.length === 0) return void 0;
+		const nx = this.normalize(x);
+		const kStar = this.xs.map((xi) => this.kernelValue(nx, this.normalize(xi), this.fitReport.lengthScale, this.fitReport.sigmaF));
+		let meanStd = 0;
+		for (let i = 0; i < kStar.length; i += 1) meanStd += kStar[i] * this.alpha[i];
+		const w = solveCholesky(this.L, kStar);
+		let quad = 0;
+		for (let i = 0; i < w.length; i += 1) quad += kStar[i] * w[i];
+		const prior = this.kernelValue(0, 0, this.fitReport.lengthScale, this.fitReport.sigmaF);
+		const varStd = Math.max(0, prior - quad);
+		return {
+			mean: meanStd * this.yStd + this.yMean,
+			std: Math.sqrt(varStd + this.config.sigmaN ** 2) * this.yStd
+		};
+	}
+	/** 最近一次拟合报告 */
+	get fitSummary() {
+		return this.fitReport;
+	}
+	/** 训练点数 */
+	get size() {
+		return this.xs.length;
+	}
+	normalize(x) {
+		return (x - this.xMin) / (this.xMax - this.xMin);
+	}
+	kernelValue(a, b, ell, sf) {
+		if (this.config.kernel === "matern52") return matern52(a - b, ell, sf);
+		return sf * sf * Math.exp(-((a - b) ** 2) / (2 * ell * ell));
+	}
+	kernelMatrix(xs, ell, sf) {
+		return xs.map((a) => xs.map((b) => this.kernelValue(a, b, ell, sf)));
+	}
+};
+/**
+* 期望改进（解析式）。
+* @param mu 候选点后验均值（越大越好口径）
+* @param sigma 候选点后验标准差
+* @param best 已观测最优值
+* @param xi 改进裕量（缺省 0.01，防过早在噪声上收敛）
+*/
+function expectedImprovement(mu, sigma, best, xi = .01) {
+	if (!(sigma > 1e-12)) return Math.max(0, mu - best - xi);
+	const z = (mu - best - xi) / sigma;
+	return (mu - best - xi) * normalCdf(z) + sigma * normalPdf(z);
+}
+/**
+* 离散候选集上的贝叶斯优化器（EI 采集）。
+*
+* observe(x,y) 登记真实观测；suggest(candidates) 拟合 GP 并返回 EI 最大
+* 的候选。适合「心跳间期在有限候选点里挑下一个试验参数」的在线调参场景。
+*/
+var BayesianOptimizer = class {
+	gp;
+	xs = [];
+	ys = [];
+	dirty = true;
+	constructor(config) {
+		this.gp = new GaussianProcess(config);
+	}
+	observe(x, y) {
+		this.xs.push(x);
+		this.ys.push(y);
+		this.dirty = true;
+	}
+	/** EI 最优候选（观测 < 2 或全部失败时 undefined） */
+	suggest(candidates) {
+		if (this.xs.length < 2 || candidates.length === 0) return void 0;
+		if (this.dirty) {
+			this.gp.fit(this.xs, this.ys);
+			this.dirty = false;
+		}
+		const best = Math.max(...this.ys);
+		let bestSuggestion;
+		for (const x of candidates) {
+			const p = this.gp.predict(x);
+			if (!p) continue;
+			const ei = expectedImprovement(p.mean, p.std, best);
+			if (!bestSuggestion || ei > bestSuggestion.expectedImprovement) bestSuggestion = {
+				x,
+				expectedImprovement: ei,
+				posteriorMean: p.mean,
+				posteriorStd: p.std
+			};
+		}
+		return bestSuggestion;
+	}
+	get state() {
+		const bestIdx = this.ys.length > 0 ? this.ys.indexOf(Math.max(...this.ys)) : -1;
+		return {
+			observations: this.xs.length,
+			bestX: bestIdx >= 0 ? this.xs[bestIdx] : void 0,
+			bestY: bestIdx >= 0 ? this.ys[bestIdx] : void 0
+		};
+	}
+};
+/**
+* 26.0 接线辅助：序列校准器——「预测/实际」比值的时间序列 GP。
+*
+* 世界模型每次校准对账 push(timestamp, ratio)；predictAt(now) 返回当前
+* 时刻的比值修正（均值 + 不确定度）。数据不足 minPoints 时 undefined
+* （先验无知 = 不修正，早期零漂移）。内部按归一时间轴拟合，GP 均值函数
+* 取经验均值——比值无趋势时修正 ≈ 平均比值，有趋势时跟踪漂移。
+*/
+var GpSeriesCalibrator = class {
+	config;
+	ts = [];
+	vs = [];
+	gp;
+	fittedAt = -1;
+	constructor(config) {
+		this.config = {
+			maxPoints: config?.maxPoints ?? 64,
+			sigmaN: config?.sigmaN ?? .15,
+			minPoints: config?.minPoints ?? 6,
+			factorClamp: config?.factorClamp ?? 4
+		};
+		this.gp = new GaussianProcess({
+			maxPoints: this.config.maxPoints,
+			sigmaN: this.config.sigmaN,
+			tuneHyperparams: true,
+			kernel: config?.kernel ?? "rbf"
+		});
+	}
+	/** 登记一次比值观测（actual/predicted） */
+	push(timestamp, ratio) {
+		if (!Number.isFinite(ratio) || ratio <= 0 || !Number.isFinite(timestamp)) return;
+		this.ts.push(timestamp);
+		this.vs.push(ratio);
+		if (this.ts.length > this.config.maxPoints) {
+			this.ts.splice(0, this.ts.length - this.config.maxPoints);
+			this.vs.splice(0, this.vs.length - this.config.maxPoints);
+		}
+	}
+	/** 当前时刻的比值修正（点数不足或拟合失败时 undefined） */
+	predictAt(now) {
+		if (this.ts.length < this.config.minPoints) return void 0;
+		if (this.fittedAt !== this.ts.length) {
+			this.gp.fit(this.ts, this.vs);
+			this.fittedAt = this.ts.length;
+		}
+		const p = this.gp.predict(now);
+		if (!p) return void 0;
+		const clamp = this.config.factorClamp;
+		return {
+			factor: Math.min(clamp, Math.max(1 / clamp, p.mean)),
+			std: p.std,
+			points: this.ts.length
+		};
+	}
+	get size() {
+		return this.ts.length;
+	}
+};
+//#endregion
 //#region src/world-model.ts
+/**
+* world-model.ts — 世界模型（自主智能"预见"支柱）
+*
+* 职责：让系统对"外部世界如何运转"建立内部模型，从而具备预见能力——
+* 不是被动等待信号到来，而是提前预判信号到达、负载趋势与类型关联，
+* 为决策引擎、心跳循环与元认知提供前瞻性依据。
+*
+* 能力矩阵：
+* 1. 信号到达规律学习：按类型维护到达时间序列（滑动窗口），
+*    计算到达率、到达间隔分布、时段热度（小时直方图）
+* 2. 到达预测：基于历史到达率 + 时段热度 + 突发趋势，
+*    预测未来窗口内各类型信号的期望到达数（含置信区间）
+* 3. 类型关联矩阵：统计类型对的共现频率（时间邻近窗口内），
+*    识别"A 类型信号常伴随 B 类型信号"的规律，供级联与预取决策
+* 4. 预测校准：记录每次预测与实际到达的偏差，
+*    计算校准误差（MAE），误差过大时降低预测置信度并提示重学
+* 5. 趋势检测：对到达率做线性回归，识别上升/下降/平稳趋势，
+*    上升趋势触发负载预警洞察（交给元认知/目标引擎）
+*
+* 设计要点：
+* - 全部为纯统计学习，无需 LLM，开销极低，可在每次信号到达时增量更新
+* - 时间序列窗口有界（每类型最多保留 N 个到达时间戳），内存可控
+*/
 /** 默认配置 */
 const DEFAULT_WORLD_MODEL_CONFIG = {
 	maxTimestampsPerType: 500,
@@ -16309,11 +17044,43 @@ var WorldModel = class {
 	causal;
 	/** 13.0：保形校准引擎（可选挂载） */
 	conformalEngine;
+	/** 26.0：每类型 GP 校准器（可选挂载；attachGpCalibrator 后惰性创建） */
+	gpCalibrators;
 	constructor(config) {
 		this.config = {
 			...DEFAULT_WORLD_MODEL_CONFIG,
 			...config
 		};
+	}
+	/**
+	* 26.0：挂载 GP 序列校准器开关（幂等）。
+	*
+	* 挂载后每次 settleCalibrations 把 actual/predicted 比值喂入该类型的
+	* GP 时间序列；predictArrivals 的期望乘以 GP 后验均值因子、区间按
+	* 后验标准差拓宽——趋势修正的 1.25/0.75 魔数由「从对账结果学出来的
+	* 修正」接管（校准史充分前 factor 恒 1，早期零漂移）。
+	*/
+	attachGpCalibrator(options) {
+		this.gpOptions = options;
+		this.gpCalibrators = this.gpCalibrators ?? /* @__PURE__ */ new Map();
+	}
+	gpOptions;
+	gpFor(type) {
+		if (!this.gpCalibrators) return void 0;
+		let cal = this.gpCalibrators.get(type);
+		if (!cal) {
+			cal = new GpSeriesCalibrator(this.gpOptions);
+			this.gpCalibrators.set(type, cal);
+		}
+		return cal;
+	}
+	/** 26.0：GP 校准状态（未挂载返回 undefined） */
+	getGpCalibrationStatus() {
+		if (!this.gpCalibrators) return void 0;
+		return [...this.gpCalibrators.entries()].map(([type, cal]) => ({
+			type,
+			points: cal.size
+		}));
 	}
 	/**
 	* 5.0：挂载因果内核（幂等）。
@@ -16394,27 +17161,37 @@ var WorldModel = class {
 			const ratePerMs = this.recentRate(entry, now);
 			const trend = this.trendOf(entry, now);
 			const trendFactor = trend === "rising" ? 1.25 : trend === "falling" ? .75 : 1;
-			const adjusted = ratePerMs * horizonMs * trendFactor * this.hourFactor(entry, now + horizonMs / 2);
-			const spread = Math.sqrt(Math.max(adjusted, .5));
+			const adjustedRaw = ratePerMs * horizonMs * trendFactor * this.hourFactor(entry, now + horizonMs / 2);
 			const confidence = this.calibrationConfidence(type);
+			const gpCorrection = this.gpFor(type)?.predictAt(now);
+			const gpFactor = gpCorrection?.factor ?? 1;
+			const gpStd = gpCorrection?.std ?? 0;
+			const adjusted = adjustedRaw * gpFactor;
+			const gpSpread = gpStd * adjustedRaw;
+			const spread = Math.sqrt(Math.max(adjusted, .5));
 			let prediction;
 			if (this.conformalEngine) {
 				const interval = this.conformalEngine.interval(adjusted);
 				prediction = {
 					type,
 					expectedCount: Number(adjusted.toFixed(2)),
-					lowerBound: interval.finite ? Number(Math.max(0, interval.lower).toFixed(2)) : Math.max(0, Number((adjusted - spread).toFixed(2))),
-					upperBound: interval.finite ? Number(Math.max(0, interval.upper).toFixed(2)) : Number((adjusted + spread).toFixed(2)),
+					lowerBound: interval.finite ? Number(Math.max(0, interval.lower - gpSpread).toFixed(2)) : Math.max(0, Number((adjusted - spread - gpSpread).toFixed(2))),
+					upperBound: interval.finite ? Number(Math.max(0, interval.upper + gpSpread).toFixed(2)) : Number((adjusted + spread + gpSpread).toFixed(2)),
 					confidence,
 					trend,
 					conformal: {
-						lower: interval.finite ? Number(Math.max(0, interval.lower).toFixed(2)) : Number.POSITIVE_INFINITY,
-						upper: interval.finite ? Number(Math.max(0, interval.upper).toFixed(2)) : Number.POSITIVE_INFINITY,
+						lower: interval.finite ? Number(Math.max(0, interval.lower - gpSpread).toFixed(2)) : Number.POSITIVE_INFINITY,
+						upper: interval.finite ? Number(Math.max(0, interval.upper + gpSpread).toFixed(2)) : Number.POSITIVE_INFINITY,
 						finite: interval.finite,
 						qhat: interval.qhat,
 						calibrationN: interval.calibrationN,
 						alpha: interval.alpha
-					}
+					},
+					...gpCorrection ? { gp: {
+						factor: Number(gpFactor.toFixed(3)),
+						std: Number(gpStd.toFixed(3)),
+						points: gpCorrection.points
+					} } : {}
 				};
 				this.pendingPredictions.set(type, {
 					predicted: adjusted,
@@ -16429,10 +17206,15 @@ var WorldModel = class {
 				prediction = {
 					type,
 					expectedCount: Number(adjusted.toFixed(2)),
-					lowerBound: Math.max(0, Number((adjusted - spread).toFixed(2))),
-					upperBound: Number((adjusted + spread).toFixed(2)),
+					lowerBound: Math.max(0, Number((adjusted - spread - gpSpread).toFixed(2))),
+					upperBound: Number((adjusted + spread + gpSpread).toFixed(2)),
 					confidence,
-					trend
+					trend,
+					...gpCorrection ? { gp: {
+						factor: Number(gpFactor.toFixed(3)),
+						std: Number(gpStd.toFixed(3)),
+						points: gpCorrection.points
+					} } : {}
 				};
 				this.pendingPredictions.set(type, {
 					predicted: adjusted,
@@ -16463,6 +17245,8 @@ var WorldModel = class {
 			};
 			this.calibrations.push(record);
 			settled.push(record);
+			const gp = this.gpFor(type);
+			if (gp && record.predicted > 0) gp.push(now, Math.max(.05, Math.min(20, record.actual / record.predicted)));
 			if (this.conformalEngine) {
 				this.conformalEngine.calibrate(record.error);
 				if (pending.conformalInterval?.finite) this.conformalEngine.recordCovered(actualCount >= pending.conformalInterval.lower && actualCount <= pending.conformalInterval.upper);
@@ -17152,7 +17936,7 @@ const SHAPLEY_PERMUTATION_SAMPLES = 512;
 */
 function shapleyByPermutationSampling(contributors, rng) {
 	const n = contributors.length;
-	const rand = rng ?? mulberry32(12648430);
+	const rand = rng ?? mulberry32$3(12648430);
 	const sums = new Array(n).fill(0);
 	const failProbs = contributors.map((c) => Math.max(0, 1 - c.prob));
 	for (let s = 0; s < SHAPLEY_PERMUTATION_SAMPLES; s += 1) {
@@ -17180,7 +17964,7 @@ function shapleyByPermutationSampling(contributors, rng) {
 * mulberry32：32 位确定性伪随机源（种子固定时序列完全可复现）。
 * 供 Shapley 置换采样在无外部 rng 注入时使用。
 */
-function mulberry32(seed) {
+function mulberry32$3(seed) {
 	let a = seed >>> 0;
 	return () => {
 		a = a + 1831565813 >>> 0;
@@ -17494,6 +18278,217 @@ function gaussian() {
 function round$11(x) {
 	return Number(x.toFixed(6));
 }
+//#endregion
+//#region src/core/mcts.ts
+/**
+* 29.0 蒙特卡洛树搜索内核 —— UCT + 折扣回报 + 任意时刻可读
+*
+* 动机: 7.0 beam search 在轨迹空间按「模型评分」剪枝——宽度是资源，深度
+* 受 beam 限制；评估函数（累计 G）是确定性的近视打分。MCTS 把搜索本身
+* 变成**序贯决策问题**：
+*
+*   选择:  UCB1 = Q(s,a)/N(s,a) + c·√(ln N(s) / N(s,a))
+*     ——利用项（均值）与探索项（访问稀缺度）的置信上界平衡，
+*     Hoeffding 界保证收敛到最优动作（Kocsis & Szepesvári 2006）。
+*   扩展: 每次迭代只展开一个未试动作（惰性扩展，树按需生长）；
+*     渐进加宽（可选）⌈k·(N+1)^κ⌉ 限制大动作集的子节点数。
+*   模拟: 随机 rollout 到深度上限，收集折扣回报 Σ γ^t·r_t。
+*   回传: **节点本地回报**——每条边记录进入奖励，回传时按
+*     (R − 前缀折扣奖励)/γ^depth 折算，每个节点的 Q 都是
+*     「从本节点出发的折扣回报」，无深度偏置。
+*
+*   任意时刻性（与 8.0 元推理同族）: 迭代预算 / 时间预算任一耗尽即读出，
+*     访问分布即时可审计（visits 越多 = 证据越多，与 21.0 学习溢价同构）。
+*
+* 确定性: 种子化 mulberry32——同一 (seed, domain) 组合逐位复现；
+*   域内随机必须只消费传入的 rng。
+*
+* 零漂移: 未挂载时一切路径与升级前逐位一致。
+*/
+/** 确定性 PRNG（mulberry32） */
+function mulberry32$2(seed) {
+	let a = seed >>> 0;
+	return () => {
+		a |= 0;
+		a = a + 1831565813 | 0;
+		let t = Math.imul(a ^ a >>> 15, 1 | a);
+		t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+}
+const DEFAULT_UCT_CONFIG = {
+	explorationC: Math.SQRT2,
+	discount: .95,
+	rolloutDepth: 12,
+	seed: 20260920,
+	progressiveWidenK: 0,
+	progressiveWidenKappa: .5
+};
+/**
+* UCT 搜索器。bind(domain) 后可反复 search()（每次为独立完整运行，
+* 种子重置——同一预算逐位可复现）。
+*/
+var UctSearch = class {
+	config;
+	domain;
+	rng = mulberry32$2(1);
+	nodeCount = 0;
+	constructor(config, domain) {
+		this.config = { ...DEFAULT_UCT_CONFIG };
+		if (config) for (const key of Object.keys(config)) {
+			const v = config[key];
+			if (v !== void 0) this.config[key] = v;
+		}
+		this.domain = domain;
+	}
+	/** 绑定/替换搜索域 */
+	bind(domain) {
+		this.domain = domain;
+		return this;
+	}
+	search(root, budget = {}) {
+		if (!this.domain) throw new Error("UctSearch: search 前必须 bind(domain)");
+		const iterations = Math.max(1, budget.iterations ?? 400);
+		const deadline = budget.timeMs !== void 0 ? Date.now() + budget.timeMs : Number.POSITIVE_INFINITY;
+		this.rng = mulberry32$2(this.config.seed);
+		this.nodeCount = 1;
+		const rootNode = {
+			state: root,
+			parent: null,
+			action: null,
+			incomingReward: 0,
+			children: /* @__PURE__ */ new Map(),
+			untried: [...this.domain.actions(root)],
+			visits: 0,
+			valueSum: 0,
+			terminal: false,
+			depth: 0
+		};
+		rootNode.terminal = rootNode.untried.length === 0;
+		let done = 0;
+		for (; done < iterations; done += 1) {
+			if ((done & 15) === 0 && Date.now() > deadline) break;
+			this.runEpisode(rootNode);
+		}
+		const children = [...rootNode.children.values()].map((c) => ({
+			action: c.action,
+			visits: c.visits,
+			meanValue: c.visits > 0 ? c.valueSum / c.visits : 0
+		})).sort((a, b) => b.visits - a.visits || b.meanValue - a.meanValue);
+		return {
+			bestAction: children[0]?.action,
+			rootValue: rootNode.visits > 0 ? rootNode.valueSum / rootNode.visits : 0,
+			iterations: done,
+			treeNodes: this.nodeCount,
+			children,
+			principalVariation: this.extractPv(rootNode)
+		};
+	}
+	runEpisode(root) {
+		const gamma = this.config.discount;
+		const path = [root];
+		const edgeReward = [];
+		let pathReward = 0;
+		let node = root;
+		while (!node.terminal && node.children.size > 0 && (node.untried.length === 0 || !this.canWiden(node))) {
+			const child = this.selectUcb(node);
+			const resampled = this.domain.step(node.state, child.action, this.rng);
+			path.push(child);
+			edgeReward.push(resampled.reward);
+			pathReward += Math.pow(gamma, Math.max(0, child.depth - 1)) * resampled.reward;
+			node = child;
+		}
+		let totalReturn;
+		if (node.terminal) totalReturn = pathReward;
+		else if (node.untried.length > 0) {
+			const idx = Math.floor(this.rng() * node.untried.length);
+			const action = node.untried.splice(idx, 1)[0];
+			const transition = this.domain.step(node.state, action, this.rng);
+			const child = {
+				state: transition.state,
+				parent: node,
+				action,
+				incomingReward: transition.reward,
+				children: /* @__PURE__ */ new Map(),
+				untried: transition.terminal ? [] : [...this.domain.actions(transition.state)],
+				visits: 0,
+				valueSum: 0,
+				terminal: transition.terminal,
+				depth: node.depth + 1
+			};
+			this.nodeCount += 1;
+			node.children.set(action, child);
+			path.push(child);
+			edgeReward.push(transition.reward);
+			totalReturn = pathReward + Math.pow(gamma, node.depth) * transition.reward + (child.terminal ? 0 : Math.pow(gamma, node.depth + 1) * this.rollout(child));
+			pathReward += Math.pow(gamma, node.depth) * transition.reward;
+		} else totalReturn = pathReward + Math.pow(gamma, node.depth) * this.rollout(node);
+		let prefix = 0;
+		for (let i = 0; i < path.length; i += 1) {
+			const n = path[i];
+			const denom = Math.pow(gamma, Math.max(0, n.depth - 1));
+			const local = (totalReturn - prefix) / denom;
+			n.valueSum += local;
+			n.visits += 1;
+			if (i >= 1) prefix += Math.pow(gamma, Math.max(0, n.depth - 1)) * edgeReward[i - 1];
+		}
+	}
+	/** UCB1 选择（访问数 0 的子节点视为 +∞——必先展开） */
+	selectUcb(node) {
+		const logN = Math.log(Math.max(1, node.visits));
+		let best;
+		let bestScore = Number.NEGATIVE_INFINITY;
+		for (const child of node.children.values()) {
+			const score = child.visits === 0 ? Number.POSITIVE_INFINITY : child.valueSum / child.visits + this.config.explorationC * Math.sqrt(logN / child.visits);
+			if (score > bestScore) {
+				bestScore = score;
+				best = child;
+			}
+		}
+		return best;
+	}
+	/** 随机 rollout：深度上限内均匀选动作，收集折扣回报（从该节点视角） */
+	rollout(node) {
+		const gamma = this.config.discount;
+		let state = node.state;
+		let acc = 0;
+		for (let d = 0; d < this.config.rolloutDepth; d += 1) {
+			const actions = this.domain.actions(state);
+			if (actions.length === 0) break;
+			const action = actions[Math.floor(this.rng() * actions.length)];
+			const t = this.domain.step(state, action, this.rng);
+			acc += Math.pow(gamma, d) * t.reward;
+			state = t.state;
+			if (t.terminal) break;
+		}
+		return acc;
+	}
+	/** 渐进加宽：子节点数上限 ⌈k·(N+1)^κ⌉（k=0 恒真 = 关闭） */
+	canWiden(node) {
+		if (this.config.progressiveWidenK <= 0) return true;
+		const cap = Math.ceil(this.config.progressiveWidenK * Math.pow(node.visits + 1, this.config.progressiveWidenKappa));
+		return node.children.size < cap;
+	}
+	/** 主变化线：自根沿最高访问数下降 */
+	extractPv(root) {
+		const pv = [];
+		let node = root;
+		const guard = /* @__PURE__ */ new Set();
+		while (node && node.children.size > 0) {
+			let best;
+			let bestVisits = -1;
+			for (const child of node.children.values()) if (child.visits > bestVisits) {
+				bestVisits = child.visits;
+				best = child;
+			}
+			if (!best || best.visits === 0 || guard.has(best)) break;
+			guard.add(best);
+			pv.push(best.action);
+			node = best;
+		}
+		return pv;
+	}
+};
 //#endregion
 //#region src/core/deliberation.ts
 /**
@@ -17816,6 +18811,109 @@ var DeliberationEngine = class {
 			best: reports[0],
 			expandedNodes,
 			skillSeeded
+		};
+	}
+	/**
+	* 29.0：UCT 前瞻搜索（beam search 的序贯决策升级口径）。
+	*
+	* beam search 按轨迹 G 剪枝（宽度即资源上限）；本方法把「搜索预算的
+	* 分配」本身交给 UCT——每条转移边按 Beta 后验采样伯努利成败（失败即
+	* 终局零回报），回报 = 逐步折扣的成功指示（与 pAllSuccess 同族），
+	* UCB1 在「利用证据多的边」与「探索证据少的边」之间自动平衡。
+	* 迭代/时间预算耗尽即读出（任意时刻性），根动作按访问证据排序；
+	* 每条报告沿 MCTS 主变化线展开完整 ImaginationReport（口径与
+	* search() 一致，可互查对账）。未挂载消费方不调用即零漂移。
+	*/
+	searchMcts(startState, candidates, opts) {
+		const preference = opts?.preference ?? .9;
+		const topK = Math.max(1, opts?.topK ?? this.config.beamBreadth);
+		const actionsAt = (state) => typeof candidates === "function" ? candidates(state) : candidates;
+		const eps = this.config.probEpsilon;
+		const advance = opts?.advance;
+		const domain = {
+			actions: actionsAt,
+			step: (state, action, rng) => {
+				const post = this.posterior(state, action);
+				const p = Math.min(1 - eps, Math.max(eps, post.pSuccess));
+				if (rng() >= p) return {
+					state: `${state}#mcts-fail`,
+					reward: 0,
+					terminal: true
+				};
+				return {
+					state: advance ? advance({
+						state,
+						action,
+						step: 0,
+						successor: post.successor
+					}) : post.successor,
+					reward: 1,
+					terminal: false
+				};
+			}
+		};
+		const mcts = new UctSearch({
+			explorationC: opts?.explorationC,
+			discount: opts?.discount
+		}, domain).search(startState, { iterations: opts?.iterations ?? 600 });
+		const depthCap = Math.max(1, Math.min(this.config.maxDepth, 12));
+		const buildPlan = (rootAction, usePv) => {
+			const plan = [rootAction];
+			if (usePv) {
+				for (const a of mcts.principalVariation.slice(1)) {
+					plan.push(a);
+					if (plan.length >= depthCap) break;
+				}
+				return plan.slice(0, depthCap);
+			}
+			let state = this.posterior(startState, rootAction).successor;
+			if (advance) state = advance({
+				state: startState,
+				action: rootAction,
+				step: 0,
+				successor: state
+			});
+			while (plan.length < depthCap) {
+				const actions = actionsAt(state);
+				if (actions.length === 0) break;
+				let bestAction = actions[0];
+				let bestP = -1;
+				for (const a of actions) {
+					const p = this.posterior(state, a).pSuccess;
+					if (p > bestP) {
+						bestP = p;
+						bestAction = a;
+					}
+				}
+				plan.push(bestAction);
+				let next = this.posterior(state, bestAction).successor;
+				if (advance) next = advance({
+					state,
+					action: bestAction,
+					step: plan.length - 1,
+					successor: next
+				});
+				state = next;
+			}
+			return plan;
+		};
+		const ranked = [];
+		const seen = /* @__PURE__ */ new Set();
+		const order = [...mcts.children].sort((a, b) => b.meanValue - a.meanValue || b.visits - a.visits);
+		for (let i = 0; i < Math.min(topK, order.length); i += 1) {
+			const entry = order[i];
+			const plan = buildPlan(entry.action, i === 0);
+			const sig = plan.join("|");
+			if (seen.has(sig)) continue;
+			seen.add(sig);
+			ranked.push(this.nodeToReport(this.expandPrefix(startState, plan, preference)));
+		}
+		return {
+			ranked,
+			best: ranked[0],
+			expandedNodes: mcts.treeNodes,
+			skillSeeded: false,
+			mcts
 		};
 	}
 	/**
@@ -20062,6 +21160,293 @@ function round$1(x) {
 	return Math.round(x * 1e6) / 1e6;
 }
 //#endregion
+//#region src/core/extreme-value.ts
+/**
+* 28.0 极值理论内核 —— POT/GPD 尾部建模 + Hill 估计 + 风险度量
+*
+* 动机: 平均值撒谎，尾部杀人。p99.9 延迟、预算爆仓、失败风暴都住在分布
+* 的尾部——而经验分位数在尾部**没有数据可看**（1000 个样本里 p99.9 就是
+* 最大值，纯运气）。极值理论（EVT）不外推整个分布，只外推尾部，且尾部
+* 有定理保证：
+*
+*   Pickands–Balkema–de Haan: 超过阈值 u 的超出量 Y = X − u（足够大的 u）
+*     收敛于广义帕累托 GPD_ξ,σ:
+*     H(y) = 1 − (1 + ξy/σ)^{−1/ξ}  (ξ≠0),  1 − e^{−y/σ}  (ξ=0)
+*   ξ > 0 重尾（无限方差当 ξ > 1/2）, ξ = 0 指数尾, ξ < 0 有界尾
+*
+*   POT 分位数（尾部外推，经验分位数的定理化替代）:
+*     VaR_p = u + (σ̂/ξ̂)·[ (N_u/n · 1/(1−p))^{ξ̂} − 1 ]
+*   期望损失 ES_p = (VaR_p + σ̂ − ξ̂·u)/(1 − ξ̂)  (ξ̂ < 1)
+*
+*   Hill 估计（重尾指数的半参数估计）:
+*     α̂_k = k / Σ_{i≤k} ln(x_(i)/x_(k+1))  （降序前 k 个）
+*     jackknife 标准误——「尾部有多重」本身带不确定度
+*
+*   GPD MLE: Grimshaw (1993) 剖面似然——把 (ξ,σ) 二维优化化为 θ = ξ/σ
+*   的一维搜索（σ(θ) = k̄/θ, k̄ = mean ln(1+θy)），θ ∈ (−1/y_max, 2/y_max)
+*   网格 + 黄金分割细化；θ→0 边界退化为指数 MLE（σ̂ = ȳ）。
+*
+* 零漂移: 未挂载时一切路径与升级前逐位一致。
+*/
+/** 确定性 PRNG（mulberry32；验证脚本与内核共用同一实现保证可复现） */
+function mulberry32(seed) {
+	let a = seed >>> 0;
+	return () => {
+		a |= 0;
+		a = a + 1831565813 | 0;
+		let t = Math.imul(a ^ a >>> 15, 1 | a);
+		t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+}
+/** 经验分位数（最近邻插值；xs 无序） */
+function empiricalQuantile(xs, q) {
+	if (xs.length === 0) return 0;
+	const sorted = [...xs].sort((a, b) => a - b);
+	const pos = Math.min(Math.max(q * (sorted.length - 1), 0), sorted.length - 1);
+	const lo = Math.floor(pos);
+	const hi = Math.ceil(pos);
+	if (lo === hi) return sorted[lo];
+	return sorted[lo] + (pos - lo) * (sorted[hi] - sorted[lo]);
+}
+/**
+* Hill 尾指数估计（降序取前 k 个对 x_(k+1) 的对数比）。
+* 适用 ξ > 0（重尾）；数据不足或含非正值时 undefined。
+*/
+function hillEstimator(samples, k) {
+	const positive = samples.filter((x) => Number.isFinite(x) && x > 0).sort((a, b) => b - a);
+	const kk = Math.min(k ?? Math.floor(positive.length * .1), positive.length - 1);
+	if (kk < 2) return void 0;
+	const xK1 = positive[kk];
+	const logs = [];
+	for (let i = 0; i < kk; i += 1) logs.push(Math.log(positive[i] / xK1));
+	const sum = logs.reduce((s, v) => s + v, 0);
+	const alpha = kk / Math.max(1e-12, sum);
+	let sq = 0;
+	for (let i = 0; i < kk; i += 1) {
+		const rest = (sum - logs[i]) / Math.max(1e-12, kk - 1);
+		const aj = 1 / Math.max(1e-12, rest);
+		sq += (aj - 1 / (sum / kk)) ** 2;
+	}
+	const se = Math.sqrt(Math.max(0, sq) * (kk - 1) / kk / kk);
+	return {
+		alpha,
+		xi: 1 / alpha,
+		se,
+		k: kk
+	};
+}
+function gpdProfileLoglik(theta, ys) {
+	const n = ys.length;
+	let sumLog = 0;
+	for (const y of ys) {
+		const inner = 1 + theta * y;
+		if (inner <= 1e-12) return Number.NEGATIVE_INFINITY;
+		sumLog += Math.log(inner);
+	}
+	if (Math.abs(theta) < 1e-10) {
+		const ybar = sumLog === 0 ? ys.reduce((s, y) => s + y, 0) / n : ys.reduce((s, y) => s + y, 0) / n;
+		return -n * Math.log(ybar) - n;
+	}
+	const kBar = sumLog / n;
+	const sigma = kBar / theta;
+	if (sigma <= 0) return Number.NEGATIVE_INFINITY;
+	return -n * Math.log(sigma) - (1 + 1 / kBar) * sumLog;
+}
+/**
+* GPD 极大似然（Grimshaw 剖面法）。ys 为严格正的超出量（x − u）。
+* 数据不足 / 退化时 undefined。
+*/
+function fitGpd(ys) {
+	const n = ys.length;
+	if (n < 8) return void 0;
+	const yMax = Math.max(...ys);
+	const yMean = ys.reduce((s, y) => s + y, 0) / n;
+	if (!(yMax > 0) || !(yMean > 0)) return void 0;
+	const lo = -1 / yMax + 1e-9;
+	const hi = Math.max(2 / yMax, 32 / yMean);
+	const grid = 96;
+	let bestTheta = 0;
+	let bestLl = gpdProfileLoglik(0, ys);
+	for (let i = 0; i <= grid; i += 1) {
+		const theta = lo + (hi - lo) * i / grid;
+		const ll = gpdProfileLoglik(theta, ys);
+		if (ll > bestLl) {
+			bestLl = ll;
+			bestTheta = theta;
+		}
+	}
+	let a = Math.max(lo, bestTheta - (hi - lo) / grid);
+	let b = Math.min(hi, bestTheta + (hi - lo) / grid);
+	const gr = .6180339887498949;
+	let c = b - gr * (b - a);
+	let d = a + gr * (b - a);
+	let fc = gpdProfileLoglik(c, ys);
+	let fd = gpdProfileLoglik(d, ys);
+	for (let it = 0; it < 80; it += 1) if (fc > fd) {
+		b = d;
+		d = c;
+		fd = fc;
+		c = b - gr * (b - a);
+		fc = gpdProfileLoglik(c, ys);
+	} else {
+		a = c;
+		c = d;
+		fc = fd;
+		d = a + gr * (b - a);
+		fd = gpdProfileLoglik(d, ys);
+	}
+	const theta = (a + b) / 2;
+	const ll = gpdProfileLoglik(theta, ys);
+	if (ll >= bestLl) {
+		bestTheta = theta;
+		bestLl = ll;
+	}
+	if (Math.abs(bestTheta) < 1e-10) return {
+		xi: 0,
+		sigma: ys.reduce((s, y) => s + y, 0) / n,
+		logLikelihood: bestLl,
+		theta: 0,
+		n
+	};
+	let sumLog = 0;
+	for (const y of ys) sumLog += Math.log(1 + bestTheta * y);
+	const xi = sumLog / n;
+	const sigma = xi / bestTheta;
+	if (!(sigma > 0)) return void 0;
+	return {
+		xi,
+		sigma,
+		logLikelihood: bestLl,
+		theta: bestTheta,
+		n
+	};
+}
+/** GPD 分布函数 */
+function gpdCdf(y, xi, sigma) {
+	if (y <= 0) return 0;
+	if (Math.abs(xi) < 1e-10) return 1 - Math.exp(-y / sigma);
+	const t = 1 + xi * y / sigma;
+	if (t <= 0) return 1;
+	return 1 - Math.pow(t, -1 / xi);
+}
+/**
+* POT 分位数与期望损失。
+* @param fit GPD 拟合（超出量口径）
+* @param totalSamples 原始样本总数 n
+* @param exceedances 超出量个数 N_u
+* @param u 阈值
+*/
+function potQuantiles(fit, totalSamples, exceedances, u, p) {
+	const ratio = exceedances / Math.max(1, totalSamples) * (1 / Math.max(1e-12, 1 - p));
+	if (Math.abs(fit.xi) < 1e-6) {
+		const varP = u + fit.sigma * Math.log(ratio);
+		return {
+			varP,
+			esP: varP + fit.sigma
+		};
+	}
+	if (fit.xi >= 1) return { varP: u + fit.sigma / fit.xi * (Math.pow(ratio, fit.xi) - 1) };
+	const varP = u + fit.sigma / fit.xi * (Math.pow(ratio, fit.xi) - 1);
+	return {
+		varP,
+		esP: (varP + fit.sigma - fit.xi * u) / (1 - fit.xi)
+	};
+}
+/** 均值超出诊断：E[X − u | X > u] 关于 u 的曲线（GPD 下应为线性，斜率 ξ/(1−ξ)） */
+function meanExcessCurve(samples, quantiles) {
+	const out = [];
+	for (const q of quantiles) {
+		const u = empiricalQuantile(samples, q);
+		const exceed = samples.filter((x) => x > u);
+		if (exceed.length < 3) continue;
+		out.push({
+			u: Number(u.toFixed(3)),
+			meanExcess: Number((exceed.reduce((s, x) => s + (x - u), 0) / exceed.length).toFixed(3)),
+			count: exceed.length
+		});
+	}
+	return out;
+}
+const DEFAULT_TAIL_RISK_CONFIG = {
+	thresholdQuantile: .9,
+	minExceedances: 20,
+	maxSamples: 2048,
+	bootstrap: 200,
+	seed: 20260920
+};
+/**
+* 尾部风险监视器：延迟/成本样本的环形流 → POT/GPD 拟合 → p99/p99.9/ES。
+*
+* 与经验分位数的本质区别：p99.9 不是「样本最大值」（运气）而是定理背书
+* 的尾部外推，且带 bootstrap 置信区间。样本不足或拟合失败时 fit()
+* 返回 undefined（诚实拒绝，不输出编造的尾部）。
+*/
+var TailRiskMonitor = class {
+	config;
+	buffer = [];
+	constructor(config) {
+		this.config = {
+			...DEFAULT_TAIL_RISK_CONFIG,
+			...config
+		};
+	}
+	observe(x) {
+		if (!Number.isFinite(x)) return;
+		this.buffer.push(x);
+		if (this.buffer.length > this.config.maxSamples) this.buffer.splice(0, this.buffer.length - this.config.maxSamples);
+	}
+	get size() {
+		return this.buffer.length;
+	}
+	/** 拟合（幂等；失败/数据不足 → undefined） */
+	fit() {
+		const n = this.buffer.length;
+		const u = empiricalQuantile(this.buffer, this.config.thresholdQuantile);
+		const ys = this.buffer.filter((x) => x > u).map((x) => x - u);
+		if (ys.length < this.config.minExceedances) return void 0;
+		const gpd = fitGpd(ys);
+		if (!gpd) return void 0;
+		const q99 = potQuantiles(gpd, n, ys.length, u, .99);
+		const q999 = potQuantiles(gpd, n, ys.length, u, .999);
+		if (!q99 || !q999) return void 0;
+		const report = {
+			samples: n,
+			threshold: Number(u.toFixed(3)),
+			exceedances: ys.length,
+			gpd,
+			p99: q99.varP,
+			p999: q999.varP,
+			es99: q99.esP,
+			hill: gpd.xi > .05 ? hillEstimator(this.buffer) : void 0
+		};
+		if (this.config.bootstrap > 0) {
+			const rng = mulberry32(this.config.seed);
+			const estimates = [];
+			for (let b = 0; b < this.config.bootstrap; b += 1) {
+				const resample = [];
+				for (let i = 0; i < ys.length; i += 1) resample.push(ys[Math.floor(rng() * ys.length)]);
+				const bf = fitGpd(resample);
+				if (!bf) continue;
+				const bq = potQuantiles(bf, n, ys.length, u, .999);
+				if (bq) estimates.push(bq.varP);
+			}
+			if (estimates.length >= 50) {
+				estimates.sort((a, b) => a - b);
+				report.p999Ci = {
+					lower: estimates[Math.floor(estimates.length * .05)],
+					upper: estimates[Math.floor(estimates.length * .95)]
+				};
+			}
+		}
+		return report;
+	}
+	/** 原始样本副本（消费方自取；26.0 GP / 23.0 稳健统计可复用同一流） */
+	toSamples() {
+		return [...this.buffer];
+	}
+};
+//#endregion
 //#region src/symbiosis/ledger.ts
 /**
 * ledger.ts — 认知能量账本（共生进化架构第五阶段 1/4）
@@ -21064,7 +22449,327 @@ function renderSankeyHtml(report, opts = {}) {
 </html>`;
 }
 //#endregion
+//#region src/core/submodular.ts
+/**
+* 30.0 次模优化内核 —— 加权覆盖 + 惰性贪心 (CELF) + 曲率修正保证
+*
+* 动机: 「探索预算分给谁」是组合选择：好奇心引擎按新颖度 top-k 挑盲区，
+* 但 top-k 是**模函数**口径——相关知识（共享主题的盲区）被重复购买,
+* 预算在冗余上浪费。覆盖价值天然**次模**（边际收益递减）：
+*
+*   f(A ∪ {x}) − f(A) ≥ f(B ∪ {x}) − f(B),  ∀A ⊆ B, x ∉ B
+*   （同一主题第二次被覆盖的边际严格更小）
+*
+*   加权覆盖函数（本内核的具体化）:
+*     f(S) = Σ_theme W_t · (1 − Π_{i∈S∩t}(1 − c_{i,t}))
+*     W_t = 主题权重（新颖度质量），c_{i,t} = 项 i 覆盖主题 t 的强度
+*
+*   Nemhauser–Wolsey–Fisher (1978): 单调次模 + 基数约束 k，
+*     贪心 ≥ (1 − 1/e)·OPT ≈ 0.632·OPT——多项式时间可证的近似比；
+*     惰性贪心（CELF, Leskovec 2007）与朴素贪心**逐位同解**，评估次数
+*     数量级下降（上一轮选中的项使其余边际只降不升——次模性的红利）。
+*
+*   曲率修正 (Conforti–Cornuéjols): 曲率 c = 1 − min_i min_X 边际(X,i)/f({i}),
+*     贪心保证收紧为 ≥ (1 − e^{−c})/c·OPT ∈ [0.632, 1]·OPT——
+*     c 从数据里算出来，不是拍脑袋。
+*
+*   预算约束（每项有成本）: 边际贪心 / 边际密度贪心取优——
+*     ≥ ½(1 − 1/e)·OPT（Khuller–Moss–Naor）。
+*
+* 零漂移: 未挂载时一切路径与升级前逐位一致。
+*/
+/** 确定性 PRNG（mulberry32） */
+function mulberry32$1(seed) {
+	let a = seed >>> 0;
+	return () => {
+		a |= 0;
+		a = a + 1831565813 | 0;
+		let t = Math.imul(a ^ a >>> 15, 1 | a);
+		t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+}
+/**
+* 加权覆盖函数：f(S) = Σ_t W_t·(1 − Π_{i∈S∩t}(1 − c_{i,t}))。
+*
+* 每个主题是概率覆盖集——单调、次模（且归一化时 f(全集) = ΣW_t）。
+*/
+var WeightedCoverage = class {
+	groundSize;
+	themes = [];
+	/** item → theme 下标列表（边际查询加速） */
+	itemThemes;
+	constructor(groundSize) {
+		this.groundSize = groundSize;
+		this.itemThemes = Array.from({ length: groundSize }, () => []);
+	}
+	/** 登记一个覆盖主题：weight 权重，items 覆盖项 → 强度 c ∈ (0,1] */
+	addTheme(weight, covers) {
+		if (!(weight > 0)) return;
+		const theme = {
+			weight,
+			covers: new Map(covers)
+		};
+		const idx = this.themes.length;
+		for (const item of covers.keys()) if (item >= 0 && item < this.groundSize) this.itemThemes[item].push(idx);
+		this.themes.push(theme);
+	}
+	value(selected) {
+		let acc = 0;
+		for (const theme of this.themes) {
+			let uncovered = 1;
+			for (const [item, c] of theme.covers) if (selected.has(item)) uncovered *= 1 - c;
+			acc += theme.weight * (1 - uncovered);
+		}
+		return acc;
+	}
+	marginal(item, selected) {
+		let gain = 0;
+		for (const t of this.itemThemes[item] ?? []) {
+			const theme = this.themes[t];
+			let uncovered = 1;
+			for (const [j, c] of theme.covers) if (j !== item && selected.has(j)) uncovered *= 1 - c;
+			gain += theme.weight * (1 - uncovered * (1 - (theme.covers.get(item) ?? 0))) - theme.weight * (1 - uncovered);
+		}
+		return gain;
+	}
+	get themeCount() {
+		return this.themes.length;
+	}
+};
+/**
+* 从 token 集合构造覆盖函数（30.0 接线辅助）。
+*
+* 主题 = 每个知识项自身的质量 w_i（被覆盖 = 该盲区的知识被获得）；
+* 项 j 对主题 i 的覆盖强度：自身 1；共享 token 的近邻 coverageStrength。
+*
+*   f({i}) = w_i；f({i, j≈i}) = w_i + w_j·(1−c)  —— 冗余第二选的
+*   边际从 w_j 衰减到 (1−c)·w_j（它 70% 的知识已经被第一个选中者
+*   「顺带学会」）；互补项边际完整保留 w_k。这是加权覆盖在
+* 「知识覆盖」语义下的正确形态（token 做主题会让独占 token 的项
+* 价值归零——语义错误）。
+*/
+function coverageFromTokens(items, coverageStrength = .7) {
+	const n = items.length;
+	const cov = new WeightedCoverage(n);
+	const tokenSets = items.map((item) => new Set(item.tokens.filter((t) => t.length >= 2)));
+	for (let i = 0; i < n; i += 1) {
+		const covers = /* @__PURE__ */ new Map();
+		covers.set(i, 1);
+		for (let j = 0; j < n; j += 1) {
+			if (j === i) continue;
+			if ([...tokenSets[i]].some((t) => tokenSets[j].has(t))) covers.set(j, coverageStrength);
+		}
+		cov.addTheme(Math.max(1e-9, items[i].weight), covers);
+	}
+	return cov;
+}
+/**
+* 惰性贪心（CELF）：单调次模 + 基数约束 k → ≥ (1−1/e)·OPT。
+* 与朴素贪心逐位同解（次模性保证队列顶端的陈旧边际只降不升）。
+*/
+function lazyGreedy(f, k) {
+	const cap = Math.max(0, Math.min(k, f.groundSize));
+	const selected = /* @__PURE__ */ new Set();
+	const values = [];
+	const gains = [];
+	let evaluations = 0;
+	const queue = [];
+	for (let i = 0; i < f.groundSize; i += 1) {
+		evaluations += 1;
+		queue.push({
+			key: f.marginal(i, selected),
+			item: i
+		});
+	}
+	while (selected.size < cap && queue.length > 0) {
+		let topIdx = 0;
+		for (let i = 1; i < queue.length; i += 1) if (queue[i].key > queue[topIdx].key) topIdx = i;
+		const top = queue[topIdx];
+		evaluations += 1;
+		const fresh = f.marginal(top.item, selected);
+		if (fresh <= 1e-12) {
+			queue.splice(topIdx, 1);
+			continue;
+		}
+		let secondKey = 0;
+		for (let i = 0; i < queue.length; i += 1) if (i !== topIdx && queue[i].key > secondKey) secondKey = queue[i].key;
+		if (fresh >= secondKey - 1e-12) {
+			queue.splice(topIdx, 1);
+			selected.add(top.item);
+			const prev = values.length > 0 ? values[values.length - 1] : 0;
+			values.push(prev + fresh);
+			gains.push(fresh);
+		} else top.key = fresh;
+	}
+	return {
+		selected: [...selected],
+		values,
+		gains,
+		evaluations
+	};
+}
+/**
+* 预算约束贪心（每项成本不同）：边际贪心与边际密度贪心各跑一遍取优，
+* 保证 ≥ ½(1−1/e)·OPT（Khuller–Moss–Naor 之「取优」加强）。
+*/
+function budgetedGreedy(f, costs, budget) {
+	const runBy = (keyOf) => {
+		let remaining = budget;
+		const selected = /* @__PURE__ */ new Set();
+		const values = [];
+		const gains = [];
+		let evaluations = 0;
+		for (;;) {
+			let bestItem = -1;
+			let bestKey = 0;
+			let bestGain = 0;
+			for (let i = 0; i < f.groundSize; i += 1) {
+				if (selected.has(i)) continue;
+				if (costs[i] > remaining) continue;
+				evaluations += 1;
+				const gain = f.marginal(i, selected);
+				const key = keyOf(i, gain);
+				if (key > bestKey && gain > 1e-12) {
+					bestKey = key;
+					bestItem = i;
+					bestGain = gain;
+				}
+			}
+			if (bestItem < 0) break;
+			selected.add(bestItem);
+			remaining -= costs[bestItem];
+			const prev = values.length > 0 ? values[values.length - 1] : 0;
+			values.push(prev + bestGain);
+			gains.push(bestGain);
+		}
+		return {
+			selected: [...selected],
+			values,
+			gains,
+			evaluations
+		};
+	};
+	const byMarginal = runBy((_i, gain) => gain);
+	const byDensity = runBy((i, gain) => gain / Math.max(1e-9, costs[i]));
+	const totalOf = (r) => r.values.length > 0 ? r.values[r.values.length - 1] : 0;
+	return totalOf(byDensity) > totalOf(byMarginal) ? {
+		...byDensity,
+		variant: "density"
+	} : {
+		...byMarginal,
+		variant: "marginal"
+	};
+}
+/** 穷举最优（验证锚点；C(n,k) 组合枚举，n ≤ ~14 适用） */
+function bruteForceBest(f, k) {
+	const n = f.groundSize;
+	const cap = Math.min(k, n);
+	let best = [];
+	let bestValue = 0;
+	const combo = [];
+	const empty = /* @__PURE__ */ new Set();
+	const rec = (start) => {
+		if (combo.length === cap) {
+			const v = f.value(new Set(combo));
+			if (v > bestValue) {
+				bestValue = v;
+				best = [...combo];
+			}
+			return;
+		}
+		for (let i = start; i < n; i += 1) {
+			combo.push(i);
+			rec(i + 1);
+			combo.pop();
+		}
+	};
+	rec(0);
+	if (bestValue === 0) f.value(empty);
+	return {
+		selected: best,
+		value: bestValue
+	};
+}
+/** 随机次模性审计：A ⊆ B、x ∉ B，检验 f(A∪x)−f(A) ≥ f(B∪x)−f(B) */
+function submodularityCheck(f, trials = 300, seed = 20260920) {
+	const rng = mulberry32$1(seed);
+	let violations = 0;
+	let maxViolation = 0;
+	const randSet = (mask) => new Set(mask);
+	for (let t = 0; t < trials; t += 1) {
+		const ground = Array.from({ length: f.groundSize }, (_, i) => i);
+		ground.filter(() => rng() > .5).concat(ground.filter(() => rng() <= .5));
+		const bSize = 1 + Math.floor(rng() * f.groundSize);
+		const rest = [...ground];
+		const B = [];
+		for (let i = 0; i < bSize && rest.length > 0; i += 1) B.push(rest.splice(Math.floor(rng() * rest.length), 1)[0]);
+		const A = B.filter(() => rng() < .6);
+		const candidates = ground.filter((i) => !B.includes(i));
+		if (candidates.length === 0) continue;
+		const x = candidates[Math.floor(rng() * candidates.length)];
+		const setA = randSet(A);
+		const setB = randSet(B);
+		const violation = f.marginal(x, setA) - f.marginal(x, setB);
+		if (violation < -1e-9) {
+			violations += 1;
+			maxViolation = Math.max(maxViolation, -violation);
+		}
+	}
+	return {
+		trials,
+		violations,
+		maxViolation
+	};
+}
+/**
+* 曲率估计（Conforti–Cornuéjols）：c = 1 − min 边际(X,i)/f({i})，
+* X 取随机子集采样（精确最小是指数级，采样给出 c 的上界估计——
+* 保守口径：真实曲率 ≤ 估计值，保证因子按估计值陈述仍然成立的方向）。
+*/
+function curvatureEstimate(f, samples = 200, seed = 20260921) {
+	const rng = mulberry32$1(seed);
+	let minRatio = 1;
+	const fSingle = (i) => f.marginal(i, /* @__PURE__ */ new Set());
+	for (let s = 0; s < samples; s += 1) {
+		const X = /* @__PURE__ */ new Set();
+		for (let i = 0; i < f.groundSize; i += 1) if (rng() < .5) X.add(i);
+		const x = Math.floor(rng() * f.groundSize);
+		X.delete(x);
+		const base = fSingle(x);
+		if (base <= 1e-12) continue;
+		const ratio = Math.max(0, f.marginal(x, X) / base);
+		if (ratio < minRatio) minRatio = ratio;
+	}
+	const c = Math.min(1, Math.max(0, 1 - minRatio));
+	return {
+		curvature: c,
+		guaranteeFactor: c < 1e-9 ? 1 : (1 - Math.exp(-c)) / c,
+		samples
+	};
+}
+//#endregion
 //#region src/curiosity-engine.ts
+/**
+* curiosity-engine.ts — 好奇心引擎（自主智能"内在动机"支柱）
+*
+* 职责：让系统不满足于"完成被指派的任务"，而是主动发现自身的知识盲区，
+* 生成探索性任务去填补盲区——这是从"工具"到"自主智能体"的关键跃迁。
+*
+* 能力矩阵：
+* 1. 知识盲区扫描：对比"系统接触过的任务类型"与"记忆中有成功经验的类型"，
+*    识别接触多但经验少（高失败/低质量）的类型，以及从未探索过的类型
+* 2. 新颖度排序：对候选探索目标按"信息增益"打分——
+*    未知程度（无经验）+ 潜在价值（接触频率）+ 探索稀缺度（历史探索次数）
+* 3. 探索预算：限制探索任务占比，防止好奇心失控挤占核心任务资源，
+*    预算随系统健康度动态调节（健康时多探索，退化时收敛）
+* 4. 探索回写：探索任务完成后记录收获（是否填补了盲区），
+*    驱动好奇心模型更新，形成"探索 → 学习 → 新盲区"的循环
+*
+* 设计要点：
+* - 好奇心产出的探索目标经 goalEngine 注入哨兵执行，与自主闭环无缝衔接
+* - 探索预算与健康度联动，保证探索行为始终在安全边界内
+*/
 /** 默认配置 */
 const DEFAULT_CURIOSITY_CONFIG = {
 	explorationBudgetRatio: .3,
@@ -21080,7 +22785,7 @@ const DEFAULT_CURIOSITY_CONFIG = {
 * 被 index.ts 持有：心跳循环在派发子任务前调用 proposeExplorations()
 * 获取探索建议（受预算约束），探索完成后经 recordExploration() 回写收获。
 */
-var CuriosityEngine = class {
+var CuriosityEngine = class CuriosityEngine {
 	config;
 	provider;
 	explorations = [];
@@ -21219,16 +22924,62 @@ var CuriosityEngine = class {
 		return gaps.sort((a, b) => b.noveltyScore - a.noveltyScore);
 	}
 	/**
+	* 30.0：挂载次模选择器（幂等）。
+	*
+	* top-k 按新颖度选盲区是模函数口径——共享主题的盲区（'generate-code' /
+	* 'review-code' 同含 code）被重复购买。挂载后探索预算按加权覆盖次模
+	* 函数惰性贪心分配（CELF，≥ (1−1/e)·OPT）：同主题第二个候选的边际
+	* 自动衰减，预算优先流向互补的知识结构。未挂载即零漂移（原 top-k）。
+	*/
+	attachSubmodularSelector(options) {
+		this.submodularSelector = { coverageStrength: options?.coverageStrength ?? .7 };
+	}
+	submodularSelector;
+	/** 30.0：任务类型 → token 集（主题 = 共享 token；camelCase 与连字符统一拆分） */
+	static tokenize(taskType) {
+		return taskType.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 2);
+	}
+	/**
 	* 生成探索建议（受预算约束）
 	* @param dispatchSlots 本轮心跳的总派发槽位数
 	* @param healthScore 系统健康度 0~1（健康时多探索）
 	* @returns 探索任务建议列表
+	*
+	* 30.0：挂载次模选择器后，预算内选择从「新颖度 top-k」升级为
+	* 加权覆盖惰性贪心——共享主题的盲区边际自动衰减（CELF 保证
+	* ≥ (1−1/e)·OPT）；主题来自任务类型 token 集。候选不足预算时
+	* 两者结果一致（全部选中）。
 	*/
 	proposeExplorations(dispatchSlots, healthScore = 1) {
 		const healthFactor = Math.max(.2, Math.min(1, healthScore));
 		const budget = Math.floor(dispatchSlots * this.config.explorationBudgetRatio * healthFactor);
 		if (budget <= 0) return [];
 		const gaps = this.scanKnowledgeGaps();
+		if (gaps.length <= budget) return gaps.map((gap) => ({
+			taskType: gap.taskType,
+			description: this.describeExploration(gap),
+			noveltyScore: gap.noveltyScore,
+			expectedGain: this.describeGain(gap)
+		}));
+		if (this.submodularSelector) {
+			const order = lazyGreedy(coverageFromTokens(gaps.map((gap) => ({
+				tokens: CuriosityEngine.tokenize(gap.taskType),
+				weight: Math.max(1e-6, gap.noveltyScore)
+			})), this.submodularSelector.coverageStrength), budget);
+			const byType = new Map(gaps.map((gap) => [gap.taskType, gap]));
+			const proposals = [];
+			for (const idx of order.selected) {
+				const gap = byType.get(gaps[idx].taskType);
+				if (!gap) continue;
+				proposals.push({
+					taskType: gap.taskType,
+					description: this.describeExploration(gap),
+					noveltyScore: gap.noveltyScore,
+					expectedGain: this.describeGain(gap)
+				});
+			}
+			if (proposals.length > 0) return proposals.slice(0, budget);
+		}
 		const proposals = [];
 		for (const gap of gaps) {
 			if (proposals.length >= budget) break;
@@ -25193,6 +26944,41 @@ function apply(ctx, config) {
 		horizon: cfg.autonomy.optimalStopping.horizon,
 		minSamples: cfg.autonomy.optimalStopping.minSamples
 	});
+	if (cfg.autonomy?.gaussianProcess?.enabled === true) {
+		worldModel.attachGpCalibrator({
+			maxPoints: cfg.autonomy.gaussianProcess.maxPoints,
+			sigmaN: cfg.autonomy.gaussianProcess.sigmaN,
+			minPoints: cfg.autonomy.gaussianProcess.minPoints
+		});
+		logger.info("26.0 高斯过程内核已挂载：预测校准 GP 修正（maxPoints=%s, minPoints=%s）", cfg.autonomy.gaussianProcess.maxPoints ?? 48, cfg.autonomy.gaussianProcess.minPoints ?? 6);
+	}
+	if (cfg.autonomy?.kalmanFilter?.enabled === true) {
+		metaCognition.attachKalmanAnomaly({
+			qLevel: cfg.autonomy.kalmanFilter.qLevel,
+			qSlope: cfg.autonomy.kalmanFilter.qSlope,
+			r: cfg.autonomy.kalmanFilter.r,
+			gateP: cfg.autonomy.kalmanFilter.gateP,
+			kpis: cfg.autonomy.kalmanFilter.kpis
+		});
+		logger.info("27.0 卡尔曼滤波内核已挂载：KPI 新息门控（gateP=%s, 覆盖 %s）", cfg.autonomy.kalmanFilter.gateP ?? .997, (cfg.autonomy.kalmanFilter.kpis ?? [
+			"successRate",
+			"avgQuality",
+			"avgLatency",
+			"cacheHitRate"
+		]).join("/"));
+	}
+	if (cfg.autonomy?.mcts?.enabled === true) {
+		optimizer.attachMctsSearch({
+			iterations: cfg.autonomy.mcts.iterations,
+			explorationC: cfg.autonomy.mcts.explorationC,
+			discount: cfg.autonomy.mcts.discount
+		});
+		logger.info("29.0 MCTS 内核已挂载：深思推荐切换 UCT（iterations=%s, explorationC=%s）", cfg.autonomy.mcts.iterations ?? 600, cfg.autonomy.mcts.explorationC ?? Math.SQRT2);
+	}
+	if (cfg.autonomy?.submodular?.enabled === true) {
+		curiosity.attachSubmodularSelector({ coverageStrength: cfg.autonomy.submodular.coverageStrength });
+		logger.info("30.0 次模内核已挂载：探索预算加权覆盖贪心（coverageStrength=%s）", cfg.autonomy.submodular.coverageStrength ?? .7);
+	}
 	/** KPI 采集器：从真实引擎状态聚合 KPI 快照 */
 	const collectKpi = () => {
 		const modelStatuses = llm.getModelStatuses();
@@ -25422,6 +27208,47 @@ function apply(ctx, config) {
 		}];
 	};
 	if (capacityPlanner) logger.info("25.0 容量规划内核已启用：心跳 2.5 段反解最小并发（targetWaitMs=%s, defaultScv=%s）", cfg.autonomy?.capacityPlanning?.targetWaitMs ?? 5e3, cfg.autonomy?.capacityPlanning?.defaultScv ?? 2);
+	const tailRiskEnabled = cfg.autonomy?.extremeValue?.enabled === true;
+	const tailRiskTargetMs = cfg.autonomy?.extremeValue?.targetP99Ms ?? 3e4;
+	const tailRiskMinSamples = cfg.autonomy?.extremeValue?.minSamples ?? 60;
+	const tailRiskMonitors = /* @__PURE__ */ new Map();
+	/** 最近一次尾部风险评估产物（introspect 审计口径） */
+	let lastTailRisk;
+	const runTailRiskAssessment = () => {
+		if (!tailRiskEnabled) return [];
+		const insights = [];
+		for (const status of llm.getModelStatuses()) {
+			const samples = llm.getLatencySamples(status.id);
+			if (!samples || samples.length < tailRiskMinSamples) continue;
+			let monitor = tailRiskMonitors.get(status.id);
+			if (!monitor) {
+				monitor = new TailRiskMonitor({
+					thresholdQuantile: cfg.autonomy?.extremeValue?.thresholdQuantile,
+					bootstrap: cfg.autonomy?.extremeValue?.bootstrap
+				});
+				tailRiskMonitors.set(status.id, monitor);
+			}
+			for (const s of samples) monitor.observe(s);
+			const report = monitor.fit();
+			if (!report) continue;
+			if (report.p99 <= tailRiskTargetMs) continue;
+			lastTailRisk = {
+				...report,
+				modelId: status.id
+			};
+			const ci = report.p999Ci ? `，p99.9 外推 ${Math.round(report.p999)}ms（90% CI ${Math.round(report.p999Ci.lower)}–${Math.round(report.p999Ci.upper)}）` : `，p99.9 外推 ${Math.round(report.p999)}ms`;
+			insights.push({
+				source: "meta-cognition",
+				category: "tail-risk",
+				taskType: void 0,
+				severity: Math.min(.9, .5 + .4 * Math.min(1, report.p99 / tailRiskTargetMs - 1)),
+				message: `尾部风险：模型 ${status.id} 延迟 p99 外推 ${Math.round(report.p99)}ms 超出目标 ${tailRiskTargetMs}ms（GPD ξ=${report.gpd.xi.toFixed(3)}，σ=${Math.round(report.gpd.sigma)}ms，${report.exceedances} 超出量${ci}）——经验最大值只是运气，定理外推才是尾部`,
+				suggestion: report.gpd.xi > .5 ? "重尾确认（ξ>0.5）：极端延迟无界，为该模型设独立超时与并发上限，路由侧按 22.0 影子价格降载，必要时熔断切流" : "尾部超限：收紧该模型超时预算或降低其高成本任务占比，观察 27.0 滤波层对延迟水平的后续裁决"
+			});
+		}
+		return insights;
+	};
+	if (tailRiskEnabled) logger.info("28.0 极值理论内核已启用：心跳 2.7 段 POT/GPD 尾部外推（targetP99Ms=%s, minSamples=%s）", tailRiskTargetMs, tailRiskMinSamples);
 	const autonomyLoop = new AutonomyLoop({
 		config: {
 			...cfg.autonomy?.loop,
@@ -25457,6 +27284,7 @@ function apply(ctx, config) {
 		governor,
 		dispatchExploration,
 		capacityAdvisor: capacityPlanner ? runCapacityPlanning : void 0,
+		tailRiskAdvisor: tailRiskEnabled ? runTailRiskAssessment : void 0,
 		policyEvolution: policyEvolutionEnabled && !futarchyEnabled ? { runEvolutionCycle: runPolicyEvolutionCycle } : void 0,
 		metaCognitionBridge: metaLayerEnabled ? { runMetaCycle: async () => {
 			const adjustment = await metaController.evaluateAndAdjust();
@@ -26676,7 +28504,20 @@ function apply(ctx, config) {
 						...kernelDiagnostics.indexScheduling ? { indexScheduling: kernelDiagnostics.indexScheduling } : {},
 						...kernelDiagnostics.lastBwK ? { banditKnapsack: kernelDiagnostics.lastBwK } : {},
 						...privacyAccountant ? { privacy: privacyAccountant.status() } : {},
-						...lastCapacityPlan ? { capacity: lastCapacityPlan } : {}
+						...lastCapacityPlan ? { capacity: lastCapacityPlan } : {},
+						...lastTailRisk ? { tailRisk: {
+							modelId: lastTailRisk.modelId,
+							p99: Math.round(lastTailRisk.p99),
+							p999: Math.round(lastTailRisk.p999),
+							xi: Number(lastTailRisk.gpd.xi.toFixed(3)),
+							sigma: Math.round(lastTailRisk.gpd.sigma),
+							exceedances: lastTailRisk.exceedances,
+							samples: lastTailRisk.samples,
+							p999Ci: lastTailRisk.p999Ci ? {
+								lower: Math.round(lastTailRisk.p999Ci.lower),
+								upper: Math.round(lastTailRisk.p999Ci.upper)
+							} : void 0
+						} } : {}
 					};
 				}
 				default: throw new ToolError(`未知 action: ${args.action}`);
@@ -26889,4 +28730,4 @@ Object.defineProperty(pluginEntry, "name", { value: name });
 pluginEntry.Config = Config;
 pluginEntry.provide = ["scheduler", "schedulerTools"];
 //#endregion
-export { AbstractionEngine, AgentBase, AliasMap, AnytimeEvidenceRegistry, AnytimeEvidenceStream, AppError, AutonomyLoop, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, BeliefMarket, BenchmarkEngine, BwKRouter, CHANNEL_GROUPS, CapacityPlanner, CausalKernel, CellularSheaf, CircuitBreaker, CircuitBreakerRegistry, CognitiveMarket, Config, ConfigError, ConformalIntervalEngine, CoverageDriftMonitor, CryptoEngine, CryptoError, CuriosityEngine, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, DecisionEngine, DeliberationEngine, DistributedSync, EProcess, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EnergyLedger, EvolverAgent, ExecutionError, FisherGeometryEngine, FreeEnergyEngine, GittinsIndexTable, GoalEngine, HotReloadEngine, INCINERATOR, IndexScheduler, JsonMemoryBackend, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMError, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, MapElitesArchive, MemoryAgent, MemoryError, MemoryGraph, MetaCognitionEngine, MetaCognitiveController, MigrationTool, ModelAgent, ModelScheduler, NetworkError, OpportunityStopper, Optimizer, OptimizerAgent, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PolicyEvolver, PolicySimulator, PrivacyAccountant, ProgressBroadcaster, RDP_ORDER, RaftEngine, RationalMetareasoner, ReflectionEngine, Reflector, RobustStream, RuntimeVerifier, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafetyGovernor, SafetyMonitor, Sandbox, ScientistMind, SelfModel, Sentinel, ShapleyAttributionEngine, SqliteMemoryBackend, StrategyEvolutionEngine, SymbiosisBridge, SymbiosisRuntime, TREASURY, TaskExecutor, TenantManager, TheoristEngine, TimeoutError, ToolError, ToolRegistry, TransportDriftMonitor, WorldModel, abortableSleep, apply, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, brussOddsIndex, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, catoniMean, cholesky, classifyError, coalitionValue, computeHomeostasis, conditionNumber, conformalQuantile, cosineSimilarity, createBaselinePolicy, createMemoryBackend, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, dpHistogram, dpMeanClamped, dpValue, eBenjaminiHochberg, emptyMemoryStore, erlangC, evaluateMemoryCondition, evidenceRankScore, extractReplayTasks, fixedSampleUpperBound, gaussianNoise, generateAdversarialTasks, initEvidence, isTradeListener, kingmanWq, laplaceNoise, lessonsToInsights, listingsOf, littleCheck, lnGamma, madSigma, matchesMemoryConditions, medianOfMeans, modelAgentId, modelSignalKey, name, normalizePolicyParams, observeEvidence, overlapSheaf, parseJSONLoose, participationRatio, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, prophetValue, quantileSorted, rdpToEpsilon, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, shrinkageCovariance, sinkhorn, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, toSparseVector, tokenizeChinese, wasserstein1D, wassersteinBarycenter1D, wilsonLowerBound };
+export { AbstractionEngine, AgentBase, AliasMap, AnytimeEvidenceRegistry, AnytimeEvidenceStream, AppError, AutonomyLoop, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, BayesianOptimizer, BeliefMarket, BenchmarkEngine, BwKRouter, CHANNEL_GROUPS, CapacityPlanner, CausalKernel, CellularSheaf, CircuitBreaker, CircuitBreakerRegistry, CognitiveMarket, Config, ConfigError, ConformalIntervalEngine, CoverageDriftMonitor, CryptoEngine, CryptoError, CuriosityEngine, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_GP_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_TAIL_RISK_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_TREND_FILTER_CONFIG, DEFAULT_UCT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, DecisionEngine, DeliberationEngine, DistributedSync, EProcess, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EnergyLedger, EvolverAgent, ExecutionError, FisherGeometryEngine, FreeEnergyEngine, GaussianProcess, GittinsIndexTable, GoalEngine, GpSeriesCalibrator, HotReloadEngine, INCINERATOR, IndexScheduler, JsonMemoryBackend, KalmanFilter, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMError, LocalLinearTrendFilter, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, MapElitesArchive, MemoryAgent, MemoryError, MemoryGraph, MetaCognitionEngine, MetaCognitiveController, MigrationTool, ModelAgent, ModelScheduler, NetworkError, OpportunityStopper, Optimizer, OptimizerAgent, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PolicyEvolver, PolicySimulator, PrivacyAccountant, ProgressBroadcaster, RDP_ORDER, RaftEngine, RationalMetareasoner, ReflectionEngine, Reflector, RobustStream, RuntimeVerifier, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafetyGovernor, SafetyMonitor, Sandbox, ScientistMind, SelfModel, Sentinel, ShapleyAttributionEngine, SqliteMemoryBackend, StrategyEvolutionEngine, SymbiosisBridge, SymbiosisRuntime, TREASURY, TailRiskMonitor, TaskExecutor, TenantManager, TheoristEngine, TimeoutError, ToolError, ToolRegistry, TransportDriftMonitor, UctSearch, WeightedCoverage, WorldModel, abortableSleep, apply, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, brussOddsIndex, bruteForceBest, budgetedGreedy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, catoniMean, chiSquareQuantile, cholesky, choleskyLower, classifyError, coalitionValue, computeHomeostasis, conditionNumber, conformalQuantile, cosineSimilarity, coverageFromTokens, createBaselinePolicy, createMemoryBackend, curvatureEstimate, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, dpHistogram, dpMeanClamped, dpValue, eBenjaminiHochberg, empiricalQuantile, emptyMemoryStore, erlangC, evaluateMemoryCondition, evidenceRankScore, expectedImprovement, extractReplayTasks, fitGpd, fixedSampleUpperBound, gaussianNoise, generateAdversarialTasks, gpdCdf, hillEstimator, initEvidence, isTradeListener, kingmanWq, laplaceNoise, lazyGreedy, lessonsToInsights, listingsOf, littleCheck, lnGamma, madSigma, matchesMemoryConditions, meanExcessCurve, medianOfMeans, modelAgentId, modelSignalKey, mulberry32, name, normalCdf, normalPdf, normalizePolicyParams, observeEvidence, overlapSheaf, parseJSONLoose, participationRatio, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, potQuantiles, prophetValue, quantileSorted, randomWalkSteadyState, rdpToEpsilon, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, shrinkageCovariance, sinkhorn, solveCholesky, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, submodularityCheck, toSparseVector, tokenizeChinese, wasserstein1D, wassersteinBarycenter1D, wilsonLowerBound };

@@ -146,6 +146,11 @@ export class RobustStream {
     return this.buffer.length;
   }
 
+  /** 缓冲副本（28.0 EVT 等下游内核的原料通道；不影响内部状态） */
+  toSamples(): number[] {
+    return [...this.buffer];
+  }
+
   read(): RobustRead {
     const n = this.buffer.length;
     const plainMean = n === 0 ? 0 : this.buffer.reduce((s, x) => s + x, 0) / n;

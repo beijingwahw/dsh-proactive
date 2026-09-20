@@ -71,6 +71,7 @@ import { GittinsIndexTable, IndexScheduler } from './core/index-scheduling.js';
 import { BwKRouter } from './core/bandit-knapsack.js';
 import { PrivacyAccountant, perturbNumbers } from './core/differential-privacy.js';
 import { CapacityPlanner, type CapacityPlan } from './core/capacity-planning.js';
+import { TailRiskMonitor, type TailRiskReport } from './core/extreme-value.js';
 import { renderSankeyHtml } from './symbiosis/observability.js';
 import { CuriosityEngine, type ExplorationProposal } from './curiosity-engine.js';
 import { SafetyGovernor } from './safety-governor.js';
@@ -519,6 +520,88 @@ export interface SchedulerConfig {
       enabled: boolean;
       targetWaitMs?: number;
       defaultScv?: number;
+    };
+    /**
+     * 26.0：高斯过程配置（预测校准的非参数贝叶斯升级）。
+     * enabled 时世界模型挂载 GP 序列校准器：每次校准对账的
+     * actual/predicted 比值喂入时间轴 GP，预测期望乘以 GP 后验因子、
+     * 区间按后验标准差拓宽——趋势修正的 1.25/0.75 魔数由从对账结果
+     * 学出的修正接管。校准史不足 minPoints 时因子恒 1（早期零漂移）。
+     * 缺省关闭（零漂移）。
+     */
+    gaussianProcess?: {
+      enabled: boolean;
+      /** 校准点上限（缺省 48） */
+      maxPoints?: number;
+      /** 出修正前的最小校准点数（缺省 6） */
+      minPoints?: number;
+      /** 观测噪声 σn（比值尺度标准化后；缺省 0.15） */
+      sigmaN?: number;
+    };
+    /**
+     * 27.0：卡尔曼滤波配置（KPI 异常判定的假设检验口径）。
+     * enabled 时元认知挂载 KPI 局部线性趋势滤波器：整条历史压进
+     * (level, slope) 充分统计量，突变判定从窗口 z-score 升级为
+     * NIS 门控（新息平方和超出 χ² 分位才报警——99.7% 不该发生的
+     * 才算异常），缓慢漂移由滤波斜率给出早期读数。缺省关闭（零漂移）。
+     */
+    kalmanFilter?: {
+      enabled: boolean;
+      /** 水平过程噪声 q_level（缺省 1e-4） */
+      qLevel?: number;
+      /** 斜率过程噪声 q_slope（缺省 1e-6） */
+      qSlope?: number;
+      /** 观测噪声方差 r（缺省 2e-4） */
+      r?: number;
+      /** NIS 门控上侧概率（缺省 0.997 ≈ 3σ） */
+      gateP?: number;
+      /** 覆盖的 KPI（缺省全部四项） */
+      kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+    };
+    /**
+     * 28.0：极值理论配置（尾部延迟的定理化外推）。
+     * enabled 时心跳 2.7 段对各模型延迟样本拟合 POT/GPD：p99.9 不再
+     * 是「样本最大值」（运气）而是 Pickands–Balkema–de Haan 定理背书的
+     * 尾部外推（含 bootstrap 置信区间），超出目标阈值产出 tail-risk
+     * 洞察。依赖 robustStatistics 启用（延迟样本流与其共用）。缺省关闭。
+     */
+    extremeValue?: {
+      enabled: boolean;
+      /** p99 外推的目标阈值（毫秒；超出产出洞察；缺省 30000） */
+      targetP99Ms?: number;
+      /** 参与拟合的最少延迟样本（缺省 60） */
+      minSamples?: number;
+      /** 超阈值经验分位（缺省 0.9） */
+      thresholdQuantile?: number;
+      /** bootstrap CI 次数（0 关闭；缺省 200） */
+      bootstrap?: number;
+    };
+    /**
+     * 29.0：MCTS 配置（深思搜索的序贯决策升级口径）。
+     * enabled 时 optimizer 深思推荐从 beam search 切换为 UCT：转移边按
+     * Beta 后验采样成败，UCB1 自动平衡利用/探索，迭代预算耗尽即读出
+     * （任意时刻性）；报告口径与 beam search 一致可互查。缺省关闭。
+     */
+    mcts?: {
+      enabled: boolean;
+      /** UCT 迭代预算（缺省 600） */
+      iterations?: number;
+      /** UCB1 探索常数（缺省 √2） */
+      explorationC?: number;
+      /** 每步折扣 γ（缺省 0.95） */
+      discount?: number;
+    };
+    /**
+     * 30.0：次模选择配置（探索预算的组合最优分配）。
+     * enabled 时好奇心探索预算从新颖度 top-k 升级为加权覆盖惰性贪心
+     * （CELF，≥ (1−1/e)·OPT）：共享主题的盲区（如 'generate-code' 与
+     * 'review-code' 同含 code）边际自动衰减，预算优先流向互补知识结构。
+     * 缺省关闭（零漂移——原 top-k）。
+     */
+    submodular?: {
+      enabled: boolean;
+      /** 主题覆盖强度 c ∈ (0,1]（缺省 0.7） */
+      coverageStrength?: number;
     };
     /** 目标分解器注入（测试离线模拟） */
     decomposer?: import('./goal-engine.js').GoalDecomposer;
@@ -1618,6 +1701,76 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
 
   // ── 20.0 层论共识内核：分歧的形状可见（Tool 注册见下方 tool 列表） ──
 
+  // ── 26.0 高斯过程内核：预测校准从魔数到学习修正 ──
+  // 质变基座：趋势修正 1.25/0.75 与时段热度是「拍脑袋的世界观」；
+  // 本内核让「预测系统性偏差多少」从校准对账史里学出来——
+  // actual/predicted 比值序列经 GP 回归给出带不确定度的乘性修正因子，
+  // 有漂移时跟踪、无漂移时收敛到 1。校准史不足时因子恒 1（零漂移）。
+  if (cfg.autonomy?.gaussianProcess?.enabled === true) {
+    worldModel.attachGpCalibrator({
+      maxPoints: cfg.autonomy.gaussianProcess.maxPoints,
+      sigmaN: cfg.autonomy.gaussianProcess.sigmaN,
+      minPoints: cfg.autonomy.gaussianProcess.minPoints,
+    });
+    logger.info(
+      '26.0 高斯过程内核已挂载：预测校准 GP 修正（maxPoints=%s, minPoints=%s）',
+      cfg.autonomy.gaussianProcess.maxPoints ?? 48,
+      cfg.autonomy.gaussianProcess.minPoints ?? 6,
+    );
+  }
+
+  // ── 27.0 卡尔曼滤波内核：KPI 异常判定的假设检验口径 ──
+  // 质变基座：z-score 是窗口内无记忆比较，阈值是经验拍定；本内核把
+  // 整条历史压进 (level, slope) 充分统计量，突变判定 = 新息 NIS 超出
+  // χ²(1) 99.7% 分位（假设检验），缓慢漂移由滤波斜率早期读出。
+  // 缺省关闭（零漂移——原 z-score 路径）。
+  if (cfg.autonomy?.kalmanFilter?.enabled === true) {
+    metaCognition.attachKalmanAnomaly({
+      qLevel: cfg.autonomy.kalmanFilter.qLevel,
+      qSlope: cfg.autonomy.kalmanFilter.qSlope,
+      r: cfg.autonomy.kalmanFilter.r,
+      gateP: cfg.autonomy.kalmanFilter.gateP,
+      kpis: cfg.autonomy.kalmanFilter.kpis,
+    });
+    logger.info(
+      '27.0 卡尔曼滤波内核已挂载：KPI 新息门控（gateP=%s, 覆盖 %s）',
+      cfg.autonomy.kalmanFilter.gateP ?? 0.997,
+      (cfg.autonomy.kalmanFilter.kpis ?? ['successRate', 'avgQuality', 'avgLatency', 'cacheHitRate']).join('/'),
+    );
+  }
+
+  // ── 29.0 MCTS 内核：深思推荐的序贯决策口径 ──
+  // 质变基座：beam search 的宽度是资源上限，搜索预算分配本身不是决策；
+  // UCT 把预算分配变成序贯决策（UCB1 平衡利用/探索），迭代耗尽即读出。
+  // 启用后 optimizer 深思推荐切至 searchMcts（报告口径与 beam 一致）。
+  // 缺省关闭（零漂移——原 beam search）。
+  if (cfg.autonomy?.mcts?.enabled === true) {
+    optimizer.attachMctsSearch({
+      iterations: cfg.autonomy.mcts.iterations,
+      explorationC: cfg.autonomy.mcts.explorationC,
+      discount: cfg.autonomy.mcts.discount,
+    });
+    logger.info(
+      '29.0 MCTS 内核已挂载：深思推荐切换 UCT（iterations=%s, explorationC=%s）',
+      cfg.autonomy.mcts.iterations ?? 600,
+      cfg.autonomy.mcts.explorationC ?? Math.SQRT2,
+    );
+  }
+
+  // ── 30.0 次模内核：探索预算的组合最优分配 ──
+  // 质变基座：新颖度 top-k 是模函数口径（重复购买相关知识）；
+  // 加权覆盖惰性贪心（CELF）给预算分配第一个近似比保证（≥ (1−1/e)·OPT），
+  // 同主题盲区边际自动衰减。缺省关闭（零漂移——原 top-k）。
+  if (cfg.autonomy?.submodular?.enabled === true) {
+    curiosity.attachSubmodularSelector({
+      coverageStrength: cfg.autonomy.submodular.coverageStrength,
+    });
+    logger.info(
+      '30.0 次模内核已挂载：探索预算加权覆盖贪心（coverageStrength=%s）',
+      cfg.autonomy.submodular.coverageStrength ?? 0.7,
+    );
+  }
+
   /** KPI 采集器：从真实引擎状态聚合 KPI 快照 */
   const collectKpi = () => {
     const modelStatuses = llm.getModelStatuses();
@@ -1887,6 +2040,60 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     );
   }
 
+  // ── 28.0 极值理论内核：心跳 2.7 段的尾部风险评估 ──
+  // 质变基座：p99.9 的经验分位数 = 样本最大值（纯运气）；POT/GPD 给出
+  // Pickands–Balkema–de Haan 定理背书的尾部外推（含 bootstrap CI）。
+  // 各模型延迟样本（与 23.0 稳健估计共用 robustLatency 流，需其启用）
+  // 喂入尾部监视器，p99 外推超出 targetP99Ms 产出 tail-risk 洞察。
+  // 未启用 / 样本不足时 advisor 不产出（自主循环零改动）。
+  const tailRiskEnabled = cfg.autonomy?.extremeValue?.enabled === true;
+  const tailRiskTargetMs = cfg.autonomy?.extremeValue?.targetP99Ms ?? 30_000;
+  const tailRiskMinSamples = cfg.autonomy?.extremeValue?.minSamples ?? 60;
+  const tailRiskMonitors = new Map<string, TailRiskMonitor>();
+  /** 最近一次尾部风险评估产物（introspect 审计口径） */
+  let lastTailRisk: TailRiskReport & { modelId: string } | undefined;
+  const runTailRiskAssessment = (): Insight[] => {
+    if (!tailRiskEnabled) return [];
+    const insights: Insight[] = [];
+    for (const status of llm.getModelStatuses()) {
+      const samples = llm.getLatencySamples(status.id);
+      if (!samples || samples.length < tailRiskMinSamples) continue;
+      let monitor = tailRiskMonitors.get(status.id);
+      if (!monitor) {
+        monitor = new TailRiskMonitor({
+          thresholdQuantile: cfg.autonomy?.extremeValue?.thresholdQuantile,
+          bootstrap: cfg.autonomy?.extremeValue?.bootstrap,
+        });
+        tailRiskMonitors.set(status.id, monitor);
+      }
+      // 样本流重建（监视器自持环形缓冲，按当前快照全量对齐）
+      for (const s of samples) monitor.observe(s);
+      const report = monitor.fit();
+      if (!report) continue;
+      if (report.p99 <= tailRiskTargetMs) continue;
+      lastTailRisk = { ...report, modelId: status.id };
+      const ci = report.p999Ci ? `，p99.9 外推 ${Math.round(report.p999)}ms（90% CI ${Math.round(report.p999Ci.lower)}–${Math.round(report.p999Ci.upper)}）` : `，p99.9 外推 ${Math.round(report.p999)}ms`;
+      insights.push({
+        source: 'meta-cognition',
+        category: 'tail-risk',
+        taskType: undefined,
+        severity: Math.min(0.9, 0.5 + 0.4 * Math.min(1, report.p99 / tailRiskTargetMs - 1)),
+        message: `尾部风险：模型 ${status.id} 延迟 p99 外推 ${Math.round(report.p99)}ms 超出目标 ${tailRiskTargetMs}ms（GPD ξ=${report.gpd.xi.toFixed(3)}，σ=${Math.round(report.gpd.sigma)}ms，${report.exceedances} 超出量${ci}）——经验最大值只是运气，定理外推才是尾部`,
+        suggestion: report.gpd.xi > 0.5
+          ? '重尾确认（ξ>0.5）：极端延迟无界，为该模型设独立超时与并发上限，路由侧按 22.0 影子价格降载，必要时熔断切流'
+          : '尾部超限：收紧该模型超时预算或降低其高成本任务占比，观察 27.0 滤波层对延迟水平的后续裁决',
+      });
+    }
+    return insights;
+  };
+  if (tailRiskEnabled) {
+    logger.info(
+      '28.0 极值理论内核已启用：心跳 2.7 段 POT/GPD 尾部外推（targetP99Ms=%s, minSamples=%s）',
+      tailRiskTargetMs,
+      tailRiskMinSamples,
+    );
+  }
+
   const autonomyLoop = new AutonomyLoop({
     config: {
       ...cfg.autonomy?.loop,
@@ -1918,6 +2125,8 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     dispatchExploration,
     // 25.0 容量规划桥接（心跳 2.5 段：λ̂ × 服务统计 → 反解最小并发 → 扩容洞察）
     capacityAdvisor: capacityPlanner ? runCapacityPlanning : undefined,
+    // 28.0 尾部风险桥接（心跳 2.7 段：延迟样本 → POT/GPD → 尾部外推洞察）
+    tailRiskAdvisor: tailRiskEnabled ? runTailRiskAssessment : undefined,
     // 第三阶段（质级升级）：调度策略进化桥接
     // 每轮周期：① 喂数金丝雀（决策反馈真实成败/质量 → 自动回滚/晋升）
     // ② 刷新沙盒素材（任务集/校准表/模型快照与操作环同步）→ 触发进化周期
@@ -2934,6 +3143,8 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
             // 24.0/25.0：隐私预算账本快照与最近容量规划产物（未启用/未产出时不出现）
             ...(privacyAccountant ? { privacy: privacyAccountant.status() } : {}),
             ...(lastCapacityPlan ? { capacity: lastCapacityPlan } : {}),
+            // 28.0：最近尾部风险评估产物（未启用/未产出时不出现）
+            ...(lastTailRisk ? { tailRisk: { modelId: lastTailRisk.modelId, p99: Math.round(lastTailRisk.p99), p999: Math.round(lastTailRisk.p999), xi: Number(lastTailRisk.gpd.xi.toFixed(3)), sigma: Math.round(lastTailRisk.gpd.sigma), exceedances: lastTailRisk.exceedances, samples: lastTailRisk.samples, p999Ci: lastTailRisk.p999Ci ? { lower: Math.round(lastTailRisk.p999Ci.lower), upper: Math.round(lastTailRisk.p999Ci.upper) } : undefined } } : {}),
           };
         }
         default:
@@ -3225,6 +3436,16 @@ export * from './core/robust-statistics.js';
 export * from './core/differential-privacy.js';
 // ── 25.0 容量规划内核：Erlang-C/Kingman 反解最小并发 + Little 定律自检 ──
 export * from './core/capacity-planning.js';
+// ── 26.0 高斯过程内核：RBF/Matérn 贝叶斯回归 + 期望改进贝叶斯优化 ──
+export * from './core/gaussian-process.js';
+// ── 27.0 卡尔曼滤波内核：线性高斯滤波 + RTS 平滑 + NIS 门控 ──
+export * from './core/kalman-filter.js';
+// ── 28.0 极值理论内核：POT/GPD 尾部建模 + Hill 估计 + 风险度量 ──
+export * from './core/extreme-value.js';
+// ── 29.0 蒙特卡洛树搜索内核：UCT + 折扣回报 + 任意时刻可读 ──
+export * from './core/mcts.js';
+// ── 30.0 次模优化内核：加权覆盖 + 惰性贪心 CELF + 曲率修正保证 ──
+export * from './core/submodular.js';
 // 4.0 弹性内核：熔断器 / 指数退避 / 错误分型（可靠执行共享组件）
 export {
   CircuitBreaker,

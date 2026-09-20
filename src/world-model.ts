@@ -21,6 +21,7 @@
  * - 全部为纯统计学习，无需 LLM，开销极低，可在每次信号到达时增量更新
  * - 时间序列窗口有界（每类型最多保留 N 个到达时间戳），内存可控
  */
+import { GpSeriesCalibrator, type ConstructorOptionsGpSeries } from './core/gaussian-process.js';
 
 /** 单类型信号的到达统计 */
 export interface ArrivalStats {
@@ -57,6 +58,12 @@ export interface ArrivalPrediction {
    * 区间诚实发散（+∞），而非伪装确定。
    */
   conformal?: { lower: number; upper: number; finite: boolean; qhat: number; calibrationN: number; alpha: number };
+  /**
+   * 26.0：GP 校准修正（attachGpCalibrator 后输出）。factor 为乘性修正
+   * （从校准史的 actual/predicted 比值序列 GP 回归而来，含不确定度）；
+   * expectedCount 已乘 factor，lowerBound/upperBound 已按 std 拓宽。
+   */
+  gp?: { factor: number; std: number; points: number };
 }
 
 /** 预测校准记录 */
@@ -145,9 +152,42 @@ export class WorldModel {
   private causal?: import('./core/causal-kernel.js').CausalKernel;
   /** 13.0：保形校准引擎（可选挂载） */
   private conformalEngine?: import('./core/conformal.js').ConformalIntervalEngine;
+  /** 26.0：每类型 GP 校准器（可选挂载；attachGpCalibrator 后惰性创建） */
+  private gpCalibrators?: Map<string, import('./core/gaussian-process.js').GpSeriesCalibrator>;
 
   constructor(config?: Partial<WorldModelConfig>) {
     this.config = { ...DEFAULT_WORLD_MODEL_CONFIG, ...config };
+  }
+
+  /**
+   * 26.0：挂载 GP 序列校准器开关（幂等）。
+   *
+   * 挂载后每次 settleCalibrations 把 actual/predicted 比值喂入该类型的
+   * GP 时间序列；predictArrivals 的期望乘以 GP 后验均值因子、区间按
+   * 后验标准差拓宽——趋势修正的 1.25/0.75 魔数由「从对账结果学出来的
+   * 修正」接管（校准史充分前 factor 恒 1，早期零漂移）。
+   */
+  attachGpCalibrator(options?: ConstructorOptionsGpSeries): void {
+    this.gpOptions = options;
+    this.gpCalibrators = this.gpCalibrators ?? new Map();
+  }
+
+  private gpOptions?: ConstructorOptionsGpSeries;
+
+  private gpFor(type: string): GpSeriesCalibrator | undefined {
+    if (!this.gpCalibrators) return undefined;
+    let cal = this.gpCalibrators.get(type);
+    if (!cal) {
+      cal = new GpSeriesCalibrator(this.gpOptions);
+      this.gpCalibrators.set(type, cal);
+    }
+    return cal;
+  }
+
+  /** 26.0：GP 校准状态（未挂载返回 undefined） */
+  getGpCalibrationStatus(): Array<{ type: string; points: number }> | undefined {
+    if (!this.gpCalibrators) return undefined;
+    return [...this.gpCalibrators.entries()].map(([type, cal]) => ({ type, points: cal.size }));
   }
 
   /**
@@ -258,33 +298,43 @@ export class WorldModel {
 
       // 时段热度修正：目标时段相对全天均值的权重
       const hourFactor = this.hourFactor(entry, now + horizonMs / 2);
-      const adjusted = expected * hourFactor;
+      const adjustedRaw = expected * hourFactor;
 
-      // 置信区间：基于到达间隔的波动性（泊松近似，std≈sqrt(mean)）
-      const spread = Math.sqrt(Math.max(adjusted, 0.5));
       const confidence = this.calibrationConfidence(type);
 
       // 13.0：保形区间升级——泊松 sqrt(λ) 近似是「假装高斯」；
       // 保形区间给出精确有限样本覆盖保证（≥ 1−α，零分布假设）。
       // 校准不足时 finite=false（诚实发散），回退泊松近似区间。
+      // 26.0：GP 校准修正——期望乘以从校准史学出的比值因子（含不确定度），
+      // 区间按后验标准差拓宽；校准史不足时 factor=1（零漂移）。
+      const gpCorrection = this.gpFor(type)?.predictAt(now);
+      const gpFactor = gpCorrection?.factor ?? 1;
+      const gpStd = gpCorrection?.std ?? 0;
+      const adjusted = adjustedRaw * gpFactor;
+      const gpSpread = gpStd * adjustedRaw;
+      // 置信区间：基于到达间隔的波动性（泊松近似，std≈sqrt(mean)）；
+      // GP 不确定度在区间端点上单独叠加（避免与泊松口径重复计价）
+      const spread = Math.sqrt(Math.max(adjusted, 0.5));
+
       let prediction: ArrivalPrediction;
       if (this.conformalEngine) {
         const interval = this.conformalEngine.interval(adjusted);
         prediction = {
           type,
           expectedCount: Number(adjusted.toFixed(2)),
-          lowerBound: interval.finite ? Number(Math.max(0, interval.lower).toFixed(2)) : Math.max(0, Number((adjusted - spread).toFixed(2))),
-          upperBound: interval.finite ? Number(Math.max(0, interval.upper).toFixed(2)) : Number((adjusted + spread).toFixed(2)),
+          lowerBound: interval.finite ? Number(Math.max(0, interval.lower - gpSpread).toFixed(2)) : Math.max(0, Number((adjusted - spread - gpSpread).toFixed(2))),
+          upperBound: interval.finite ? Number(Math.max(0, interval.upper + gpSpread).toFixed(2)) : Number((adjusted + spread + gpSpread).toFixed(2)),
           confidence,
           trend,
           conformal: {
-            lower: interval.finite ? Number(Math.max(0, interval.lower).toFixed(2)) : Number.POSITIVE_INFINITY,
-            upper: interval.finite ? Number(Math.max(0, interval.upper).toFixed(2)) : Number.POSITIVE_INFINITY,
+            lower: interval.finite ? Number(Math.max(0, interval.lower - gpSpread).toFixed(2)) : Number.POSITIVE_INFINITY,
+            upper: interval.finite ? Number(Math.max(0, interval.upper + gpSpread).toFixed(2)) : Number.POSITIVE_INFINITY,
             finite: interval.finite,
             qhat: interval.qhat,
             calibrationN: interval.calibrationN,
             alpha: interval.alpha,
           },
+          ...(gpCorrection ? { gp: { factor: Number(gpFactor.toFixed(3)), std: Number(gpStd.toFixed(3)), points: gpCorrection.points } } : {}),
         };
         this.pendingPredictions.set(type, {
           predicted: adjusted,
@@ -295,10 +345,11 @@ export class WorldModel {
         prediction = {
           type,
           expectedCount: Number(adjusted.toFixed(2)),
-          lowerBound: Math.max(0, Number((adjusted - spread).toFixed(2))),
-          upperBound: Number((adjusted + spread).toFixed(2)),
+          lowerBound: Math.max(0, Number((adjusted - spread - gpSpread).toFixed(2))),
+          upperBound: Number((adjusted + spread + gpSpread).toFixed(2)),
           confidence,
           trend,
+          ...(gpCorrection ? { gp: { factor: Number(gpFactor.toFixed(3)), std: Number(gpStd.toFixed(3)), points: gpCorrection.points } } : {}),
         };
         this.pendingPredictions.set(type, { predicted: adjusted, windowEnd: now + horizonMs });
       }
@@ -329,6 +380,11 @@ export class WorldModel {
       };
       this.calibrations.push(record);
       settled.push(record);
+      // 26.0：比值入 GP 校准器（actual/predicted 序列 → 预测修正因子）
+      const gp = this.gpFor(type);
+      if (gp && record.predicted > 0) {
+        gp.push(now, Math.max(0.05, Math.min(20, record.actual / record.predicted)));
+      }
       // 13.0：残差入保形校准集 + 覆盖监测（发出过有限区间才对账覆盖）
       if (this.conformalEngine) {
         this.conformalEngine.calibrate(record.error);

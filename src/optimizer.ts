@@ -388,6 +388,21 @@ export class Optimizer implements IOptimizer {
     opts?: { breadth?: number; preference?: number },
   ): DeliberationResult | undefined {
     if (!this.deliberation || candidateActions.length === 0 || stages < 1) return undefined;
+    // 29.0：挂载 MCTS 后深思推荐切换 UCT 口径（报告与 beam 同构可互查）
+    if (this.mctsOptions) {
+      return this.deliberation.searchMcts(
+        `${taskType}#s0`,
+        candidateActions,
+        {
+          iterations: this.mctsOptions.iterations,
+          explorationC: this.mctsOptions.explorationC,
+          discount: this.mctsOptions.discount,
+          topK: opts?.breadth,
+          preference: opts?.preference,
+          advance: ({ step }) => `${taskType}#s${step + 1}`,
+        },
+      );
+    }
     return this.deliberation.search(
       `${taskType}#s0`,
       candidateActions,
@@ -399,6 +414,18 @@ export class Optimizer implements IOptimizer {
         advance: ({ step }) => `${taskType}#s${step + 1}`,
       },
     );
+  }
+
+  /** 29.0 MCTS 搜索参数（attachMctsSearch 后深思推荐走 UCT；undefined = 原 beam search） */
+  private mctsOptions?: { iterations?: number; explorationC?: number; discount?: number };
+
+  /**
+   * 29.0：挂载 UCT 搜索口径（幂等；撤除传 null）。
+   * 深思推荐从 beam search 切换为 MCTS——转移边按 Beta 后验采样成败，
+   * UCB1 平衡利用/探索，迭代预算耗尽即读出（任意时刻性）。
+   */
+  attachMctsSearch(options?: { iterations?: number; explorationC?: number; discount?: number } | null): void {
+    this.mctsOptions = options === null ? undefined : (options ?? {});
   }
 
   /**

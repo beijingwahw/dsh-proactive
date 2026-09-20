@@ -5,7 +5,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-339933?logo=nodedotjs&logoColor=white)](#安装)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-8250df)](https://github.com/topics/dsh-plugin)
 
-> **主动智能（Proactive Intelligence）调度插件** —— DeepSeek Harness（DSH）生态中的多模型协同调度系统：自主感知、自主决策、自主进化，内置**科学家 / 理论家双心智**、**认知能量共生经济**与**十八大质变内核（证据 → 几何与拓扑层，任意时刻有效 / 保形 / 多样性 / 形式安全 / 公平归因 / 最优传输 / 信息几何 / 最优停止 / 层论共识）**。
+> **主动智能（Proactive Intelligence）调度插件** —— DeepSeek Harness（DSH）生态中的多模型协同调度系统：自主感知、自主决策、自主进化，内置**科学家 / 理论家双心智**、**认知能量共生经济**与**二十八质变内核（证据 → 几何拓扑 / 创世 / 先知层：任意时刻有效 / 保形 / 最优传输 / 信息几何 / 层论共识 / Gittins / 稳健统计 / 差分隐私 / 容量规划 / 高斯过程 / 卡尔曼滤波 / 极值理论 / 蒙特卡洛树搜索 / 次模优化）**。
 >
 > [English](./README.en.md) | 中文
 
@@ -31,12 +31,16 @@
 │  操作环：信号→决策→执行→反思 10 步主链路（index.ts）             │
 │  进化环：策略进化器 + 安全沙盒 + 金丝雀部署（policy/）            │
 │  元认知外环：自我建模 → 保守调整 → 观察/回滚（meta/）             │
-├─ 质变内核（core/）3.0 → 20.0 十八大内核 ──────────────────────┤
+├─ 质变内核（core/）3.0 → 30.0 二十八内核 ──────────────────────┤
 │  证据 3.0  弹性 4.0  因果 5.0  自由能 6.0  深思 7.0             │
 │  元推理 8.0  抽象 9.0  科学家 10.0  理论家 11.0                 │
 │  任意时刻证据 12.0  保形预测 13.0  质量-多样性 14.0              │
 │  运行时验证 15.0  Shapley 归因 16.0                             │
 │  最优传输 17.0  信息几何 18.0  最优停止 19.0  层论共识 20.0      │
+│  Gittins 21.0  预算 Knapsack 22.0（创世层）                    │
+│  稳健统计 23.0  差分隐私 24.0  容量规划 25.0（创世层）           │
+│  高斯过程 26.0  卡尔曼滤波 27.0  极值理论 28.0（先知层）         │
+│  蒙特卡洛树搜索 29.0  次模优化 30.0（先知层）                    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,7 +72,19 @@
 - **最优索引调度内核**（[core/index-scheduling.ts](./src/core/index-scheduling.ts)）：Gittins 指数精确计算——**模型调度第一次有了可证明最优的口径**。对每个候选的 Beta 后验求解折扣 bandit 最优索引（退休 MDP 在 (α,β) 三角形上按 n 反向归纳一遍即得全部 V_R，无需不动点迭代；对无差异退休金二分），调度按 ν × availability 排序；学习溢价 = ν − p̂ 随证据积累自动归零（探索自我终结，不再需要手设探索预算），与 UCB 乐观上界启发式的本质区别是最优性有定理背书
 - **预算最优路由内核**（[core/bandit-knapsack.ts](./src/core/bandit-knapsack.ts)）：Bandits with Knapsacks——**预算约束下的最优路由，影子价格内生涌现**。质量走经验伯恩斯坦乐观上界（复用 12.0），可行性按「剩余预算 / 剩余轮数 × (1+slack)」判定，影子价格 λ 从不可行高质臂与选中臂的混合 LP 顶点实时解出（固定 costWeight 只是 λ 的一次性猜测）；无可行臂时选最廉臂止血并标记 urgent（负载卸载，而非假装最优仍存在）
 
-### 质变内核（core/，3.0 → 22.0）
+### 创世层（23.0 → 25.0）
+- **稳健统计内核**（[core/robust-statistics.ts](./src/core/robust-statistics.ts)）：Catoni 估计 + Median-of-Means——**重尾延迟下均值不再被尾部绑架**。仅有限方差假设即得 sub-Gaussian 型置信界（普通均值被 5% 污染 × 1e6 幅度的尾部搬到 50000，Catoni 压回 2.69——四个数量级的抗性）；每模型延迟流随样本量自适应 mean → MoM → Catoni，启用后 `getModelStatuses` 输出 `robustAvgLatencyMs`
+- **差分隐私内核**（[core/differential-privacy.ts](./src/core/differential-privacy.ts)）：Laplace/Gaussian 机制 + Rényi-DP 记账——**遥测不裸暴露个体**。折半分账永不超支（Σε ≤ ε），id/时间戳自动跳过，RDP→(ε,δ) 解析转换；心智报告 / Sankey 能量流启用后数值叶经扰动发布
+- **容量规划内核**（[core/capacity-planning.ts](./src/core/capacity-planning.ts)）：Erlang-C / Kingman 反解——**并发上限第一次从排队论里算出来**。心跳 2.5 段把世界模型预测到达率 × 稳健平均延迟喂入排队论规划器，反解「守住目标等待时间」的最小并发；不可行（ρ≥1）时诚实返回 infeasible 并建议扩容/降载
+
+### 先知层（26.0 → 30.0）
+- **高斯过程内核**（[core/gaussian-process.ts](./src/core/gaussian-process.ts)）：RBF/Matérn 贝叶斯回归 + 期望改进——**预测偏差本身成为可学习的曲线**。世界模型校准史的 actual/predicted 比值序列经 GP 回归给出带不确定度的乘性修正因子（趋势修正的 1.25/0.75 魔数由对账结果接管）；EI 采集函数（解析式与蒙特卡洛对照）支撑离散候选集上的贝叶斯优化
+- **卡尔曼滤波内核**（[core/kalman-filter.ts](./src/core/kalman-filter.ts)）：局部线性趋势滤波 + RTS 平滑 + NIS 门控——**突变判定从启发式升级为假设检验**。KPI 整条历史压进 (level, slope) 充分统计量，新息平方和超出 χ²(1) 99.7% 分位才报警（99.7% 不该发生的才算异常），缓慢漂移由滤波斜率早期读出；随机游走稳态与闭式 P∞=(√(q²+4qr)−q)/2 精确对照
+- **极值理论内核**（[core/extreme-value.ts](./src/core/extreme-value.ts)）：POT/GPD + Hill 估计——**p99.9 不再是「样本最大值」的运气**。Pickands–Balkema–de Haan 定理保证超阈值超出量收敛于 GPD，Grimshaw 剖面似然一维搜索定参，尾部分位数定理化外推（含 bootstrap CI）；心跳 2.7 段对延迟样本评估尾部风险，超出目标产出 tail-risk 洞察
+- **蒙特卡洛树搜索内核**（[core/mcts.ts](./src/core/mcts.ts)）：UCT + 折扣回报——**搜索预算的分配本身成为序贯决策**。转移边按 Beta 后验采样成败，UCB1 平衡利用/探索，节点本地回报回传（无深度偏置），迭代/时间预算耗尽即读出（任意时刻性）；深思引擎 `searchMcts` 与 beam search 同口径互查
+- **次模优化内核**（[core/submodular.ts](./src/core/submodular.ts)）：加权覆盖 + 惰性贪心（CELF）——**探索预算的分配第一次有近似比保证**（≥ (1−1/e)·OPT，Nemhauser–Wolsey–Fisher）。知识项自身为主题、相似项部分覆盖：冗余第二选的边际衰减到 (1−c)·w，互补盲区优先入选；曲率修正把保证收紧到 (1−e^{−c})/c·OPT
+
+### 质变内核（core/，3.0 → 30.0）
 | 内核 | 版本 | 一句话 |
 |------|------|--------|
 | evidence.ts | 3.0 | 统一证据语言：Wilson 界 / 时间衰减 / 证据排序，铺满所有记忆层 |
@@ -91,6 +107,14 @@
 | sheaf-consensus.ts | 20.0 | 层论共识：胞腔层拉普拉斯 + 调和共识 + 障碍检测（见上） |
 | index-scheduling.ts | 21.0 | 最优索引调度：Gittins 指数精确计算（退休 MDP 三角形反向归纳），可证明最优模型调度 |
 | bandit-knapsack.ts | 22.0 | 预算最优路由：Bandits with Knapsacks，影子价格从预算稀缺性内生涌现 |
+| robust-statistics.ts | 23.0 | 稳健统计：Catoni + MoM（重尾下 sub-Gaussian 置信界，见上） |
+| differential-privacy.ts | 24.0 | 差分隐私：Laplace/Gaussian 机制 + RDP 记账（见上） |
+| capacity-planning.ts | 25.0 | 容量规划：Erlang-C / Kingman 反解最小并发 + Little 定律自检（见上） |
+| gaussian-process.ts | 26.0 | 高斯过程：RBF/Matérn 回归 + EI 贝叶斯优化（预测偏差可学习，见上） |
+| kalman-filter.ts | 27.0 | 卡尔曼滤波：局部线性趋势 + RTS 平滑 + NIS 门控（见上） |
+| extreme-value.ts | 28.0 | 极值理论：POT/GPD 尾部外推 + Hill 估计 + 风险度量（见上） |
+| mcts.ts | 29.0 | 蒙特卡洛树搜索：UCT + 折扣回报 + 任意时刻可读（见上） |
+| submodular.ts | 30.0 | 次模优化：加权覆盖 + CELF 惰性贪心 + 曲率修正保证（见上） |
 
 ### 认知能量共生经济（symbiosis/）
 - **能量账本**（ledger.ts）：认知能量不可伪造，复式记账全局守恒，每笔转账 sha256 链式可审计可回放，基尼系数度量生态健康
@@ -127,7 +151,7 @@
 
 1. **元认知观察** —— 采集 KPI，发现异常洞察
 2. **1.5 共生心跳** —— KPI 注入能量经济 + 信念市场
-3. **世界模型预见** —— 预测信号到达，捕捉上升趋势
+3. **世界模型预见** —— 预测信号到达，捕捉上升趋势；2.5 段容量规划（25.0）反解最小并发，2.7 段尾部风险评估（28.0）POT/GPD 外推 p99.9
 4. **汇总反思教训** —— 合并反思引擎经验教训，去重已消化项
 5. **目标生成** —— 从洞察自动生成改进目标并分解子任务
 6. **子任务派发** —— 经安全治理审查后注入执行
@@ -181,7 +205,7 @@ dsh web
 - **多密钥故障转移**：同一厂商存在多个候选密钥时，认证失败（401/403）或配额耗尽（429）会自动轮换到下一个候选密钥重试，并升级为**健康感知路由**——按成功/失败统计选择最优密钥，429 冷却 1 分钟、401/403 冷却 5 分钟，成功后自动恢复；用户可通过 `manage_keys` 工具调整密钥使用顺序（持久化，重启保留），启动日志输出每个模型的密钥来源（不含密钥值），运行时可用 `query_memory keys` 查看各密钥健康状态；
 - 若只需单一厂商，可改用 `patches/domestic-models/` 下按厂商拆分的 patch；重新生成：`pnpm generate:patches`。
 
-完整运行配置项（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主循环 `autonomy` / 宿主融合 `hostFusion`）同样内置于 [cordis.patch.yml](./cordis.patch.yml)，无需改动；共生经济子项位于 `autonomy.symbiosis`（futarchy 表决、能量反哺等，缺省关闭）。保证层内核 12.0-16.0、几何/拓扑层内核 17.0-20.0 与最优调度层内核 21.0-22.0 子项同样缺省关闭（零漂移）：`autonomy.anytimeEvidence`（α / 水位线）、`autonomy.conformal`（α / 校准容量 / 阈值风险与置信）、`autonomy.qualityDiversity`（探索率）、`autonomy.runtimeVerification`（附加规约 `specs`）、`autonomy.optimalTransport`（监测 KPI / 窗口 / 阈值分位）、`autonomy.informationGeometry`（KL 信任域 / 步长尺度）、`autonomy.optimalStopping`（机会视野 / 最小样本）、`autonomy.sheafConsensus`（障碍失配容差）、`autonomy.indexScheduling`（贴现 / 网格）、`autonomy.banditKnapsack`（UCB α / 可行性松弛 / 视界）。
+完整运行配置项（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主循环 `autonomy` / 宿主融合 `hostFusion`）同样内置于 [cordis.patch.yml](./cordis.patch.yml)，无需改动；共生经济子项位于 `autonomy.symbiosis`（futarchy 表决、能量反哺等，缺省关闭）。保证层内核 12.0-16.0、几何/拓扑层内核 17.0-20.0 与最优调度层内核 21.0-22.0 子项同样缺省关闭（零漂移）：`autonomy.anytimeEvidence`（α / 水位线）、`autonomy.conformal`（α / 校准容量 / 阈值风险与置信）、`autonomy.qualityDiversity`（探索率）、`autonomy.runtimeVerification`（附加规约 `specs`）、`autonomy.optimalTransport`（监测 KPI / 窗口 / 阈值分位）、`autonomy.informationGeometry`（KL 信任域 / 步长尺度）、`autonomy.optimalStopping`（机会视野 / 最小样本）、`autonomy.sheafConsensus`（障碍失配容差）、`autonomy.indexScheduling`（贴现 / 网格）、`autonomy.banditKnapsack`（UCB α / 可行性松弛 / 视界）、`autonomy.robustStatistics`（α）、`autonomy.privacy`（ε / δ）、`autonomy.capacityPlanning`（目标等待 / SCV）；先知层 26.0-30.0 子项同样缺省关闭（零漂移）：`autonomy.gaussianProcess`（校准点数 / 最小点数）、`autonomy.kalmanFilter`（过程噪声 / 观测噪声 / 门控分位）、`autonomy.extremeValue`（p99 目标 / 最小样本 / 阈值分位）、`autonomy.mcts`（迭代 / 探索常数 / 折扣）、`autonomy.submodular`（主题覆盖强度）。
 
 ## 工具一览（18 个 + 缺省关闭的层论共识 Tool）
 
@@ -215,7 +239,7 @@ dsh web
 - `manage_autonomy`：`start` / `stop` / `tick` / `kill-switch` / `revive` / `reset-circuit`
 - `query_memory`：`world-model` / `curiosity` / `governance` / `patterns` / `lessons` / `keys` 等
 
-## 离线验证（31 个，零 API Key）
+## 离线验证（35 个，零 API Key）
 
 每个内核与子系统均有离线端到端验证脚本（`node scripts/verify-*.mjs`）：
 
@@ -228,6 +252,8 @@ node scripts/verify-anytime-evidence.mjs # 任意时刻证据：CS 时间一致�
 node scripts/verify-shapley.mjs       # Shapley：四公理 / 置信区间 / 协同侦测
 node scripts/verify-frontier-kernels.mjs # 几何与拓扑层 17.0→20.0：解析解对照 / 坐标不变性 / 先知 2-3 / 层障碍检测
 node scripts/verify-frontier-wiring.mjs # 几何与拓扑层接线：真实引擎端到端（漂移洞察 / 自然变异 / 数学 defer）
+node scripts/verify-prophet-kernels.mjs # 先知层 26.0→30.0：GP 插值/EI-MC 对照 / Riccati 闭式 / POT 解析分位 / UCT 收敛 / CELF-穷举对照
+node scripts/verify-prophet-wiring.mjs  # 先知层接线：真实引擎端到端（GP 校准 / NIS 门控洞察 / 延迟样本→尾部外推 / UCT 互查 / 互补盲区入选）
 ```
 
 | 分组 | 脚本 |
@@ -236,6 +262,8 @@ node scripts/verify-frontier-wiring.mjs # 几何与拓扑层接线：真实引�
 | 质变内核 | verify-unified-evidence · verify-resilience-governance · verify-causal-kernel · verify-active-inference · verify-deliberation · verify-metareasoning · verify-abstraction |
 | 保证层内核 12.0-16.0 | verify-anytime-evidence · verify-conformal · verify-quality-diversity · verify-runtime-verification · verify-shapley |
 | 几何与拓扑层 17.0-20.0 | verify-frontier-kernels · verify-frontier-wiring |
+| 创世层 21.0-25.0 | verify-genesis-kernels · verify-genesis-wiring |
+| 先知层 26.0-30.0 | verify-prophet-kernels · verify-prophet-wiring |
 | 共生经济 | verify-symbiosis · verify-symbiosis-bridge · verify-belief-market · verify-futarchy · verify-energy-feedback · verify-full-agents · verify-observability |
 | 学习与进化 | verify-self-evolution · verify-self-evolution-v2 · verify-knowledge-distillation · verify-policy-evolution · verify-meta-cognition · verify-meta-cognition-v2 · verify-meta-edge · verify-consensus-sync |
 
@@ -268,7 +296,7 @@ node scripts/verify-frontier-wiring.mjs # 几何与拓扑层接线：真实引�
 ├── cordis.patch.yml              # bundle 配置层（dsh.bundle.patch 指向，全部国产模型零密钥）
 ├── symbiosis-sankey-demo.html    # 认知生态能量流 Sankey 全景（零依赖自包含）
 ├── patches/domestic-models/      # 按厂商拆分的可选 patch（9 厂商 + all-domestic.yml）
-├── scripts/                      # patch 生成器 + 31 个离线验证脚本
+├── scripts/                      # patch 生成器 + 35 个离线验证脚本
 └── src/
     ├── index.ts                  # 插件入口：10 步主链路编排 + Tool 注册
     ├── types.ts / errors.ts      # 共享类型层 / 统一错误体系（稳定机器可读 code）
@@ -291,7 +319,7 @@ node scripts/verify-frontier-wiring.mjs # 几何与拓扑层接线：真实引�
     ├── autonomy-loop.ts          # 自主循环：11 步心跳编排
     ├── host-fusion.ts            # 宿主融合层：全宿主可观测 + 安全治理
     ├── dsh-host.ts               # DSH 宿主集成：LLM 客户端 / 模型目录 / Key 注入
-    ├── core/                     # 质变内核：evidence 3.0 → sheaf 20.0 十八大内核
+    ├── core/                     # 质变内核：evidence 3.0 → submodular 30.0 二十八内核
     ├── meta/                     # 元认知层：自我建模 + 元认知控制器（双环外环）
     ├── policy/                   # 策略进化器 + 安全沙盒：种群进化 / 金丝雀部署
     ├── symbiosis/                # 认知能量共生经济：账本 / 市场 / 信念市场 / 智能体 / 运行时 / Sankey

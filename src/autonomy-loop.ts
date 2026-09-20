@@ -94,7 +94,8 @@ export interface SymbiosisBridgeHook {
  * 失败由调用侧静默隔离，不阻断主链路。
  */
 export type CapacityAdvisor = () => Insight[] | void;
-
+/** 28.0：尾部风险顾问（心跳 2.7 段消费，缺省零改动） */
+export type TailRiskAdvisor = () => Insight[] | void;
 /** 自主心跳配置 */
 export interface AutonomyLoopConfig {
   /** 心跳间隔（毫秒） */
@@ -169,6 +170,8 @@ export class AutonomyLoop {
   private symbiosis?: SymbiosisBridgeHook;
   /** 25.0：容量规划顾问（可选注入；心跳 2.5 段消费，缺省零改动） */
   private capacityAdvisor?: CapacityAdvisor;
+  /** 28.0：尾部风险顾问（可选注入；心跳 2.7 段消费，缺省零改动） */
+  private tailRiskAdvisor?: TailRiskAdvisor;
   // 可选自主组件（向后兼容）
   private worldModel?: WorldModel;
   private curiosity?: CuriosityEngine;
@@ -202,6 +205,8 @@ export class AutonomyLoop {
     symbiosis?: SymbiosisBridgeHook;
     /** 25.0：容量规划顾问（可选，缺省不启用） */
     capacityAdvisor?: CapacityAdvisor;
+    /** 28.0：尾部风险顾问（可选，缺省不启用） */
+    tailRiskAdvisor?: TailRiskAdvisor;
     worldModel?: WorldModel;
     curiosity?: CuriosityEngine;
     governor?: SafetyGovernor;
@@ -220,6 +225,7 @@ export class AutonomyLoop {
     this.metaCognitionBridge = params.metaCognitionBridge;
     this.symbiosis = params.symbiosis;
     this.capacityAdvisor = params.capacityAdvisor;
+    this.tailRiskAdvisor = params.tailRiskAdvisor;
     this.worldModel = params.worldModel;
     this.curiosity = params.curiosity;
     this.governor = params.governor;
@@ -358,6 +364,21 @@ export class AutonomyLoop {
       }
     } catch {
       /* 容量规划失败不阻断 */
+    }
+
+    // ── 2.7 尾部风险评估（28.0）：延迟样本 → POT/GPD → 尾部外推洞察 ──
+    // 经验 p99.9 = 样本最大值（运气）；POT/GPD 外推有 Pickands–
+    // Balkema–de Haan 定理背书（含 bootstrap CI）。未注入顾问时零改动；
+    // 失败静默（尾部评估不阻断主链路）。
+    try {
+      if (this.tailRiskAdvisor) {
+        const tailInsights = this.tailRiskAdvisor();
+        if (tailInsights && tailInsights.length > 0) {
+          insights.push(...tailInsights);
+        }
+      }
+    } catch {
+      /* 尾部评估失败不阻断 */
     }
 
     // ── 3. 汇总反思教训洞察（去重已消化的教训） ──

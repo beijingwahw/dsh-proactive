@@ -19,6 +19,8 @@
  * - 探索预算与健康度联动，保证探索行为始终在安全边界内
  */
 
+import { coverageFromTokens, lazyGreedy } from './core/submodular.js';
+
 /** 知识盲区候选 */
 export interface KnowledgeGap {
   /** 任务类型 */
@@ -283,10 +285,37 @@ export class CuriosityEngine {
   }
 
   /**
+   * 30.0：挂载次模选择器（幂等）。
+   *
+   * top-k 按新颖度选盲区是模函数口径——共享主题的盲区（'generate-code' /
+   * 'review-code' 同含 code）被重复购买。挂载后探索预算按加权覆盖次模
+   * 函数惰性贪心分配（CELF，≥ (1−1/e)·OPT）：同主题第二个候选的边际
+   * 自动衰减，预算优先流向互补的知识结构。未挂载即零漂移（原 top-k）。
+   */
+  attachSubmodularSelector(options?: { coverageStrength?: number }): void {
+    this.submodularSelector = { coverageStrength: options?.coverageStrength ?? 0.7 };
+  }
+
+  private submodularSelector?: { coverageStrength: number };
+
+  /** 30.0：任务类型 → token 集（主题 = 共享 token；camelCase 与连字符统一拆分） */
+  private static tokenize(taskType: string): string[] {
+    return taskType
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((t) => t.length >= 2);
+  }
+  /**
    * 生成探索建议（受预算约束）
    * @param dispatchSlots 本轮心跳的总派发槽位数
    * @param healthScore 系统健康度 0~1（健康时多探索）
    * @returns 探索任务建议列表
+   *
+   * 30.0：挂载次模选择器后，预算内选择从「新颖度 top-k」升级为
+   * 加权覆盖惰性贪心——共享主题的盲区边际自动衰减（CELF 保证
+   * ≥ (1−1/e)·OPT）；主题来自任务类型 token 集。候选不足预算时
+   * 两者结果一致（全部选中）。
    */
   proposeExplorations(dispatchSlots: number, healthScore = 1): ExplorationProposal[] {
     // 探索预算：基础比例 × 健康度调节（退化时收敛探索）
@@ -295,6 +324,38 @@ export class CuriosityEngine {
     if (budget <= 0) return [];
 
     const gaps = this.scanKnowledgeGaps();
+    if (gaps.length <= budget) {
+      return gaps.map((gap) => ({
+        taskType: gap.taskType,
+        description: this.describeExploration(gap),
+        noveltyScore: gap.noveltyScore,
+        expectedGain: this.describeGain(gap),
+      }));
+    }
+
+    // 30.0 次模路径：加权覆盖（主题 = 共享 token）惰性贪心
+    if (this.submodularSelector) {
+      const cov = coverageFromTokens(
+        gaps.map((gap) => ({ tokens: CuriosityEngine.tokenize(gap.taskType), weight: Math.max(1e-6, gap.noveltyScore) })),
+        this.submodularSelector.coverageStrength,
+      );
+      const order = lazyGreedy(cov, budget);
+      const byType = new Map(gaps.map((gap) => [gap.taskType, gap]));
+      const proposals: ExplorationProposal[] = [];
+      for (const idx of order.selected) {
+        const gap = byType.get(gaps[idx]!.taskType);
+        if (!gap) continue;
+        proposals.push({
+          taskType: gap.taskType,
+          description: this.describeExploration(gap),
+          noveltyScore: gap.noveltyScore,
+          expectedGain: this.describeGain(gap),
+        });
+      }
+      if (proposals.length > 0) return proposals.slice(0, budget);
+    }
+
+    // 原路径（未挂载次模选择器）：新颖度 top-k
     const proposals: ExplorationProposal[] = [];
     for (const gap of gaps) {
       if (proposals.length >= budget) break;

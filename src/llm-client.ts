@@ -351,6 +351,15 @@ export class LLMClient {
     return stream;
   }
 
+  /**
+   * 28.0：取模型的原始延迟样本（毫秒）。
+   * 仅配置 robustLatency 时有值（否则 undefined，零开销零漂移）——
+   * 尾部风险监视器（POT/GPD）与 23.0 稳健估计共用同一条流。
+   */
+  getLatencySamples(modelId: string): number[] | undefined {
+    return this.robustStreams.get(modelId)?.toSamples();
+  }
+
   /** 获取并发槽位（必要时排队） */
   private acquireSlot(state: ModelState): Promise<void> {
     if (state.active < state.maxConcurrency) {

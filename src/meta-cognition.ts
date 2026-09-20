@@ -24,6 +24,7 @@ import {
   type AnytimeVerdict,
 } from './core/anytime-evidence.js';
 import { TransportDriftMonitor, type TransportDriftView } from './core/optimal-transport.js';
+import { LocalLinearTrendFilter, type TrendFilterConfig, type TrendStepRead } from './core/kalman-filter.js';
 
 /** KPI 快照 */
 export interface KpiSnapshot {
@@ -158,6 +159,14 @@ export interface HealthReport {
     }>;
     interpretation: string;
   };
+  /**
+   * 27.0：卡尔曼滤波层（挂载后输出）——KPI 的去噪读数（level）、
+   * 缓慢漂移的早期读数（slope）与突变门控状态（NIS 假设检验）。
+   */
+  kalman?: {
+    streams: Array<{ kpi: string; level: number; slope: number; nis: number; threshold: number; gated: boolean }>;
+    interpretation: string;
+  };
 }
 
 /** 元认知配置 */
@@ -267,6 +276,10 @@ export class MetaCognitionEngine {
   private transportDrift?: Map<string, TransportDriftMonitor>;
   /** 17.0：各 KPI 的上次漂移态（翻转沿触发洞察） */
   private transportDriftState = new Map<string, boolean>();
+  /** 27.0：KPI 局部线性趋势滤波器（挂载后异常判定升级为 NIS 假设检验） */
+  private kalmanFilters?: Map<string, LocalLinearTrendFilter>;
+  /** 27.0：各 KPI 的上次门控态（翻转沿触发洞察） */
+  private kalmanGateState = new Map<string, boolean>();
   /** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
   private guardAlpha = 0.05;
   /**
@@ -365,6 +378,55 @@ export class MetaCognitionEngine {
   /** 17.0：各 KPI 的当前形状漂移视图（纯读取；未挂载返回 undefined） */
   transportDriftView(kpi: string): TransportDriftView | undefined {
     return this.transportDrift?.get(kpi)?.drift();
+  }
+
+  /**
+   * 27.0：挂载 KPI 卡尔曼滤波层（幂等；缺省覆盖 successRate / avgQuality /
+   * avgLatency / cacheHitRate）。
+   *
+   * 1 号 z-score 检查是窗口内无记忆比较；本层把整条历史压进 (level, slope)
+   * 充分统计量——异常判定从启发式升级为 NIS 假设检验（新息平方和超出
+   * χ²(1) 99.7% 分位才报警），缓慢漂移由滤波斜率给出早期读数。
+   * 不 attach 即零漂移。
+   */
+  attachKalmanAnomaly(options?: Partial<TrendFilterConfig> & { kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'> }): void {
+    const kpis = options?.kpis ?? ['successRate', 'avgQuality', 'avgLatency', 'cacheHitRate'];
+    const filterOptions: Partial<TrendFilterConfig> = {};
+    for (const key of ['qLevel', 'qSlope', 'r', 'gateP', 'p0Level', 'p0Slope'] as const) {
+      const v = options?.[key];
+      if (typeof v === 'number' && Number.isFinite(v)) filterOptions[key] = v;
+    }
+    this.kalmanFilters = new Map();
+    for (const kpi of kpis) {
+      this.kalmanFilters.set(kpi, new LocalLinearTrendFilter(filterOptions));
+    }
+  }
+
+  /** 27.0：KPI 的当前滤波读数（纯读取；未挂载返回 undefined） */
+  kalmanView(kpi: string): TrendStepRead | undefined {
+    return this.kalmanFilters?.get(kpi)?.lastRead;
+  }
+
+  /** 27.0：NIS 门控检验（每批快照后调用；进入门控的翻转沿产出洞察） */
+  private checkKalman(kpi: string, value: number): Insight[] {
+    const filter = this.kalmanFilters?.get(kpi);
+    if (!filter || !Number.isFinite(value)) return [];
+    const read = filter.observe(value);
+    const last = this.kalmanGateState.get(kpi) ?? false;
+    this.kalmanGateState.set(kpi, read.gated);
+    if (!read.gated || last) return []; // 只在进入门控的翻转沿打扰
+    // 方向语义：延迟上升 / 其余下降 = 退化
+    const degraded = kpi === 'avgLatency' ? read.innovation > 0 : read.innovation < 0;
+    if (!degraded) return []; // 方向性改善不打扰（健康报告可见）
+    return [
+      {
+        source: 'meta-cognition',
+        category: 'kpi-innovation-gate',
+        severity: Math.min(0.9, 0.55 + Math.min(0.35, Math.log10(Math.max(10, read.nis)) / 12)),
+        message: `KPI ${kpi} 新息门控触发：观测 ${value.toFixed(3)} 偏离滤波预测 ${read.level.toFixed(3)}（NIS=${read.nis.toFixed(1)} > χ²阈值 ${read.threshold.toFixed(1)}），突变在模型方差下 99.7% 不该发生`,
+        suggestion: '单点冲击先观察（可能是突发负载）；连续门控 = 状态转移模型失配，结合 17.0 形状漂移与 12.0 保证层三口径定位根因',
+      },
+    ];
   }
 
   /**
@@ -514,6 +576,15 @@ export class MetaCognitionEngine {
       }
     }
 
+    // 0.7 27.0：卡尔曼新息门控（突变判定的假设检验口径）
+    if (this.kalmanFilters) {
+      for (const kpi of this.kalmanFilters.keys()) {
+        const value = kpi === 'avgLatency' ? snapshot.avgLatency : kpi === 'cacheHitRate' ? snapshot.cacheHitRate : kpi === 'successRate' ? snapshot.successRate : snapshot.avgQuality;
+        if (!Number.isFinite(value)) continue;
+        insights.push(...this.checkKalman(kpi, value));
+      }
+    }
+
     // 1. z-score 异常检测（窗口足够时）
     if (this.history.length >= 5) {
       for (const kpi of ['successRate', 'avgQuality', 'cacheHitRate'] as const) {
@@ -588,6 +659,25 @@ export class MetaCognitionEngine {
       knowledgeFrontier: this.scientistMind ? this.scientistMind.knowledgeFrontier() : undefined,
       // 11.0：理论前沿 KPI（挂载理论内核时输出）
       theoryFrontier: this.theoristEngine ? this.theoristEngine.frontier() : undefined,
+      // 27.0：卡尔曼滤波层（挂载后输出；level 去噪 / slope 漂移 / NIS 门控）
+      kalman: this.kalmanFilters
+        ? (() => {
+            const streams = [...this.kalmanFilters!.entries()].map(([kpi, filter]) => {
+              const r = filter.lastRead;
+              return r
+                ? { kpi, level: Number(r.level.toFixed(4)), slope: Number(r.slope.toFixed(5)), nis: Number(r.nis.toFixed(2)), threshold: Number(r.threshold.toFixed(2)), gated: r.gated }
+                : { kpi, level: 0, slope: 0, nis: 0, threshold: 0, gated: false };
+            });
+            const gatedCount = streams.filter((s) => s.gated).length;
+            return {
+              streams,
+              interpretation:
+                gatedCount > 0
+                  ? '存在新息门控触发中的 KPI：观测偏离滤波预测超出 χ² 99.7% 分位——突变正在发生'
+                  : '全部 KPI 新息在模型方差内：状态转移模型仍解释世界',
+            };
+          })()
+        : undefined,
       // 12.0：KPI 保证层（挂载 anytime 守卫后输出）
       guarantees: this.anytimeGuards
         ? (() => {

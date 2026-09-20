@@ -1835,6 +1835,109 @@ declare function decompose(state: string): {
   hasSkeleton: boolean;
 };
 //#endregion
+//#region src/core/mcts.d.ts
+/**
+ * 29.0 蒙特卡洛树搜索内核 —— UCT + 折扣回报 + 任意时刻可读
+ *
+ * 动机: 7.0 beam search 在轨迹空间按「模型评分」剪枝——宽度是资源，深度
+ * 受 beam 限制；评估函数（累计 G）是确定性的近视打分。MCTS 把搜索本身
+ * 变成**序贯决策问题**：
+ *
+ *   选择:  UCB1 = Q(s,a)/N(s,a) + c·√(ln N(s) / N(s,a))
+ *     ——利用项（均值）与探索项（访问稀缺度）的置信上界平衡，
+ *     Hoeffding 界保证收敛到最优动作（Kocsis & Szepesvári 2006）。
+ *   扩展: 每次迭代只展开一个未试动作（惰性扩展，树按需生长）；
+ *     渐进加宽（可选）⌈k·(N+1)^κ⌉ 限制大动作集的子节点数。
+ *   模拟: 随机 rollout 到深度上限，收集折扣回报 Σ γ^t·r_t。
+ *   回传: **节点本地回报**——每条边记录进入奖励，回传时按
+ *     (R − 前缀折扣奖励)/γ^depth 折算，每个节点的 Q 都是
+ *     「从本节点出发的折扣回报」，无深度偏置。
+ *
+ *   任意时刻性（与 8.0 元推理同族）: 迭代预算 / 时间预算任一耗尽即读出，
+ *     访问分布即时可审计（visits 越多 = 证据越多，与 21.0 学习溢价同构）。
+ *
+ * 确定性: 种子化 mulberry32——同一 (seed, domain) 组合逐位复现；
+ *   域内随机必须只消费传入的 rng。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致。
+ */
+/**
+ * 搜索域：动作清单 + 随机步进。
+ * 契约：终局状态的 actions() 必须返回空数组（rollout 依赖此停止）。
+ */
+interface MctsDomain {
+  actions(state: string): string[];
+  /**
+   * 一步转移（域内随机只消费传入 rng，保证种子可复现）。
+   * @returns 后继状态、即时奖励 r（建议 [0,1] 口径）、是否终局
+   */
+  step(state: string, action: string, rng: () => number): {
+    state: string;
+    reward: number;
+    terminal: boolean;
+  };
+}
+interface UctConfig {
+  /** UCB1 探索常数 c（缺省 √2） */
+  explorationC: number;
+  /** 每步折扣 γ（缺省 0.95） */
+  discount: number;
+  /** rollout 深度上限（缺省 12） */
+  rolloutDepth: number;
+  /** PRNG 种子（缺省 20260920） */
+  seed: number;
+  /** 渐进加宽系数 k（子节点上限 ⌈k·(N+1)^κ⌉；0 = 关闭；缺省 0） */
+  progressiveWidenK: number;
+  /** 渐进加宽指数 κ ∈ (0,1]（缺省 0.5） */
+  progressiveWidenKappa: number;
+}
+declare const DEFAULT_UCT_CONFIG: UctConfig;
+interface MctsChildStat {
+  action: string;
+  visits: number;
+  meanValue: number;
+}
+interface MctsResult {
+  /** 访问次数最多的根动作（收敛意义下的最优动作） */
+  bestAction: string | undefined;
+  /** 根价值（根的本地回报均值） */
+  rootValue: number;
+  /** 完成迭代数 */
+  iterations: number;
+  /** 树节点总数 */
+  treeNodes: number;
+  /** 根子节点统计（visits 降序） */
+  children: MctsChildStat[];
+  /** 主变化线（最访问链的动作序列） */
+  principalVariation: string[];
+}
+/**
+ * UCT 搜索器。bind(domain) 后可反复 search()（每次为独立完整运行，
+ * 种子重置——同一预算逐位可复现）。
+ */
+declare class UctSearch {
+  private config;
+  private domain;
+  private rng;
+  private nodeCount;
+  constructor(config?: Partial<UctConfig>, domain?: MctsDomain);
+  /** 绑定/替换搜索域 */
+  bind(domain: MctsDomain): this;
+  search(root: string, budget?: {
+    iterations?: number;
+    timeMs?: number;
+  }): MctsResult;
+  private runEpisode;
+  /** UCB1 选择（访问数 0 的子节点视为 +∞——必先展开） */
+  private selectUcb;
+  /** 随机 rollout：深度上限内均匀选动作，收集折扣回报（从该节点视角） */
+  private rollout;
+  /** 渐进加宽：子节点数上限 ⌈k·(N+1)^κ⌉（k=0 恒真 = 关闭） */
+  private canWiden;
+  /** 主变化线：自根沿最高访问数下降 */
+  private extractPv;
+}
+//#endregion
 //#region src/core/deliberation.d.ts
 /** 转移边后验（state × action → outcome，学习与想象的生成模型） */
 interface TransitionPosterior {
@@ -1953,6 +2056,8 @@ interface DeliberationResult {
   expandedNodes: number;
   /** 技能种子是否参与（时间抽象生效） */
   skillSeeded: boolean;
+  /** 29.0：UCT 搜索元数据（searchMcts 专属；beam search 不出现） */
+  mcts?: MctsResult;
 }
 interface DeliberationConfig {
   /** 时间折扣 γ（缺省 0.95：远期收益按 5%/步衰减） */
@@ -2063,6 +2168,37 @@ declare class DeliberationEngine {
       successor: string;
     }) => string;
   }): DeliberationResult;
+  /**
+   * 29.0：UCT 前瞻搜索（beam search 的序贯决策升级口径）。
+   *
+   * beam search 按轨迹 G 剪枝（宽度即资源上限）；本方法把「搜索预算的
+   * 分配」本身交给 UCT——每条转移边按 Beta 后验采样伯努利成败（失败即
+   * 终局零回报），回报 = 逐步折扣的成功指示（与 pAllSuccess 同族），
+   * UCB1 在「利用证据多的边」与「探索证据少的边」之间自动平衡。
+   * 迭代/时间预算耗尽即读出（任意时刻性），根动作按访问证据排序；
+   * 每条报告沿 MCTS 主变化线展开完整 ImaginationReport（口径与
+   * search() 一致，可互查对账）。未挂载消费方不调用即零漂移。
+   */
+  searchMcts(startState: string, candidates: string[] | ((state: string) => string[]), opts?: {
+    /** UCT 迭代预算（缺省 600） */
+    iterations?: number;
+    /** UCB1 探索常数（缺省 √2） */
+    explorationC?: number;
+    /** 折扣 γ（缺省 0.95） */
+    discount?: number;
+    /** 输出报告条数（缺省 beamBreadth） */
+    topK?: number;
+    preference?: number;
+    /** 状态推进覆盖（与 search 同义） */
+    advance?: (ctx: {
+      state: string;
+      action: string;
+      step: number;
+      successor: string;
+    }) => string;
+  }): DeliberationResult & {
+    mcts: MctsResult;
+  };
   /**
    * 技能入库/强化：整体成功的计划蒸馏为可复用宏动作。
    * 同一 (触发态, 行动序列) 已存在时按 EMA 强化价值。
@@ -3025,6 +3161,161 @@ declare class TransportDriftMonitor {
   private interpret;
 }
 //#endregion
+//#region src/core/kalman-filter.d.ts
+/**
+ * 27.0 卡尔曼滤波内核 —— 线性高斯状态空间滤波 + RTS 平滑 + NIS 门控
+ *
+ * 动机: KPI 快照是**带噪的状态观测**——成功率的真水平被采样噪声、窗口效应、
+ * 瞬时抖动遮蔽。z-score（meta-cognition 1 号检查）在窗口内做无记忆比较，
+ * 而卡尔曼滤波把整条历史压缩进 (x, P) 两个充分统计量：
+ *
+ *   预测:  x⁻ = F·x,  P⁻ = F·P·Fᵀ + Q
+ *   更新:  y = z − H·x⁻（新息）,  S = H·P⁻·Hᵀ + R
+ *          K = P⁻·Hᵀ·S⁻¹（最优增益 = 最小方差）
+ *          x = x⁻ + K·y,  P = (I−K·H)·P⁻
+ *   新息平方和 NIS = yᵀ·S⁻¹·y ~ χ²(dim)（模型正确时）
+ *     → NIS 门控: 突变不是「窗口均值变了」而是「新息超出模型方差 99.7%
+ *       分位」——异常判定从启发式升级为假设检验。
+ *
+ *   平滑（RTS，批量回看）: 后向递推把未来信息回灌历史估计——
+ *     趋势斜率的「事后最优」读数（检测缓慢漂移比滤波更早确认）。
+ *
+ *   随机游走稳态解析解（验证锚点）: q 过程噪声 / r 观测噪声,
+ *     P∞ 满足 P∞ = q + r·P∞/(P∞+r) → P∞ = (q + √(q²+4qr))/2,
+ *     K∞ = P∞/(P∞+r)——Riccati 迭代收敛于此（精确对照）。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致。
+ */
+type Matrix = number[][];
+/** 列向量 */
+type Vec = number[];
+/** χ² 分布分位数（自由度 df、上侧概率 p） */
+declare function chiSquareQuantile(p: number, df: number): number;
+interface KalmanModel {
+  /** 状态转移 F */
+  F: Matrix;
+  /** 观测矩阵 H */
+  H: Matrix;
+  /** 过程噪声协方差 Q */
+  Q: Matrix;
+  /** 观测噪声协方差 R */
+  R: Matrix;
+  /** 初始状态（列向量） */
+  x0: Vec;
+  /** 初始协方差 */
+  P0: Matrix;
+}
+interface KalmanStepResult {
+  /** 滤波后状态（列向量） */
+  x: Vec;
+  /** 新息（标量观测） */
+  innovation: number;
+  /** 新息方差 S */
+  innovationVar: number;
+  /** 新息平方和（NIS，模型正确时 ~ χ²(dim)） */
+  nis: number;
+  /** 本步对数似然（用于模型比较 / 变点检测） */
+  logLikelihood: number;
+  /** NIS 是否超过门控分位 */
+  gated: boolean;
+}
+/**
+ * 线性高斯卡尔曼滤波器（dim ≤ 3 的小矩阵实现，标量观测）。
+ *
+ * predict()/update() 分离（无观测的心跳可只预测），step(z) = 预测 + 更新 +
+ * 门控判定。所有数值在线更新，无历史缓冲（内存 O(dim²)）。
+ */
+declare class KalmanFilter {
+  private readonly model;
+  private readonly gateQuantile;
+  private readonly gateThreshold;
+  private x;
+  private P;
+  constructor(model: KalmanModel, gateP?: number);
+  /** 一步预测（不更新） */
+  predict(): void;
+  /** 一步预测 + 观测更新 + NIS 门控 */
+  step(z: number): KalmanStepResult;
+  /** 观测更新（假设已 predict） */
+  update(z: number): KalmanStepResult;
+  get state(): Vec;
+  get covariance(): Matrix;
+  get gate(): {
+    p: number;
+    threshold: number;
+  };
+}
+/**
+ * 随机游走 + 白噪观测的稳态滤波方差（精确闭式）：
+ *   P∞ = (√(q² + 4·q·r) − q) / 2,  K∞ = P∞ / (P∞ + r)
+ * （Riccati 稳态方程 P² + q·P − q·r = 0 的正根；验证锚点：迭代收敛于此值）
+ */
+declare function randomWalkSteadyState(q: number, r: number): {
+  pInf: number;
+  kInf: number;
+};
+interface TrendFilterConfig {
+  /** 水平过程噪声 q_level（越大跟踪越快、越信新观测；缺省 1e-4） */
+  qLevel: number;
+  /** 斜率过程噪声 q_slope（缺省 1e-6） */
+  qSlope: number;
+  /** 观测噪声方差 r（缺省 2e-4） */
+  r: number;
+  /** NIS 门控上侧概率（缺省 0.997 ≈ 3σ） */
+  gateP: number;
+  /** 初始水平不确定度 */
+  p0Level: number;
+  /** 初始斜率不确定度 */
+  p0Slope: number;
+}
+declare const DEFAULT_TREND_FILTER_CONFIG: TrendFilterConfig;
+interface TrendStepRead {
+  /** 滤波水平（去噪后的当前值） */
+  level: number;
+  /** 滤波斜率（每步变化率） */
+  slope: number;
+  /** 新息 */
+  innovation: number;
+  /** NIS 与门控阈值 */
+  nis: number;
+  threshold: number;
+  /** NIS 超门（异常观测） */
+  gated: boolean;
+  /** 水平的滤波方差 */
+  levelVar: number;
+  logLikelihood: number;
+}
+interface SmoothedPoint {
+  level: number;
+  slope: number;
+}
+/**
+ * 局部线性趋势滤波器（constant-velocity 模型，标量序列）：
+ *
+ *   状态 [level, slope]ᵀ,  F = [[1,1],[0,1]],  H = [1, 0]
+ *   Q = diag(q_level, q_slope),  R = r
+ *
+ * 用途: KPI 序列的去噪读数（level）、缓慢漂移的早期读数（slope）、
+ * 突变的假设检验（NIS 门控）。历史保留 filter 状态序列以支持 RTS 平滑。
+ */
+declare class LocalLinearTrendFilter {
+  private config;
+  private filter;
+  private history;
+  private last;
+  constructor(config?: Partial<TrendFilterConfig>);
+  /** 喂入一个观测（自动先验初始化：首个观测把水平初始化为 z，收敛更快） */
+  observe(z: number): TrendStepRead;
+  /** 最近一次滤波读数（纯读取；无观测时 undefined） */
+  get lastRead(): TrendStepRead | undefined;
+  /**
+   * RTS 平滑（批量后向回看）：用全部历史给出每个时刻的事后最优
+   * (level, slope)。缓慢漂移的确认比纯滤波更早、更稳。
+   */
+  smooth(): SmoothedPoint[];
+  get size(): number;
+}
+//#endregion
 //#region src/meta-cognition.d.ts
 /** KPI 快照 */
 interface KpiSnapshot {
@@ -3173,6 +3464,21 @@ interface HealthReport {
     }>;
     interpretation: string;
   };
+  /**
+   * 27.0：卡尔曼滤波层（挂载后输出）——KPI 的去噪读数（level）、
+   * 缓慢漂移的早期读数（slope）与突变门控状态（NIS 假设检验）。
+   */
+  kalman?: {
+    streams: Array<{
+      kpi: string;
+      level: number;
+      slope: number;
+      nis: number;
+      threshold: number;
+      gated: boolean;
+    }>;
+    interpretation: string;
+  };
 }
 /** 元认知配置 */
 interface MetaCognitionConfig {
@@ -3246,6 +3552,10 @@ declare class MetaCognitionEngine {
   private transportDrift?;
   /** 17.0：各 KPI 的上次漂移态（翻转沿触发洞察） */
   private transportDriftState;
+  /** 27.0：KPI 局部线性趋势滤波器（挂载后异常判定升级为 NIS 假设检验） */
+  private kalmanFilters?;
+  /** 27.0：各 KPI 的上次门控态（翻转沿触发洞察） */
+  private kalmanGateState;
   /** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
   private guardAlpha;
   /**
@@ -3296,6 +3606,22 @@ declare class MetaCognitionEngine {
   private checkTransportDrift;
   /** 17.0：各 KPI 的当前形状漂移视图（纯读取；未挂载返回 undefined） */
   transportDriftView(kpi: string): TransportDriftView | undefined;
+  /**
+   * 27.0：挂载 KPI 卡尔曼滤波层（幂等；缺省覆盖 successRate / avgQuality /
+   * avgLatency / cacheHitRate）。
+   *
+   * 1 号 z-score 检查是窗口内无记忆比较；本层把整条历史压进 (level, slope)
+   * 充分统计量——异常判定从启发式升级为 NIS 假设检验（新息平方和超出
+   * χ²(1) 99.7% 分位才报警），缓慢漂移由滤波斜率给出早期读数。
+   * 不 attach 即零漂移。
+   */
+  attachKalmanAnomaly(options?: Partial<TrendFilterConfig> & {
+    kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+  }): void;
+  /** 27.0：KPI 的当前滤波读数（纯读取；未挂载返回 undefined） */
+  kalmanView(kpi: string): TrendStepRead | undefined;
+  /** 27.0：NIS 门控检验（每批快照后调用；进入门控的翻转沿产出洞察） */
+  private checkKalman;
   /**
    * 12.0：保证层检验（每批快照后调用）。
    *
@@ -5626,6 +5952,18 @@ declare class Optimizer implements IOptimizer {
     breadth?: number;
     preference?: number;
   }): DeliberationResult | undefined;
+  /** 29.0 MCTS 搜索参数（attachMctsSearch 后深思推荐走 UCT；undefined = 原 beam search） */
+  private mctsOptions?;
+  /**
+   * 29.0：挂载 UCT 搜索口径（幂等；撤除传 null）。
+   * 深思推荐从 beam search 切换为 MCTS——转移边按 Beta 后验采样成败，
+   * UCB1 平衡利用/探索，迭代预算耗尽即读出（任意时刻性）。
+   */
+  attachMctsSearch(options?: {
+    iterations?: number;
+    explorationC?: number;
+    discount?: number;
+  } | null): void;
   /**
    * 8.0：元认知推荐 —— 理性元推理的冷启动序列建议。
    *
@@ -7182,30 +7520,177 @@ declare class MetaCognitiveController {
   private restore;
 }
 //#endregion
-//#region src/world-model.d.ts
+//#region src/core/gaussian-process.d.ts
 /**
- * world-model.ts — 世界模型（自主智能"预见"支柱）
+ * 26.0 高斯过程内核 —— RBF/Matérn 贝叶斯回归 + 期望改进贝叶斯优化
  *
- * 职责：让系统对"外部世界如何运转"建立内部模型，从而具备预见能力——
- * 不是被动等待信号到来，而是提前预判信号到达、负载趋势与类型关联，
- * 为决策引擎、心跳循环与元认知提供前瞻性依据。
+ * 动机: 世界模型的预测校准史（predicted vs actual）是一条**时间序列**——
+ * 「预测系统性偏高/偏低多少」本身随时间漂移（负载周期、模型更替、宿主行为
+ * 变化）。EWPMA / 线性回归只能给点估计，GP 给出**带不确定度的非参数回归**：
  *
- * 能力矩阵：
- * 1. 信号到达规律学习：按类型维护到达时间序列（滑动窗口），
- *    计算到达率、到达间隔分布、时段热度（小时直方图）
- * 2. 到达预测：基于历史到达率 + 时段热度 + 突发趋势，
- *    预测未来窗口内各类型信号的期望到达数（含置信区间）
- * 3. 类型关联矩阵：统计类型对的共现频率（时间邻近窗口内），
- *    识别"A 类型信号常伴随 B 类型信号"的规律，供级联与预取决策
- * 4. 预测校准：记录每次预测与实际到达的偏差，
- *    计算校准误差（MAE），误差过大时降低预测置信度并提示重学
- * 5. 趋势检测：对到达率做线性回归，识别上升/下降/平稳趋势，
- *    上升趋势触发负载预警洞察（交给元认知/目标引擎）
+ *   f ~ GP(m, k),  k(x,x') = σf²·exp(−(x−x')²/2ℓ²)（RBF）
+ *   后验（无噪观测推导，含噪以 σn 加入对角）:
+ *     μ*(x) = k*ᵀ(K+σn²I)⁻¹y
+ *     σ*²(x) = k(x,x) − k*ᵀ(K+σn²I)⁻¹k*
+ *   边际似然（超参 ℓ,σf 由网格搜索极大化）:
+ *     ln p(y|X,θ) = −½yᵀK_y⁻¹y − ½ln|K_y| − n/2·ln(2π)
  *
- * 设计要点：
- * - 全部为纯统计学习，无需 LLM，开销极低，可在每次信号到达时增量更新
- * - 时间序列窗口有界（每类型最多保留 N 个到达时间戳），内存可控
+ *   贝叶斯优化（采集函数 = 期望改进 EI）:
+ *     EI(x) = (μ*−y_best−ξ)·Φ(z) + σ*·φ(z),  z = (μ*−y_best−ξ)/σ*
+ *   解析式与蒙特卡洛口径一致（验证脚本对照），全局搜索与局部精化自动平衡——
+ *   不确定的地方探索（φ 项），确定的地方利用（Φ 项）。
+ *
+ * 数值稳定: Cholesky 分解带抖动升级（1e-10 → 1e-6），对数域计算 LML;
+ *   y 标准化（均值 0 方差 1）、x 归一到 [0,1] 后再拟合，尺度不敏感。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致。
  */
+type GpKernelKind = 'rbf' | 'matern52';
+interface GaussianProcessConfig {
+  /** 协方差核族（缺省 rbf；matern52 假设更粗糙，对阶跃漂移更稳健） */
+  kernel: GpKernelKind;
+  /** 信号标准差 σf（标准化 y 尺度；缺省 1.0） */
+  sigmaF: number;
+  /** 长度尺度 ℓ（x 归一到 [0,1] 后；缺省 0.3） */
+  lengthScale: number;
+  /** 观测噪声标准差 σn（标准化 y 尺度；缺省 0.1） */
+  sigmaN: number;
+  /** 训练点上限（超出丢弃最旧；缺省 64） */
+  maxPoints: number;
+  /** 是否网格搜索 (ℓ, σf) 极大化 LML（缺省 true） */
+  tuneHyperparams: boolean;
+}
+declare const DEFAULT_GP_CONFIG: GaussianProcessConfig;
+/** Cholesky 分解（下三角），失败时抖动逐级升级，全失败返回 undefined */
+declare function choleskyLower(A: number[][]): {
+  L: number[][];
+  jitter: number;
+} | undefined;
+/** 解 L·Lᵀ·x = b（前代 + 回代） */
+declare function solveCholesky(L: number[][], b: number[]): number[];
+/** 标准正态 CDF（Abramowitz-Stegun 7.1.26 有理逼近，|误差| < 7.5e-8） */
+declare function normalCdf(z: number): number;
+/** 标准正态 PDF */
+declare function normalPdf(z: number): number;
+interface GpPredict {
+  /** 后验均值（原始尺度） */
+  mean: number;
+  /** 后验标准差（原始尺度，含观测噪声项） */
+  std: number;
+}
+interface GpFitReport {
+  points: number;
+  lengthScale: number;
+  sigmaF: number;
+  logMarginalLikelihood: number;
+  tuned: boolean;
+}
+/**
+ * 一维高斯过程回归器。
+ *
+ * fit() 内部完成 y 标准化 + x 归一；tuneHyperparams 时在
+ * ℓ ∈ logspace(−2, 0.7, 8) × σf ∈ {0.5, 1, 2} 网格上取 LML 最大者。
+ * predict() 返回原始尺度的均值/标准差（不确定度随距离数据远近伸缩）。
+ */
+declare class GaussianProcess {
+  private config;
+  private xs;
+  private ys;
+  private yMean;
+  private yStd;
+  private xMin;
+  private xMax;
+  private L;
+  private alpha;
+  private fitReport;
+  constructor(config?: Partial<GaussianProcessConfig>);
+  /** 拟合（重复调用为全量重拟合；数据先按 maxPoints 截尾） */
+  fit(xs: number[], ys: number[]): GpFitReport | undefined;
+  /** 后验预测（原始尺度；未拟合时 undefined） */
+  predict(x: number): GpPredict | undefined;
+  /** 最近一次拟合报告 */
+  get fitSummary(): GpFitReport | undefined;
+  /** 训练点数 */
+  get size(): number;
+  private normalize;
+  private kernelValue;
+  private kernelMatrix;
+}
+/**
+ * 期望改进（解析式）。
+ * @param mu 候选点后验均值（越大越好口径）
+ * @param sigma 候选点后验标准差
+ * @param best 已观测最优值
+ * @param xi 改进裕量（缺省 0.01，防过早在噪声上收敛）
+ */
+declare function expectedImprovement(mu: number, sigma: number, best: number, xi?: number): number;
+interface BoSuggestion {
+  x: number;
+  expectedImprovement: number;
+  posteriorMean: number;
+  posteriorStd: number;
+}
+interface BoState {
+  observations: number;
+  bestX?: number;
+  bestY?: number;
+}
+/**
+ * 离散候选集上的贝叶斯优化器（EI 采集）。
+ *
+ * observe(x,y) 登记真实观测；suggest(candidates) 拟合 GP 并返回 EI 最大
+ * 的候选。适合「心跳间期在有限候选点里挑下一个试验参数」的在线调参场景。
+ */
+declare class BayesianOptimizer {
+  private gp;
+  private xs;
+  private ys;
+  private dirty;
+  constructor(config?: Partial<GaussianProcessConfig>);
+  observe(x: number, y: number): void;
+  /** EI 最优候选（观测 < 2 或全部失败时 undefined） */
+  suggest(candidates: number[]): BoSuggestion | undefined;
+  get state(): BoState;
+}
+interface GpCorrection {
+  /** 乘性修正因子（已钳制） */
+  factor: number;
+  /** 因子的后验标准差（原始尺度） */
+  std: number;
+  /** 参与拟合的校准点数 */
+  points: number;
+}
+/** GpSeriesCalibrator 构造参数（26.0 接线口径） */
+interface ConstructorOptionsGpSeries {
+  maxPoints?: number;
+  sigmaN?: number;
+  minPoints?: number;
+  factorClamp?: number;
+  kernel?: GpKernelKind;
+}
+/**
+ * 26.0 接线辅助：序列校准器——「预测/实际」比值的时间序列 GP。
+ *
+ * 世界模型每次校准对账 push(timestamp, ratio)；predictAt(now) 返回当前
+ * 时刻的比值修正（均值 + 不确定度）。数据不足 minPoints 时 undefined
+ * （先验无知 = 不修正，早期零漂移）。内部按归一时间轴拟合，GP 均值函数
+ * 取经验均值——比值无趋势时修正 ≈ 平均比值，有趋势时跟踪漂移。
+ */
+declare class GpSeriesCalibrator {
+  private config;
+  private ts;
+  private vs;
+  private gp;
+  private fittedAt;
+  constructor(config?: ConstructorOptionsGpSeries);
+  /** 登记一次比值观测（actual/predicted） */
+  push(timestamp: number, ratio: number): void;
+  /** 当前时刻的比值修正（点数不足或拟合失败时 undefined） */
+  predictAt(now: number): GpCorrection | undefined;
+  get size(): number;
+}
+//#endregion
+//#region src/world-model.d.ts
 /** 单类型信号的到达统计 */
 interface ArrivalStats {
   type: string;
@@ -7246,6 +7731,16 @@ interface ArrivalPrediction {
     qhat: number;
     calibrationN: number;
     alpha: number;
+  };
+  /**
+   * 26.0：GP 校准修正（attachGpCalibrator 后输出）。factor 为乘性修正
+   * （从校准史的 actual/predicted 比值序列 GP 回归而来，含不确定度）；
+   * expectedCount 已乘 factor，lowerBound/upperBound 已按 std 拓宽。
+   */
+  gp?: {
+    factor: number;
+    std: number;
+    points: number;
   };
 }
 /** 预测校准记录 */
@@ -7330,7 +7825,25 @@ declare class WorldModel {
   private causal?;
   /** 13.0：保形校准引擎（可选挂载） */
   private conformalEngine?;
+  /** 26.0：每类型 GP 校准器（可选挂载；attachGpCalibrator 后惰性创建） */
+  private gpCalibrators?;
   constructor(config?: Partial<WorldModelConfig>);
+  /**
+   * 26.0：挂载 GP 序列校准器开关（幂等）。
+   *
+   * 挂载后每次 settleCalibrations 把 actual/predicted 比值喂入该类型的
+   * GP 时间序列；predictArrivals 的期望乘以 GP 后验均值因子、区间按
+   * 后验标准差拓宽——趋势修正的 1.25/0.75 魔数由「从对账结果学出来的
+   * 修正」接管（校准史充分前 factor 恒 1，早期零漂移）。
+   */
+  attachGpCalibrator(options?: ConstructorOptionsGpSeries): void;
+  private gpOptions?;
+  private gpFor;
+  /** 26.0：GP 校准状态（未挂载返回 undefined） */
+  getGpCalibrationStatus(): Array<{
+    type: string;
+    points: number;
+  }> | undefined;
   /**
    * 5.0：挂载因果内核（幂等）。
    *
@@ -7591,10 +8104,29 @@ declare class CuriosityEngine {
    */
   scanKnowledgeGaps(): KnowledgeGap[];
   /**
+   * 30.0：挂载次模选择器（幂等）。
+   *
+   * top-k 按新颖度选盲区是模函数口径——共享主题的盲区（'generate-code' /
+   * 'review-code' 同含 code）被重复购买。挂载后探索预算按加权覆盖次模
+   * 函数惰性贪心分配（CELF，≥ (1−1/e)·OPT）：同主题第二个候选的边际
+   * 自动衰减，预算优先流向互补的知识结构。未挂载即零漂移（原 top-k）。
+   */
+  attachSubmodularSelector(options?: {
+    coverageStrength?: number;
+  }): void;
+  private submodularSelector?;
+  /** 30.0：任务类型 → token 集（主题 = 共享 token；camelCase 与连字符统一拆分） */
+  private static tokenize;
+  /**
    * 生成探索建议（受预算约束）
    * @param dispatchSlots 本轮心跳的总派发槽位数
    * @param healthScore 系统健康度 0~1（健康时多探索）
    * @returns 探索任务建议列表
+   *
+   * 30.0：挂载次模选择器后，预算内选择从「新颖度 top-k」升级为
+   * 加权覆盖惰性贪心——共享主题的盲区边际自动衰减（CELF 保证
+   * ≥ (1−1/e)·OPT）；主题来自任务类型 token 集。候选不足预算时
+   * 两者结果一致（全部选中）。
    */
   proposeExplorations(dispatchSlots: number, healthScore?: number): ExplorationProposal[];
   /**
@@ -8060,6 +8592,8 @@ interface SymbiosisBridgeHook {
  * 失败由调用侧静默隔离，不阻断主链路。
  */
 type CapacityAdvisor = () => Insight[] | void;
+/** 28.0：尾部风险顾问（心跳 2.7 段消费，缺省零改动） */
+type TailRiskAdvisor = () => Insight[] | void;
 /** 自主心跳配置 */
 interface AutonomyLoopConfig {
   /** 心跳间隔（毫秒） */
@@ -8128,6 +8662,8 @@ declare class AutonomyLoop {
   private symbiosis?;
   /** 25.0：容量规划顾问（可选注入；心跳 2.5 段消费，缺省零改动） */
   private capacityAdvisor?;
+  /** 28.0：尾部风险顾问（可选注入；心跳 2.7 段消费，缺省零改动） */
+  private tailRiskAdvisor?;
   private worldModel?;
   private curiosity?;
   private governor?;
@@ -8158,6 +8694,8 @@ declare class AutonomyLoop {
     symbiosis?: SymbiosisBridgeHook;
     /** 25.0：容量规划顾问（可选，缺省不启用） */
     capacityAdvisor?: CapacityAdvisor;
+    /** 28.0：尾部风险顾问（可选，缺省不启用） */
+    tailRiskAdvisor?: TailRiskAdvisor;
     worldModel?: WorldModel;
     curiosity?: CuriosityEngine;
     governor?: SafetyGovernor;
@@ -9421,6 +9959,12 @@ declare class LLMClient {
    * dispose 后不再复活统计流（清空即终态）。
    */
   private robustStreamFor;
+  /**
+   * 28.0：取模型的原始延迟样本（毫秒）。
+   * 仅配置 robustLatency 时有值（否则 undefined，零开销零漂移）——
+   * 尾部风险监视器（POT/GPD）与 23.0 稳健估计共用同一条流。
+   */
+  getLatencySamples(modelId: string): number[] | undefined;
   /** 获取并发槽位（必要时排队） */
   private acquireSlot;
   /** 释放并发槽位并唤醒队首 */
@@ -10826,6 +11370,8 @@ declare class RobustStream {
   constructor(config?: Partial<RobustStatisticsConfig>);
   observe(x: number): void;
   get size(): number;
+  /** 缓冲副本（28.0 EVT 等下游内核的原料通道；不影响内部状态） */
+  toSamples(): number[];
   read(): RobustRead;
 }
 //#endregion
@@ -11009,6 +11555,265 @@ declare class CapacityPlanner {
   }): CapacityPlan;
   private build;
 }
+//#endregion
+//#region src/core/extreme-value.d.ts
+/**
+ * 28.0 极值理论内核 —— POT/GPD 尾部建模 + Hill 估计 + 风险度量
+ *
+ * 动机: 平均值撒谎，尾部杀人。p99.9 延迟、预算爆仓、失败风暴都住在分布
+ * 的尾部——而经验分位数在尾部**没有数据可看**（1000 个样本里 p99.9 就是
+ * 最大值，纯运气）。极值理论（EVT）不外推整个分布，只外推尾部，且尾部
+ * 有定理保证：
+ *
+ *   Pickands–Balkema–de Haan: 超过阈值 u 的超出量 Y = X − u（足够大的 u）
+ *     收敛于广义帕累托 GPD_ξ,σ:
+ *     H(y) = 1 − (1 + ξy/σ)^{−1/ξ}  (ξ≠0),  1 − e^{−y/σ}  (ξ=0)
+ *   ξ > 0 重尾（无限方差当 ξ > 1/2）, ξ = 0 指数尾, ξ < 0 有界尾
+ *
+ *   POT 分位数（尾部外推，经验分位数的定理化替代）:
+ *     VaR_p = u + (σ̂/ξ̂)·[ (N_u/n · 1/(1−p))^{ξ̂} − 1 ]
+ *   期望损失 ES_p = (VaR_p + σ̂ − ξ̂·u)/(1 − ξ̂)  (ξ̂ < 1)
+ *
+ *   Hill 估计（重尾指数的半参数估计）:
+ *     α̂_k = k / Σ_{i≤k} ln(x_(i)/x_(k+1))  （降序前 k 个）
+ *     jackknife 标准误——「尾部有多重」本身带不确定度
+ *
+ *   GPD MLE: Grimshaw (1993) 剖面似然——把 (ξ,σ) 二维优化化为 θ = ξ/σ
+ *   的一维搜索（σ(θ) = k̄/θ, k̄ = mean ln(1+θy)），θ ∈ (−1/y_max, 2/y_max)
+ *   网格 + 黄金分割细化；θ→0 边界退化为指数 MLE（σ̂ = ȳ）。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致。
+ */
+/** 确定性 PRNG（mulberry32；验证脚本与内核共用同一实现保证可复现） */
+declare function mulberry32(seed: number): () => number;
+/** 经验分位数（最近邻插值；xs 无序） */
+declare function empiricalQuantile(xs: number[], q: number): number;
+interface HillEstimate {
+  /** 尾指数 α̂（1/ξ̂ 口径；α 越小尾越重） */
+  alpha: number;
+  /** ξ̂ = 1/α̂ */
+  xi: number;
+  /** jackknife 标准误 */
+  se: number;
+  /** 使用的尾部序统计量个数 */
+  k: number;
+}
+/**
+ * Hill 尾指数估计（降序取前 k 个对 x_(k+1) 的对数比）。
+ * 适用 ξ > 0（重尾）；数据不足或含非正值时 undefined。
+ */
+declare function hillEstimator(samples: number[], k?: number): HillEstimate | undefined;
+interface GpdFit {
+  /** 形状参数 ξ̂ */
+  xi: number;
+  /** 尺度参数 σ̂ */
+  sigma: number;
+  /** 剖面对数似然 */
+  logLikelihood: number;
+  /** θ = ξ/σ 的收敛点 */
+  theta: number;
+  /** 拟合用超出量个数 */
+  n: number;
+}
+/**
+ * GPD 极大似然（Grimshaw 剖面法）。ys 为严格正的超出量（x − u）。
+ * 数据不足 / 退化时 undefined。
+ */
+declare function fitGpd(ys: number[]): GpdFit | undefined;
+/** GPD 分布函数 */
+declare function gpdCdf(y: number, xi: number, sigma: number): number;
+interface TailQuantiles {
+  /** POT 外推分位数（p ∈ (0,1)，如 0.999） */
+  varP: number;
+  /** 期望损失（尾部均值；ξ̂ ≥ 1 时 undefined——均值不存在） */
+  esP?: number;
+}
+/**
+ * POT 分位数与期望损失。
+ * @param fit GPD 拟合（超出量口径）
+ * @param totalSamples 原始样本总数 n
+ * @param exceedances 超出量个数 N_u
+ * @param u 阈值
+ */
+declare function potQuantiles(fit: GpdFit, totalSamples: number, exceedances: number, u: number, p: number): TailQuantiles | undefined;
+/** 均值超出诊断：E[X − u | X > u] 关于 u 的曲线（GPD 下应为线性，斜率 ξ/(1−ξ)） */
+declare function meanExcessCurve(samples: number[], quantiles: number[]): Array<{
+  u: number;
+  meanExcess: number;
+  count: number;
+}>;
+interface TailRiskConfig {
+  /** 超阈值经验分位（缺省 0.9：最重 10% 样本入 GPD） */
+  thresholdQuantile: number;
+  /** 拟合所需最小超出量（缺省 20） */
+  minExceedances: number;
+  /** 环形缓冲容量（缺省 2048） */
+  maxSamples: number;
+  /** bootstrap 置信区间重采样次数（0 = 不算 CI；缺省 200） */
+  bootstrap: number;
+  /** bootstrap 种子（缺省 20260920） */
+  seed: number;
+}
+declare const DEFAULT_TAIL_RISK_CONFIG: TailRiskConfig;
+interface TailRiskReport {
+  /** 样本量 */
+  samples: number;
+  /** 阈值 u（经验分位） */
+  threshold: number;
+  /** 超出量个数 */
+  exceedances: number;
+  /** GPD 拟合 */
+  gpd: GpdFit;
+  /** p99 外推 */
+  p99: number;
+  /** p99.9 外推（经验分位数看不到的地方） */
+  p999: number;
+  /** p99 期望损失 */
+  es99?: number;
+  /** Hill 尾指数（重尾口径） */
+  hill?: HillEstimate;
+  /** p99.9 的 bootstrap 90% 置信区间 */
+  p999Ci?: {
+    lower: number;
+    upper: number;
+  };
+}
+/**
+ * 尾部风险监视器：延迟/成本样本的环形流 → POT/GPD 拟合 → p99/p99.9/ES。
+ *
+ * 与经验分位数的本质区别：p99.9 不是「样本最大值」（运气）而是定理背书
+ * 的尾部外推，且带 bootstrap 置信区间。样本不足或拟合失败时 fit()
+ * 返回 undefined（诚实拒绝，不输出编造的尾部）。
+ */
+declare class TailRiskMonitor {
+  private config;
+  private buffer;
+  constructor(config?: Partial<TailRiskConfig>);
+  observe(x: number): void;
+  get size(): number;
+  /** 拟合（幂等；失败/数据不足 → undefined） */
+  fit(): TailRiskReport | undefined;
+  /** 原始样本副本（消费方自取；26.0 GP / 23.0 稳健统计可复用同一流） */
+  toSamples(): number[];
+}
+//#endregion
+//#region src/core/submodular.d.ts
+/**
+ * 30.0 次模优化内核 —— 加权覆盖 + 惰性贪心 (CELF) + 曲率修正保证
+ *
+ * 动机: 「探索预算分给谁」是组合选择：好奇心引擎按新颖度 top-k 挑盲区，
+ * 但 top-k 是**模函数**口径——相关知识（共享主题的盲区）被重复购买,
+ * 预算在冗余上浪费。覆盖价值天然**次模**（边际收益递减）：
+ *
+ *   f(A ∪ {x}) − f(A) ≥ f(B ∪ {x}) − f(B),  ∀A ⊆ B, x ∉ B
+ *   （同一主题第二次被覆盖的边际严格更小）
+ *
+ *   加权覆盖函数（本内核的具体化）:
+ *     f(S) = Σ_theme W_t · (1 − Π_{i∈S∩t}(1 − c_{i,t}))
+ *     W_t = 主题权重（新颖度质量），c_{i,t} = 项 i 覆盖主题 t 的强度
+ *
+ *   Nemhauser–Wolsey–Fisher (1978): 单调次模 + 基数约束 k，
+ *     贪心 ≥ (1 − 1/e)·OPT ≈ 0.632·OPT——多项式时间可证的近似比；
+ *     惰性贪心（CELF, Leskovec 2007）与朴素贪心**逐位同解**，评估次数
+ *     数量级下降（上一轮选中的项使其余边际只降不升——次模性的红利）。
+ *
+ *   曲率修正 (Conforti–Cornuéjols): 曲率 c = 1 − min_i min_X 边际(X,i)/f({i}),
+ *     贪心保证收紧为 ≥ (1 − e^{−c})/c·OPT ∈ [0.632, 1]·OPT——
+ *     c 从数据里算出来，不是拍脑袋。
+ *
+ *   预算约束（每项有成本）: 边际贪心 / 边际密度贪心取优——
+ *     ≥ ½(1 − 1/e)·OPT（Khuller–Moss–Naor）。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致。
+ */
+/** 次模目标函数（下标即地面集合） */
+interface SubmodularFunction {
+  groundSize: number;
+  /** f(S)（空集 = 0） */
+  value(selected: ReadonlySet<number>): number;
+  /** 边际增益 f(S ∪ {item}) − f(S)（item ∉ S 时） */
+  marginal(item: number, selected: ReadonlySet<number>): number;
+}
+/**
+ * 加权覆盖函数：f(S) = Σ_t W_t·(1 − Π_{i∈S∩t}(1 − c_{i,t}))。
+ *
+ * 每个主题是概率覆盖集——单调、次模（且归一化时 f(全集) = ΣW_t）。
+ */
+declare class WeightedCoverage implements SubmodularFunction {
+  readonly groundSize: number;
+  private readonly themes;
+  /** item → theme 下标列表（边际查询加速） */
+  private readonly itemThemes;
+  constructor(groundSize: number);
+  /** 登记一个覆盖主题：weight 权重，items 覆盖项 → 强度 c ∈ (0,1] */
+  addTheme(weight: number, covers: ReadonlyMap<number, number>): void;
+  value(selected: ReadonlySet<number>): number;
+  marginal(item: number, selected: ReadonlySet<number>): number;
+  get themeCount(): number;
+}
+/**
+ * 从 token 集合构造覆盖函数（30.0 接线辅助）。
+ *
+ * 主题 = 每个知识项自身的质量 w_i（被覆盖 = 该盲区的知识被获得）；
+ * 项 j 对主题 i 的覆盖强度：自身 1；共享 token 的近邻 coverageStrength。
+ *
+ *   f({i}) = w_i；f({i, j≈i}) = w_i + w_j·(1−c)  —— 冗余第二选的
+ *   边际从 w_j 衰减到 (1−c)·w_j（它 70% 的知识已经被第一个选中者
+ *   「顺带学会」）；互补项边际完整保留 w_k。这是加权覆盖在
+ * 「知识覆盖」语义下的正确形态（token 做主题会让独占 token 的项
+ * 价值归零——语义错误）。
+ */
+declare function coverageFromTokens(items: Array<{
+  tokens: ReadonlyArray<string>;
+  weight: number;
+}>, coverageStrength?: number): WeightedCoverage;
+interface GreedyResult {
+  selected: number[];
+  /** 贪心终止价值（逐选择点记录，任何时刻可读） */
+  values: number[];
+  /** 边际增益序列 */
+  gains: number[];
+  /** marginal 调用次数（CELF 加速比的证据） */
+  evaluations: number;
+}
+/**
+ * 惰性贪心（CELF）：单调次模 + 基数约束 k → ≥ (1−1/e)·OPT。
+ * 与朴素贪心逐位同解（次模性保证队列顶端的陈旧边际只降不升）。
+ */
+declare function lazyGreedy(f: SubmodularFunction, k: number): GreedyResult;
+/**
+ * 预算约束贪心（每项成本不同）：边际贪心与边际密度贪心各跑一遍取优，
+ * 保证 ≥ ½(1−1/e)·OPT（Khuller–Moss–Naor 之「取优」加强）。
+ */
+declare function budgetedGreedy(f: SubmodularFunction, costs: ReadonlyArray<number>, budget: number): GreedyResult & {
+  variant: 'marginal' | 'density';
+};
+/** 穷举最优（验证锚点；C(n,k) 组合枚举，n ≤ ~14 适用） */
+declare function bruteForceBest(f: SubmodularFunction, k: number): {
+  selected: number[];
+  value: number;
+};
+interface SubmodularityAudit {
+  trials: number;
+  /** 违反递减收益不等式的次数（应恒为 0） */
+  violations: number;
+  maxViolation: number;
+}
+/** 随机次模性审计：A ⊆ B、x ∉ B，检验 f(A∪x)−f(A) ≥ f(B∪x)−f(B) */
+declare function submodularityCheck(f: SubmodularFunction, trials?: number, seed?: number): SubmodularityAudit;
+interface CurvatureReport {
+  /** 曲率估计 c ∈ [0,1]（越接近 0 越接近模函数 = 贪心越接近精确） */
+  curvature: number;
+  /** 修正保证因子 (1 − e^{−c})/c ∈ [1−1/e, 1] */
+  guaranteeFactor: number;
+  samples: number;
+}
+/**
+ * 曲率估计（Conforti–Cornuéjols）：c = 1 − min 边际(X,i)/f({i})，
+ * X 取随机子集采样（精确最小是指数级，采样给出 c 的上界估计——
+ * 保守口径：真实曲率 ≤ 估计值，保证因子按估计值陈述仍然成立的方向）。
+ */
+declare function curvatureEstimate(f: SubmodularFunction, samples?: number, seed?: number): CurvatureReport;
 //#endregion
 //#region src/core/resilience.d.ts
 /**
@@ -13158,6 +13963,88 @@ interface SchedulerConfig {
       targetWaitMs?: number;
       defaultScv?: number;
     };
+    /**
+     * 26.0：高斯过程配置（预测校准的非参数贝叶斯升级）。
+     * enabled 时世界模型挂载 GP 序列校准器：每次校准对账的
+     * actual/predicted 比值喂入时间轴 GP，预测期望乘以 GP 后验因子、
+     * 区间按后验标准差拓宽——趋势修正的 1.25/0.75 魔数由从对账结果
+     * 学出的修正接管。校准史不足 minPoints 时因子恒 1（早期零漂移）。
+     * 缺省关闭（零漂移）。
+     */
+    gaussianProcess?: {
+      enabled: boolean;
+      /** 校准点上限（缺省 48） */
+      maxPoints?: number;
+      /** 出修正前的最小校准点数（缺省 6） */
+      minPoints?: number;
+      /** 观测噪声 σn（比值尺度标准化后；缺省 0.15） */
+      sigmaN?: number;
+    };
+    /**
+     * 27.0：卡尔曼滤波配置（KPI 异常判定的假设检验口径）。
+     * enabled 时元认知挂载 KPI 局部线性趋势滤波器：整条历史压进
+     * (level, slope) 充分统计量，突变判定从窗口 z-score 升级为
+     * NIS 门控（新息平方和超出 χ² 分位才报警——99.7% 不该发生的
+     * 才算异常），缓慢漂移由滤波斜率给出早期读数。缺省关闭（零漂移）。
+     */
+    kalmanFilter?: {
+      enabled: boolean;
+      /** 水平过程噪声 q_level（缺省 1e-4） */
+      qLevel?: number;
+      /** 斜率过程噪声 q_slope（缺省 1e-6） */
+      qSlope?: number;
+      /** 观测噪声方差 r（缺省 2e-4） */
+      r?: number;
+      /** NIS 门控上侧概率（缺省 0.997 ≈ 3σ） */
+      gateP?: number;
+      /** 覆盖的 KPI（缺省全部四项） */
+      kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+    };
+    /**
+     * 28.0：极值理论配置（尾部延迟的定理化外推）。
+     * enabled 时心跳 2.7 段对各模型延迟样本拟合 POT/GPD：p99.9 不再
+     * 是「样本最大值」（运气）而是 Pickands–Balkema–de Haan 定理背书的
+     * 尾部外推（含 bootstrap 置信区间），超出目标阈值产出 tail-risk
+     * 洞察。依赖 robustStatistics 启用（延迟样本流与其共用）。缺省关闭。
+     */
+    extremeValue?: {
+      enabled: boolean;
+      /** p99 外推的目标阈值（毫秒；超出产出洞察；缺省 30000） */
+      targetP99Ms?: number;
+      /** 参与拟合的最少延迟样本（缺省 60） */
+      minSamples?: number;
+      /** 超阈值经验分位（缺省 0.9） */
+      thresholdQuantile?: number;
+      /** bootstrap CI 次数（0 关闭；缺省 200） */
+      bootstrap?: number;
+    };
+    /**
+     * 29.0：MCTS 配置（深思搜索的序贯决策升级口径）。
+     * enabled 时 optimizer 深思推荐从 beam search 切换为 UCT：转移边按
+     * Beta 后验采样成败，UCB1 自动平衡利用/探索，迭代预算耗尽即读出
+     * （任意时刻性）；报告口径与 beam search 一致可互查。缺省关闭。
+     */
+    mcts?: {
+      enabled: boolean;
+      /** UCT 迭代预算（缺省 600） */
+      iterations?: number;
+      /** UCB1 探索常数（缺省 √2） */
+      explorationC?: number;
+      /** 每步折扣 γ（缺省 0.95） */
+      discount?: number;
+    };
+    /**
+     * 30.0：次模选择配置（探索预算的组合最优分配）。
+     * enabled 时好奇心探索预算从新颖度 top-k 升级为加权覆盖惰性贪心
+     * （CELF，≥ (1−1/e)·OPT）：共享主题的盲区（如 'generate-code' 与
+     * 'review-code' 同含 code）边际自动衰减，预算优先流向互补知识结构。
+     * 缺省关闭（零漂移——原 top-k）。
+     */
+    submodular?: {
+      enabled: boolean;
+      /** 主题覆盖强度 c ∈ (0,1]（缺省 0.7） */
+      coverageStrength?: number;
+    };
     /** 目标分解器注入（测试离线模拟） */
     decomposer?: GoalDecomposer;
   };
@@ -13486,4 +14373,4 @@ declare const pluginEntry: typeof apply & {
   provide: string[];
 };
 //#endregion
-export { AbstractSkillEntry, AbstractionConfig, AbstractionEngine, AbstractionStats, AccountId, ActionResult, ActiveTask, AdjustmentKnob, AdjustmentReport, AgentBase, AgentGoal, AgentKind, AgentMeta, AgentMode, AgentProposal, AgentReputation, AliasMap, AnytimeEvidenceConfig, AnytimeEvidenceRegistry, AnytimeEvidenceRegistryReport, AnytimeEvidenceStream, AnytimeEvidenceView, AnytimeVerdict, AppError, ArbitrationResult, ArchiveReport, ArmIndex, ArmStats, ArrivalPrediction, ArrivalStats, AssetKind, AuditEntry, AutonomyLoop, AutonomyLoopConfig, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, type BackoffConfig, BayesianEstimate, BeliefAsset, BeliefMarket, BeliefMarketConfig, BeliefOutcome, BeliefPosition, type SettlementReport as BeliefSettlementReport, BeliefStatus, BeliefView, BenchmarkEngine, BenchmarkReport, BenchmarkResult, BenchmarkScenario, BenchmarkStats, BetReceipt, BidOrder, type BreakerProbe, type BreakerState, type BreakerStatus, BuiltinScenarioContext, BwKArmStat, BwKBudgets, BwKCandidateView, BwKConfig, BwKRouter, BwKVerdict, CHANNEL_GROUPS, CalibrationRecord, CalibrationStatus, CanaryState, CancelReport, CapacityAdvisor, CapacityPlan, CapacityPlanner, CapacityPlannerConfig, CascadeHandler, CausalEdge, CausalEdgeEvidence, CausalEffect, CausalExperiment, CausalExplorationRecord, CausalKernel, CausalKernelConfig, CausalNode, CausalNodeKind, CausalQuestion, CellularSheaf, ChangeEntry, ChangePayload, ChannelGroup, ChatMessage, ChatOptions, CircuitBreaker, type CircuitBreakerConfig, CircuitBreakerInfo, CircuitBreakerRegistry, CircuitState, ClusterNodeConfig, ClusterStatus, CoalitionValueFunction, CognitiveEconomy, CognitiveMarket, ConfidenceSequenceView, Config, ConfigError, ConformalInterval, ConformalIntervalConfig, ConformalIntervalEngine, ConformalStatus, ConsensusLogEntry, ContributorProb, CounterfactualInsight, CoverageDriftMonitor, CoverageDriftView, CryptoEngine, CryptoError, CryptoResult, CuriosityEngine, CuriosityEngineConfig, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, Decision, DecisionAction, DecisionAuditEntry, DecisionEngine, DecisionEngineConfig, DecisionEngineStats, DecisionFeedback, DecisionInsightRecord, DecisionMode, DeliberationConfig, DeliberationEngine, DeliberationResult, type SettlementReport$1 as DeliberationSettlementReport, SettlementReport$1 as SettlementReport, DesignedExperiment, DistillationReport, DistilledStrategy, DistributedSync, DistributionReport, EBHEntry, EFEAction, EFEEvaluation, EProcess, EProcessSide, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EncryptedField, EncryptedFile, EncryptionConfig, EnergyLedger, EnergySankeyReport, EnergyTransfer, type ErrorClassification, EvaluationReport, EvidenceCensus, EvidenceCensusLayer, type EvidenceView, EvolutionCycleOutcome, EvolutionCycleReport, EvolutionReport, EvolutionStatusReport, EvolverAgent, EvolverAgentConfig, EvolverEfficiencySummary, EvolverMetrics, ExecutionError, ExecutionGrant, ExecutionPlan, ExperienceLookup, ExperimentLedgerEntry, ExplorationDispatcher, ExplorationProposal, ExplorationRecord, ExportOptions, FailureRecord, FisherGeometryEngine, FreeEnergyConfig, FreeEnergyEngine, GittinsConfig, GittinsIndexTable, GittinsSnapshot, Goal, GoalDecomposer, GoalEngine, GoalEngineConfig, GoalStatus, GoalSubtask, GovernanceAuditEntry, GovernanceGate, GovernanceVerdict, GovernedAction, GovernorPersistState, GrantOutcome, Habit, HealthReport, HierarchicalPrior, HomeostasisBands, HomeostasisStatus, HotReloadConfig, HotReloadEngine, HotReloadEvent, HotReloadStatus, IAgent, IMemoryStore, IMetaCognitiveController, INCINERATOR, IOptimizer, IPolicyEvolver, IReflector, ISandbox, ISelfModel, ImaginationReport, ImprovementEvidence, IndexArm, IndexScheduler, InformationGeometryConfig, InformationGeometryReport, Insight, InterventionRecord, JsonMemoryBackend, JudgeMetric, JudgeModel, KnobEffectiveness, KnowledgeAsset, KnowledgeFrontier, KnowledgeGap, KnowledgeProvider, KpiAnomaly, KpiCollector, KpiSnapshot, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMClientConfig, LLMError, LLMResponse, LedgerConfig, LedgerSnapshot, LedgerStats, Lesson, LessonExtractor, LessonProvider, ListError, ListingView, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, ManagedAgent, MapElitesArchive, MapElitesConfig, MarketConfig, MarketSnapshot, MemoryAgent, MemoryAgentConfig, MemoryBackend, MemoryCondition, MemoryEdge, MemoryError, type MemoryEvidence, MemoryGraph, MemoryLayer, MemoryMaintainer, MemoryMatchContext, MemoryMetrics, MemoryNode, MemoryQualitySummary, MemorySearchHit, MemoryStore, MentalReport, MergeStrategy, MetaCognitionBridge, MetaCognitionConfig, MetaCognitionEngine, MetaCognitiveController, MetaControllerConfig, MetaControllerState, MetaDecision, MetaStabilitySummary, MetareasoningConfig, MetricForecast, MigrationConflict, MigrationPackage, MigrationRecordVersion, MigrationReport, MigrationTool, ModelAgent, ModelConfig, ModelLongTermProfile, ModelRuntimeStatus, ModelScheduler, ModelSchedulerConfig, ModelScoreInput, ModelTaskStats, MonitorStatus, NaturalMutationResult, NetworkError, NodeResult, NodeRole, NodeRunner, OperationalMetrics, OpportunityStopper, OptimalStoppingConfig, Optimizer, OptimizerAgent, OptimizerAgentConfig, OptimizerConfig, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, Perception, PerformanceThreshold, PlacementOutcome, PlanExecutionResult, PlanNode, PluginVersion, Policy, PolicyEvaluationMetrics, PolicyEvolutionBridge, PolicyEvolver, PolicyEvolverConfig, PolicyEvolverStatus, PolicyFitness, PolicyMatchContext, PolicyRule, PolicySimulator, PrivacyAccountant, PrivacyConfig, PrivacyRelease, PrivacyStatus, ProactiveRisk, ProceduralAction, ProceduralCondition, ProceduralConditionDimension, ProceduralMemory, ProgressBroadcaster, ProgressEvent, ProposalKind, QualityDiversityMetrics, QualityTrendPoint, QueueMetrics, RDP_ORDER, RaftConfig, RaftEngine, RationalMetareasoner, RecommendedAdjustment, RecordDecisionFeedbackParams, RecordFailureParams, RecordSuccessParams, ReflectionEngine, ReflectionEngineConfig, ReflectionVerdict, Reflector, ReflectorConfig, ReputationTier, type RetryClass, RiskControlResult, Rng, RobustMethod, RobustRead, RobustStatisticsConfig, RobustStream, RollbackResult, RootCauseCategory, RoyaltyPayout, RuntimeEvent, RuntimeVerifier, RuntimeVerifierStatus, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafeEnvelopeInfo, SafetyGovernor, SafetyGovernorConfig, SafetyMonitor, SafetyPattern, SafetySpec, Sandbox, SandboxConfig, SandboxTask, SankeyLink, SankeyNode, SankeyTotals, ScalarGeneKey, SchedulerConfig, SchedulerPolicyParams, SchedulerService, SchedulerTaskContext, SchedulingInsight, ScientistConfig, ScientistMind, SelfModel, SelfModelCollectors, SelfModelConfig, SemanticConclusion, SemanticCondition, SemanticConditionDimension, SemanticMemory, Sentinel, SentinelConfig, SentinelStatus, ShapleyAttribution, ShapleyAttributionEngine, ShapleyConfig, ShapleyReport, SheafAnchorSpec, SheafConsensusReport, SheafEdgeSpec, SheafVertexSpec, Signal, SignalBatch, SignalEnrichment, SignalHistoryStats, SignalSourceConfig, SimCalibration, SimCalibrationEntry, SimModelStatus, SinkhornConfig, SinkhornResult, Skill, SqliteMemoryBackend, StepEvaluation, StoppingVerdict, StrategistVerdict, StrategyApplier, StrategyBehaviorDim, StrategyEvolutionConfig, StrategyEvolutionEngine, StrategyGenes, StrategyGenesLike, StrategyGenome, StrategyPerformanceSummary, SubtaskDispatcher, SuccessfulPlanRecord, SymbiosisBridge, SymbiosisBridgeConfig, SymbiosisBridgeHook, SymbiosisConfig, SymbiosisRuntime, SymbiosisTickReport, SyncBatch, SyncConflict, SyncLogEntry, SyncNodeConfig, SyncState, SynergyPair, SystemMetrics, SystemStabilitySummary, TREASURY, TaskExecutor, TaskExecutorConfig, TaskPatternMemory, TenantConfig, TenantManager, TenantRegistry, TenantRuntime, TheoristConfig, TheoristEngine, Theory, TheoryFrontier, TheoryMember, TheoryPrediction, TickReport, TimeoutError, ToolDefinition, ToolError, ToolRegistry, TopicNode, TradeListener, TradeRecord, TransferError, TransferReceipt, TransitionPosterior, TransportDriftConfig, TransportDriftEvent, TransportDriftMonitor, TransportDriftView, TrendMetric, TrendSummary, TuningAction, TypeCorrelation, VariationalReport, ViolationReport, ViolationSeverity, WorldModel, WorldModelConfig, WorldModelSummary, abortableSleep, apply, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, brussOddsIndex, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, catoniMean, cholesky, classifyError, coalitionValue, computeHomeostasis, conditionNumber, conformalQuantile, cosineSimilarity, createBaselinePolicy, createMemoryBackend, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, dpHistogram, dpMeanClamped, dpValue, eBenjaminiHochberg, emptyMemoryStore, erlangC, evaluateMemoryCondition, evidenceRankScore, extractReplayTasks, fixedSampleUpperBound, gaussianNoise, generateAdversarialTasks, initEvidence, isTradeListener, kingmanWq, laplaceNoise, lessonsToInsights, listingsOf, littleCheck, lnGamma, madSigma, matchesMemoryConditions, medianOfMeans, modelAgentId, modelSignalKey, name, normalizePolicyParams, observeEvidence, overlapSheaf, parseJSONLoose, participationRatio, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, prophetValue, quantileSorted, rdpToEpsilon, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, shrinkageCovariance, sinkhorn, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, toSparseVector, tokenizeChinese, wasserstein1D, wassersteinBarycenter1D, wilsonLowerBound };
+export { AbstractSkillEntry, AbstractionConfig, AbstractionEngine, AbstractionStats, AccountId, ActionResult, ActiveTask, AdjustmentKnob, AdjustmentReport, AgentBase, AgentGoal, AgentKind, AgentMeta, AgentMode, AgentProposal, AgentReputation, AliasMap, AnytimeEvidenceConfig, AnytimeEvidenceRegistry, AnytimeEvidenceRegistryReport, AnytimeEvidenceStream, AnytimeEvidenceView, AnytimeVerdict, AppError, ArbitrationResult, ArchiveReport, ArmIndex, ArmStats, ArrivalPrediction, ArrivalStats, AssetKind, AuditEntry, AutonomyLoop, AutonomyLoopConfig, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, type BackoffConfig, BayesianEstimate, BayesianOptimizer, BeliefAsset, BeliefMarket, BeliefMarketConfig, BeliefOutcome, BeliefPosition, type SettlementReport as BeliefSettlementReport, BeliefStatus, BeliefView, BenchmarkEngine, BenchmarkReport, BenchmarkResult, BenchmarkScenario, BenchmarkStats, BetReceipt, BidOrder, BoState, BoSuggestion, type BreakerProbe, type BreakerState, type BreakerStatus, BuiltinScenarioContext, BwKArmStat, BwKBudgets, BwKCandidateView, BwKConfig, BwKRouter, BwKVerdict, CHANNEL_GROUPS, CalibrationRecord, CalibrationStatus, CanaryState, CancelReport, CapacityAdvisor, CapacityPlan, CapacityPlanner, CapacityPlannerConfig, CascadeHandler, CausalEdge, CausalEdgeEvidence, CausalEffect, CausalExperiment, CausalExplorationRecord, CausalKernel, CausalKernelConfig, CausalNode, CausalNodeKind, CausalQuestion, CellularSheaf, ChangeEntry, ChangePayload, ChannelGroup, ChatMessage, ChatOptions, CircuitBreaker, type CircuitBreakerConfig, CircuitBreakerInfo, CircuitBreakerRegistry, CircuitState, ClusterNodeConfig, ClusterStatus, CoalitionValueFunction, CognitiveEconomy, CognitiveMarket, ConfidenceSequenceView, Config, ConfigError, ConformalInterval, ConformalIntervalConfig, ConformalIntervalEngine, ConformalStatus, ConsensusLogEntry, ConstructorOptionsGpSeries, ContributorProb, CounterfactualInsight, CoverageDriftMonitor, CoverageDriftView, CryptoEngine, CryptoError, CryptoResult, CuriosityEngine, CuriosityEngineConfig, CurvatureReport, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_GP_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_TAIL_RISK_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_TREND_FILTER_CONFIG, DEFAULT_UCT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, Decision, DecisionAction, DecisionAuditEntry, DecisionEngine, DecisionEngineConfig, DecisionEngineStats, DecisionFeedback, DecisionInsightRecord, DecisionMode, DeliberationConfig, DeliberationEngine, DeliberationResult, type SettlementReport$1 as DeliberationSettlementReport, SettlementReport$1 as SettlementReport, DesignedExperiment, DistillationReport, DistilledStrategy, DistributedSync, DistributionReport, EBHEntry, EFEAction, EFEEvaluation, EProcess, EProcessSide, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EncryptedField, EncryptedFile, EncryptionConfig, EnergyLedger, EnergySankeyReport, EnergyTransfer, type ErrorClassification, EvaluationReport, EvidenceCensus, EvidenceCensusLayer, type EvidenceView, EvolutionCycleOutcome, EvolutionCycleReport, EvolutionReport, EvolutionStatusReport, EvolverAgent, EvolverAgentConfig, EvolverEfficiencySummary, EvolverMetrics, ExecutionError, ExecutionGrant, ExecutionPlan, ExperienceLookup, ExperimentLedgerEntry, ExplorationDispatcher, ExplorationProposal, ExplorationRecord, ExportOptions, FailureRecord, FisherGeometryEngine, FreeEnergyConfig, FreeEnergyEngine, GaussianProcess, GaussianProcessConfig, GittinsConfig, GittinsIndexTable, GittinsSnapshot, Goal, GoalDecomposer, GoalEngine, GoalEngineConfig, GoalStatus, GoalSubtask, GovernanceAuditEntry, GovernanceGate, GovernanceVerdict, GovernedAction, GovernorPersistState, GpCorrection, GpFitReport, GpKernelKind, GpPredict, GpSeriesCalibrator, GpdFit, GrantOutcome, GreedyResult, Habit, HealthReport, HierarchicalPrior, HillEstimate, HomeostasisBands, HomeostasisStatus, HotReloadConfig, HotReloadEngine, HotReloadEvent, HotReloadStatus, IAgent, IMemoryStore, IMetaCognitiveController, INCINERATOR, IOptimizer, IPolicyEvolver, IReflector, ISandbox, ISelfModel, ImaginationReport, ImprovementEvidence, IndexArm, IndexScheduler, InformationGeometryConfig, InformationGeometryReport, Insight, InterventionRecord, JsonMemoryBackend, JudgeMetric, JudgeModel, KalmanFilter, KalmanModel, KalmanStepResult, KnobEffectiveness, KnowledgeAsset, KnowledgeFrontier, KnowledgeGap, KnowledgeProvider, KpiAnomaly, KpiCollector, KpiSnapshot, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMClientConfig, LLMError, LLMResponse, LedgerConfig, LedgerSnapshot, LedgerStats, Lesson, LessonExtractor, LessonProvider, ListError, ListingView, LocalLinearTrendFilter, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, ManagedAgent, MapElitesArchive, MapElitesConfig, MarketConfig, MarketSnapshot, MctsChildStat, MctsDomain, MctsResult, MemoryAgent, MemoryAgentConfig, MemoryBackend, MemoryCondition, MemoryEdge, MemoryError, type MemoryEvidence, MemoryGraph, MemoryLayer, MemoryMaintainer, MemoryMatchContext, MemoryMetrics, MemoryNode, MemoryQualitySummary, MemorySearchHit, MemoryStore, MentalReport, MergeStrategy, MetaCognitionBridge, MetaCognitionConfig, MetaCognitionEngine, MetaCognitiveController, MetaControllerConfig, MetaControllerState, MetaDecision, MetaStabilitySummary, MetareasoningConfig, MetricForecast, MigrationConflict, MigrationPackage, MigrationRecordVersion, MigrationReport, MigrationTool, ModelAgent, ModelConfig, ModelLongTermProfile, ModelRuntimeStatus, ModelScheduler, ModelSchedulerConfig, ModelScoreInput, ModelTaskStats, MonitorStatus, NaturalMutationResult, NetworkError, NodeResult, NodeRole, NodeRunner, OperationalMetrics, OpportunityStopper, OptimalStoppingConfig, Optimizer, OptimizerAgent, OptimizerAgentConfig, OptimizerConfig, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, Perception, PerformanceThreshold, PlacementOutcome, PlanExecutionResult, PlanNode, PluginVersion, Policy, PolicyEvaluationMetrics, PolicyEvolutionBridge, PolicyEvolver, PolicyEvolverConfig, PolicyEvolverStatus, PolicyFitness, PolicyMatchContext, PolicyRule, PolicySimulator, PrivacyAccountant, PrivacyConfig, PrivacyRelease, PrivacyStatus, ProactiveRisk, ProceduralAction, ProceduralCondition, ProceduralConditionDimension, ProceduralMemory, ProgressBroadcaster, ProgressEvent, ProposalKind, QualityDiversityMetrics, QualityTrendPoint, QueueMetrics, RDP_ORDER, RaftConfig, RaftEngine, RationalMetareasoner, RecommendedAdjustment, RecordDecisionFeedbackParams, RecordFailureParams, RecordSuccessParams, ReflectionEngine, ReflectionEngineConfig, ReflectionVerdict, Reflector, ReflectorConfig, ReputationTier, type RetryClass, RiskControlResult, Rng, RobustMethod, RobustRead, RobustStatisticsConfig, RobustStream, RollbackResult, RootCauseCategory, RoyaltyPayout, RuntimeEvent, RuntimeVerifier, RuntimeVerifierStatus, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafeEnvelopeInfo, SafetyGovernor, SafetyGovernorConfig, SafetyMonitor, SafetyPattern, SafetySpec, Sandbox, SandboxConfig, SandboxTask, SankeyLink, SankeyNode, SankeyTotals, ScalarGeneKey, SchedulerConfig, SchedulerPolicyParams, SchedulerService, SchedulerTaskContext, SchedulingInsight, ScientistConfig, ScientistMind, SelfModel, SelfModelCollectors, SelfModelConfig, SemanticConclusion, SemanticCondition, SemanticConditionDimension, SemanticMemory, Sentinel, SentinelConfig, SentinelStatus, ShapleyAttribution, ShapleyAttributionEngine, ShapleyConfig, ShapleyReport, SheafAnchorSpec, SheafConsensusReport, SheafEdgeSpec, SheafVertexSpec, Signal, SignalBatch, SignalEnrichment, SignalHistoryStats, SignalSourceConfig, SimCalibration, SimCalibrationEntry, SimModelStatus, SinkhornConfig, SinkhornResult, Skill, SmoothedPoint, SqliteMemoryBackend, StepEvaluation, StoppingVerdict, StrategistVerdict, StrategyApplier, StrategyBehaviorDim, StrategyEvolutionConfig, StrategyEvolutionEngine, StrategyGenes, StrategyGenesLike, StrategyGenome, StrategyPerformanceSummary, SubmodularFunction, SubmodularityAudit, SubtaskDispatcher, SuccessfulPlanRecord, SymbiosisBridge, SymbiosisBridgeConfig, SymbiosisBridgeHook, SymbiosisConfig, SymbiosisRuntime, SymbiosisTickReport, SyncBatch, SyncConflict, SyncLogEntry, SyncNodeConfig, SyncState, SynergyPair, SystemMetrics, SystemStabilitySummary, TREASURY, TailQuantiles, TailRiskAdvisor, TailRiskConfig, TailRiskMonitor, TailRiskReport, TaskExecutor, TaskExecutorConfig, TaskPatternMemory, TenantConfig, TenantManager, TenantRegistry, TenantRuntime, TheoristConfig, TheoristEngine, Theory, TheoryFrontier, TheoryMember, TheoryPrediction, TickReport, TimeoutError, ToolDefinition, ToolError, ToolRegistry, TopicNode, TradeListener, TradeRecord, TransferError, TransferReceipt, TransitionPosterior, TransportDriftConfig, TransportDriftEvent, TransportDriftMonitor, TransportDriftView, TrendFilterConfig, TrendMetric, TrendStepRead, TrendSummary, TuningAction, TypeCorrelation, UctConfig, UctSearch, VariationalReport, ViolationReport, ViolationSeverity, WeightedCoverage, WorldModel, WorldModelConfig, WorldModelSummary, abortableSleep, apply, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, brussOddsIndex, bruteForceBest, budgetedGreedy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, catoniMean, chiSquareQuantile, cholesky, choleskyLower, classifyError, coalitionValue, computeHomeostasis, conditionNumber, conformalQuantile, cosineSimilarity, coverageFromTokens, createBaselinePolicy, createMemoryBackend, curvatureEstimate, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, dpHistogram, dpMeanClamped, dpValue, eBenjaminiHochberg, empiricalQuantile, emptyMemoryStore, erlangC, evaluateMemoryCondition, evidenceRankScore, expectedImprovement, extractReplayTasks, fitGpd, fixedSampleUpperBound, gaussianNoise, generateAdversarialTasks, gpdCdf, hillEstimator, initEvidence, isTradeListener, kingmanWq, laplaceNoise, lazyGreedy, lessonsToInsights, listingsOf, littleCheck, lnGamma, madSigma, matchesMemoryConditions, meanExcessCurve, medianOfMeans, modelAgentId, modelSignalKey, mulberry32, name, normalCdf, normalPdf, normalizePolicyParams, observeEvidence, overlapSheaf, parseJSONLoose, participationRatio, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, potQuantiles, prophetValue, quantileSorted, randomWalkSteadyState, rdpToEpsilon, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, shrinkageCovariance, sinkhorn, solveCholesky, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, submodularityCheck, toSparseVector, tokenizeChinese, wasserstein1D, wassersteinBarycenter1D, wilsonLowerBound };

@@ -5,7 +5,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-339933?logo=nodedotjs&logoColor=white)](#installation)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-8250df)](https://github.com/topics/dsh-plugin)
 
-> **Proactive Intelligence scheduling plugin** — a multi-model collaborative scheduling system for the DeepSeek Harness (DSH) ecosystem: it perceives, decides, and evolves on its own, with a built-in **Scientist / Theorist dual mind**, a **cognitive energy symbiosis economy**, and **eighteen phase-change kernels (evidence → geometry & topology layer: anytime-valid / conformal / quality-diversity / formal safety / fair attribution / optimal transport / information geometry / optimal stopping / sheaf consensus)**.
+> **Proactive Intelligence scheduling plugin** — a multi-model collaborative scheduling system for the DeepSeek Harness (DSH) ecosystem: it perceives, decides, and evolves on its own, with a built-in **Scientist / Theorist dual mind**, a **cognitive energy symbiosis economy**, and **twenty-eight phase-change kernels (evidence → geometry-topology / genesis / prophet layers: anytime-valid / conformal / optimal transport / information geometry / sheaf consensus / Gittins / robust statistics / differential privacy / capacity planning / Gaussian process / Kalman filtering / extreme value theory / Monte-Carlo tree search / submodular optimization)**.
 >
 > English | [中文](./README.md)
 
@@ -33,7 +33,7 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 │  Operational: signal→decide→execute→reflect 10-step pipeline │
 │  Evolution: policy evolver + sandbox + canary (policy/)      │
 │  Meta outer: self-model → conservative tune → rollback (meta/)│
-├─ Kernel Stack (core/) — eighteen kernels, 3.0 → 20.0 ───────┤
+├─ Kernel Stack (core/) — twenty-eight kernels, 3.0 → 30.0 ──┤
 │  Evidence 3.0  Resilience 4.0  Causal 5.0  Free-Energy 6.0   │
 │  Deliberation 7.0  Metareasoning 8.0  Abstraction 9.0        │
 │  Scientist 10.0  Theorist 11.0                               │
@@ -41,6 +41,10 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 │  Runtime Verification 15.0  Shapley Attribution 16.0          │
 │  Optimal Transport 17.0  Info-Geometry 18.0                  │
 │  Optimal Stopping 19.0  Sheaf Consensus 20.0                  │
+│  Gittins 21.0  Budget Knapsack 22.0   (genesis layer)         │
+│  Robust Stats 23.0  Diff-Privacy 24.0  Capacity 25.0          │
+│  Gaussian Process 26.0  Kalman 27.0  Extreme Value 28.0       │
+│  MCTS 29.0  Submodular 30.0            (prophet layer)        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,7 +72,21 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 - **Optimal-stopping kernel** ([core/optimal-stopping.ts](./src/core/optimal-stopping.ts)): prophet inequality + backward induction — **waiting has a mathematical price**. Exact stopping-value recursion over the empirical distribution (V_k = E[max(X, V_{k+1})]), prophet benchmark (exact order-statistics E[max]), Samuel-Cahn single-threshold rule (≥ ½ of prophet for any distribution), secretary 1/e rule and Bruss' odds algorithm; once mounted on decision-engine Rule C, **defer/execute for costly signals upgrades from the "urgency < 0.3" magic number to a continuation-value verdict** (act iff current value ≥ V_{horizon} — mathematically optimal to grab the slot, otherwise waiting pays)
 - **Sheaf-consensus kernel** ([core/sheaf-consensus.ts](./src/core/sheaf-consensus.ts)): cellular-sheaf Laplacian + harmonic consensus — **the shape of disagreement is visible**. "Who must agree with whom, on which claims" becomes a first-class mathematical object (vertex stalks + edge restriction maps); weighted harmonic consensus (dual solve: soft mediation + best fit on the perfect-consensus manifold) reports the consensus assignment, per-source walk-back distances (outlier localization), and **structural-obstruction detection** — under circular hard constraints with contradictory observations (0.9/0.1/0.5) averaging says a happy 0.5, this kernel says "no solution exists, resolve the contradiction first"; the `sheaf_consensus` Tool lets the LLM call structured belief fusion at reasoning time
 
-### Kernel Stack (core/, 3.0 → 20.0)
+### Genesis Layer (21.0 → 25.0)
+- **Index-scheduling kernel** ([core/index-scheduling.ts](./src/core/index-scheduling.ts)): exact Gittins index computation — **model scheduling gets its first provably-optimal policy**. Retired-MDP backward induction over the (α,β) triangle yields exact discounted-bandit optimal indices; the learning premium ν − p̂ self-terminates as evidence accumulates (no hand-tuned exploration budget)
+- **Budget-optimal routing kernel** ([core/bandit-knapsack.ts](./src/core/bandit-knapsack.ts)): Bandits with Knapsacks — **shadow prices emerge endogenously from budget scarcity**. Empirical-Bernstein optimism for quality, feasibility from remaining-budget-per-round, the shadow price λ solved live from a mixed-LP vertex of infeasible-high-quality arms vs selected arms
+- **Robust-statistics kernel** ([core/robust-statistics.ts](./src/core/robust-statistics.ts)): Catoni estimator + median-of-means — **heavy-tailed latencies no longer kidnap the mean**. Sub-Gaussian confidence under finite variance only (5% contamination at 1e6 magnitude drags the plain mean to 50000, Catoni holds it at 2.69 — four orders of magnitude of robustness); per-model latency streams adapt mean → MoM → Catoni with sample size
+- **Differential-privacy kernel** ([core/differential-privacy.ts](./src/core/differential-privacy.ts)): Laplace/Gaussian mechanisms + Rényi-DP accounting — **telemetry never exposes individuals**. Halving budget allocation never overspends (Σε ≤ ε), ids/timestamps auto-skipped, analytic RDP→(ε,δ) conversion
+- **Capacity-planning kernel** ([core/capacity-planning.ts](./src/core/capacity-planning.ts)): Erlang-C / Kingman inversion — **concurrency limits are computed from queueing theory**. Heartbeat phase 2.5 feeds the world-model predicted arrival rate × robust mean latency into the planner, inverting the minimum concurrency that holds the target wait; honestly returns infeasible when ρ ≥ 1
+
+### Prophet Layer (26.0 → 30.0)
+- **Gaussian-process kernel** ([core/gaussian-process.ts](./src/core/gaussian-process.ts)): RBF/Matérn Bayesian regression + expected improvement — **prediction bias itself becomes a learnable curve**. The world-model calibration history's actual/predicted ratio series feeds a GP regression that returns a multiplicative correction factor with uncertainty (the 1.25/0.75 trend magic numbers are taken over by learned corrections); the analytic-EI acquisition function (verified against Monte Carlo) powers discrete-candidate Bayesian optimization
+- **Kalman-filter kernel** ([core/kalman-filter.ts](./src/core/kalman-filter.ts)): local-linear-trend filtering + RTS smoothing + NIS gating — **anomaly detection upgrades from heuristics to a hypothesis test**. The full KPI history compresses into (level, slope) sufficient statistics; an alarm fires only when the normalized innovation squared exceeds the χ²(1) 99.7% quantile; slow drifts get early readings from the filtered slope; the random-walk steady state matches the closed form P∞=(√(q²+4qr)−q)/2 exactly
+- **Extreme-value-theory kernel** ([core/extreme-value.ts](./src/core/extreme-value.ts)): POT/GPD + Hill estimation — **p99.9 is no longer the luck of the sample maximum**. Pickands–Balkema–de Haan guarantees threshold exceedances converge to a GPD; Grimshaw profile likelihood reduces the 2-D MLE to a 1-D search; tail quantiles are extrapolated with theorem backing (plus bootstrap CIs); heartbeat phase 2.7 assesses latency tail risk and emits tail-risk insights beyond target
+- **Monte-Carlo-tree-search kernel** ([core/mcts.ts](./src/core/mcts.ts)): UCT + discounted returns — **the allocation of search budget itself becomes a sequential decision**. Transition edges sample Bernoulli outcomes from Beta posteriors, UCB1 balances exploit/explore, node-local returns backpropagate without depth bias, and any exhausted iteration/time budget reads out immediately (anytime property); the deliberation engine's `searchMcts` cross-checks beam search under one shared report format
+- **Submodular-optimization kernel** ([core/submodular.ts](./src/core/submodular.ts)): weighted coverage + lazy greedy (CELF) — **exploration-budget allocation gets its first approximation-ratio guarantee** (≥ (1−1/e)·OPT, Nemhauser–Wolsey–Fisher). Knowledge items are themes of their own with similar items partially covering them: a redundant second pick's marginal decays to (1−c)·w, complementary blind spots get picked first; a curvature refinement tightens the guarantee to (1−e^−c)/c·OPT
+
+### Kernel Stack (core/, 3.0 → 30.0)
 | Kernel | Version | In one line |
 |------|------|--------|
 | evidence.ts | 3.0 | Unified evidence language: Wilson bounds / time decay / evidence ranking, spread across all memory layers |
@@ -89,6 +107,16 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 | information-geometry.ts | 18.0 | Information geometry: Fisher-metric natural mutation + KL trust region (see above) |
 | optimal-stopping.ts | 19.0 | Optimal stopping: prophet inequality + backward induction + opportunity stopper (see above) |
 | sheaf-consensus.ts | 20.0 | Sheaf consensus: cellular-sheaf Laplacian + harmonic consensus + obstruction detection (see above) |
+| index-scheduling.ts | 21.0 | Index scheduling: exact Gittins index (retired-MDP triangle backward induction), provably-optimal model scheduling (see above) |
+| bandit-knapsack.ts | 22.0 | Budget-optimal routing: Bandits with Knapsacks, shadow prices from budget scarcity (see above) |
+| robust-statistics.ts | 23.0 | Robust statistics: Catoni + MoM, sub-Gaussian bounds under heavy tails (see above) |
+| differential-privacy.ts | 24.0 | Differential privacy: Laplace/Gaussian mechanisms + Rényi-DP accounting (see above) |
+| capacity-planning.ts | 25.0 | Capacity planning: Erlang-C / Kingman minimum-concurrency inversion + Little's-law check (see above) |
+| gaussian-process.ts | 26.0 | Gaussian process: RBF/Matérn regression + EI Bayesian optimization, learnable prediction bias (see above) |
+| kalman-filter.ts | 27.0 | Kalman filtering: local-linear-trend + RTS smoothing + NIS gating (see above) |
+| extreme-value.ts | 28.0 | Extreme value theory: POT/GPD tail extrapolation + Hill estimation + risk measures (see above) |
+| mcts.ts | 29.0 | Monte-Carlo tree search: UCT + discounted returns + anytime readout (see above) |
+| submodular.ts | 30.0 | Submodular optimization: weighted coverage + CELF lazy greedy + curvature-refined guarantee (see above) |
 
 ### Cognitive Energy Symbiosis Economy (symbiosis/)
 - **Energy ledger** (ledger.ts): cognitive energy cannot be forged — global conservation via double-entry bookkeeping, every transfer sha256-chained for audit and replay, a Gini coefficient measures ecosystem health
@@ -202,7 +230,7 @@ Other common operations:
 - `manage_autonomy`: `start` / `stop` / `tick` / `kill-switch` / `revive` / `reset-circuit`
 - `query_memory`: `world-model` / `curiosity` / `governance` / `patterns` / `lessons` / `keys`, etc.
 
-## Offline Verification (31, zero API keys)
+## Offline Verification (35, zero API keys)
 
 Every kernel and subsystem has an offline end-to-end verification script (`node scripts/verify-*.mjs`):
 
@@ -215,6 +243,8 @@ node scripts/verify-anytime-evidence.mjs # Anytime evidence: CS time-uniformity 
 node scripts/verify-shapley.mjs        # Shapley: four axioms / confidence intervals / synergy detection
 node scripts/verify-frontier-kernels.mjs # Geometry & topology 17.0-20.0: analytic-solution checks / affine invariance / prophet 2/3 / sheaf obstruction
 node scripts/verify-frontier-wiring.mjs # Geometry & topology wiring: real engines end-to-end (drift insight / natural mutation / mathematical defer)
+node scripts/verify-prophet-kernels.mjs # Prophet layer 26.0-30.0: GP interpolation / EI-vs-MC / Riccati closed form / POT analytic quantile / UCT convergence / CELF-vs-brute-force
+node scripts/verify-prophet-wiring.mjs  # Prophet wiring: real engines end-to-end (GP calibration / NIS-gate insight / latency samples to tail extrapolation / UCT cross-check / complementary blind spots)
 ```
 
 | Group | Scripts |
@@ -223,6 +253,8 @@ node scripts/verify-frontier-wiring.mjs # Geometry & topology wiring: real engin
 | Kernel stack | verify-unified-evidence · verify-resilience-governance · verify-causal-kernel · verify-active-inference · verify-deliberation · verify-metareasoning · verify-abstraction |
 | Guarantee-layer kernels 12.0-16.0 | verify-anytime-evidence · verify-conformal · verify-quality-diversity · verify-runtime-verification · verify-shapley |
 | Geometry & topology layer 17.0-20.0 | verify-frontier-kernels · verify-frontier-wiring |
+| Genesis layer 21.0-25.0 | verify-genesis-kernels · verify-genesis-wiring |
+| Prophet layer 26.0-30.0 | verify-prophet-kernels · verify-prophet-wiring |
 | Symbiosis economy | verify-symbiosis · verify-symbiosis-bridge · verify-belief-market · verify-futarchy · verify-energy-feedback · verify-full-agents · verify-observability |
 | Learning & evolution | verify-self-evolution · verify-self-evolution-v2 · verify-knowledge-distillation · verify-policy-evolution · verify-meta-cognition · verify-meta-cognition-v2 · verify-meta-edge · verify-consensus-sync |
 
@@ -255,7 +287,7 @@ Config section `hostFusion`: `enabled` / `observeToolResults` / `governToolCalls
 ├── cordis.patch.yml              # Bundle config layer (dsh.bundle.patch target, all domestic models, zero keys)
 ├── symbiosis-sankey-demo.html    # Cognitive-ecosystem energy-flow Sankey panorama (zero-dependency, self-contained)
 ├── patches/domestic-models/      # Optional per-vendor patches (9 vendors + all-domestic.yml)
-├── scripts/                      # Patch generator + 31 offline verification scripts
+├── scripts/                      # Patch generator + 35 offline verification scripts
 └── src/
     ├── index.ts                  # Plugin entry: 10-step pipeline orchestration + 18 tool registrations
     ├── types.ts / errors.ts      # Shared type layer / unified error hierarchy (stable machine-readable codes)
