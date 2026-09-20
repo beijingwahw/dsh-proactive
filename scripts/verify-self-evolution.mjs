@@ -348,11 +348,13 @@ checks.push({
   detail: `质量持续 0.95 时阈值 0.70 → ${calibEngine.getCurrentThreshold().toFixed(2)}（收紧追求卓越；偏低时对称放宽）`,
 });
 
-fs.rmSync(stalePath, { force: true });
-fs.rmSync(`${stalePath}.migrated`, { force: true });
-fs.rmSync(stalePath.replace(/\.json$/, '.db'), { force: true });
-fs.rmSync(`${stalePath.replace(/\.json$/, '.db')}-wal`, { force: true });
-fs.rmSync(`${stalePath.replace(/\.json$/, '.db')}-shm`, { force: true });
+// Windows 下 SQLite 句柄释放有延迟, dispose + 重试删除避免 EPERM 误报
+try { staleMemory.dispose(); } catch { /* 已释放 */ }
+fs.rmSync(stalePath, { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(`${stalePath}.migrated`, { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(stalePath.replace(/\.json$/, '.db'), { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(`${stalePath.replace(/\.json$/, '.db')}-wal`, { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(`${stalePath.replace(/\.json$/, '.db')}-shm`, { force: true, maxRetries: 10, retryDelay: 100 });
 
 console.log('\n=== 断言结果 ===\n');
 let allPass = true;
@@ -362,11 +364,12 @@ for (const check of checks) {
   if (!check.pass) allPass = false;
 }
 
-fs.rmSync(memPath, { force: true });
-fs.rmSync(dbPath, { force: true });
-fs.rmSync(`${dbPath}-wal`, { force: true });
-fs.rmSync(`${dbPath}-shm`, { force: true });
-fs.rmSync(`${memPath}.migrated`, { force: true });
-fs.rmSync(graphPath, { force: true });
+try { memory.dispose(); reloaded.dispose(); } catch { /* 已释放 */ }
+fs.rmSync(memPath, { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(dbPath, { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(`${dbPath}-wal`, { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(`${dbPath}-shm`, { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(`${memPath}.migrated`, { force: true, maxRetries: 10, retryDelay: 100 });
+fs.rmSync(graphPath, { force: true, maxRetries: 10, retryDelay: 100 });
 console.log(allPass ? '\n✓ 新架构闭环验证全部通过：记忆 → 优化 → 执行 → 反思 → 记忆更新，越用越聪明。' : '\n✗ 存在未通过的断言，请检查。');
 process.exit(allPass ? 0 : 1);

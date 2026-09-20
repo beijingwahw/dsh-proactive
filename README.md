@@ -5,7 +5,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-339933?logo=nodedotjs&logoColor=white)](#安装)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-8250df)](https://github.com/topics/dsh-plugin)
 
-> **主动智能（Proactive Intelligence）调度插件** —— DeepSeek Harness（DSH）生态中的多模型协同调度系统：自主感知、自主决策、自主进化，内置**科学家 / 理论家双心智**、**认知能量共生经济**与**十四大质变内核（证据 → 保证层，任意时刻有效 / 保形 / 多样性 / 形式安全 / 公平归因）**。
+> **主动智能（Proactive Intelligence）调度插件** —— DeepSeek Harness（DSH）生态中的多模型协同调度系统：自主感知、自主决策、自主进化，内置**科学家 / 理论家双心智**、**认知能量共生经济**与**十八大质变内核（证据 → 几何与拓扑层，任意时刻有效 / 保形 / 多样性 / 形式安全 / 公平归因 / 最优传输 / 信息几何 / 最优停止 / 层论共识）**。
 >
 > [English](./README.en.md) | 中文
 
@@ -31,11 +31,12 @@
 │  操作环：信号→决策→执行→反思 10 步主链路（index.ts）             │
 │  进化环：策略进化器 + 安全沙盒 + 金丝雀部署（policy/）            │
 │  元认知外环：自我建模 → 保守调整 → 观察/回滚（meta/）             │
-├─ 质变内核（core/）3.0 → 16.0 十四大内核 ──────────────────────┤
+├─ 质变内核（core/）3.0 → 20.0 十八大内核 ──────────────────────┤
 │  证据 3.0  弹性 4.0  因果 5.0  自由能 6.0  深思 7.0             │
 │  元推理 8.0  抽象 9.0  科学家 10.0  理论家 11.0                 │
 │  任意时刻证据 12.0  保形预测 13.0  质量-多样性 14.0              │
 │  运行时验证 15.0  Shapley 归因 16.0                             │
+│  最优传输 17.0  信息几何 18.0  最优停止 19.0  层论共识 20.0      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,7 +58,17 @@
 - **运行时验证内核**（[core/runtime-verification.ts](./src/core/runtime-verification.ts)）：LTLf 规约监视——**安全规约形式化，裁决携带证明**。缺省规约集（无失败风暴 / 命令必响应 / 周期心跳 / 先授权后执行）编译为四类监视器原子；违规报告含完整证据轨迹与反例见证；severity 分级升级（critical → Kill Switch、warn → 熔断、info → 审计）
 - **Shapley 归因内核**（[core/shapley.ts](./src/core/shapley.ts)）：公理化公平分配——**贡献拆账有数学定理背书**。效率/对称/哑元/可加四公理精确满足；置换采样 + 任意时刻有效置信区间（边采样边出置信界，停不停都有保证）；协同侦测自动识别 1+1>2 的正协同与搭便车的负协同
 
-### 质变内核（core/，3.0 → 16.0）
+### 最优传输 / 信息几何 / 最优停止 / 层论共识（17.0 → 20.0）
+- **最优传输内核**（[core/optimal-transport.ts](./src/core/optimal-transport.ts)）：Wasserstein 距离 + Sinkhorn——**漂移检测看见分布的形状**。一维精确 W₁（分位数耦合，O(n log n)）、对数域稳定化 Sinkhorn（任意代价矩阵）、Wasserstein 重心（保留形状的分布融合）；形状感知漂移监视器（滑动窗 vs 不相交基准窗 + 历史分位自适应阈值）挂载元认知后——**均值不变而形状巨变的「换了世界」第一次可见**（12.0 水位检测的盲区补位、13.0 保形区间的绊线）
+- **信息几何内核**（[core/information-geometry.ts](./src/core/information-geometry.ts)）：Fisher 度量 + KL 信任域——**进化在流形上行走**。策略变异从坐标轴独立加噪升级为种群协方差主轴展开的联合相关步（有利基因组合完整传递）；步长以 nat 计价（KL 信任域 Mahalanobis 封顶），**仿射重参数化下严格不变**（数值验证：坐标缩放 100×/0.01× 后步长 6 位小数不变）；条件数 / 有效维数（参与比）让搜索几何本身成为可观测对象
+- **最优停止内核**（[core/optimal-stopping.ts](./src/core/optimal-stopping.ts)）：先知不等式 + 向后归纳——**等待有了数学价格**。经验分布上的精确停止价值递推（V_k = E[max(X, V_{k+1})]）、先知基准（次序统计量精确计算 E[max]）、Samuel-Cahn 单阈值规则（任意分布 ≥ ½ 先知保证）、秘书 1/e 规则与 Bruss 赔率算法；决策引擎规则 C 挂载后，**高成本信号的 defer/execute 从「urgency < 0.3」魔数升级为继续价值裁决**（现值 ≥ V_{horizon} 即执行——占坑数学最优，否则等待有价）
+- **层论共识内核**（[core/sheaf-consensus.ts](./src/core/sheaf-consensus.ts)）：胞腔层拉普拉斯 + 调和共识——**分歧的形状可见**。「谁与谁、在哪些声明上应该一致」成为一等数学对象（顶点 stalk + 边限制映射）；加权调和共识（软调解解 + 完美共识流形最优拟合双解口径）输出共识指派、各源翻供距离（离群者定位）与**结构性障碍检测**——0.9/0.1/0.5 的循环硬约束下平均化会说 0.5 皆大欢喜，本内核说「无解，先解决矛盾」；`sheaf_consensus` Tool 让大模型在推理时直接调用结构化信念融合
+
+### 最优索引调度 / 预算最优路由（21.0 → 22.0）
+- **最优索引调度内核**（[core/index-scheduling.ts](./src/core/index-scheduling.ts)）：Gittins 指数精确计算——**模型调度第一次有了可证明最优的口径**。对每个候选的 Beta 后验求解折扣 bandit 最优索引（退休 MDP 在 (α,β) 三角形上按 n 反向归纳一遍即得全部 V_R，无需不动点迭代；对无差异退休金二分），调度按 ν × availability 排序；学习溢价 = ν − p̂ 随证据积累自动归零（探索自我终结，不再需要手设探索预算），与 UCB 乐观上界启发式的本质区别是最优性有定理背书
+- **预算最优路由内核**（[core/bandit-knapsack.ts](./src/core/bandit-knapsack.ts)）：Bandits with Knapsacks——**预算约束下的最优路由，影子价格内生涌现**。质量走经验伯恩斯坦乐观上界（复用 12.0），可行性按「剩余预算 / 剩余轮数 × (1+slack)」判定，影子价格 λ 从不可行高质臂与选中臂的混合 LP 顶点实时解出（固定 costWeight 只是 λ 的一次性猜测）；无可行臂时选最廉臂止血并标记 urgent（负载卸载，而非假装最优仍存在）
+
+### 质变内核（core/，3.0 → 22.0）
 | 内核 | 版本 | 一句话 |
 |------|------|--------|
 | evidence.ts | 3.0 | 统一证据语言：Wilson 界 / 时间衰减 / 证据排序，铺满所有记忆层 |
@@ -74,6 +85,12 @@
 | quality-diversity.ts | 14.0 | 质量-多样性：MAP-Elites 行为归档（见上） |
 | runtime-verification.ts | 15.0 | 运行时验证：LTLf 规约监视 + 证明携带裁决（见上） |
 | shapley.ts | 16.0 | Shapley 归因：公理化公平分配 + 任意时刻置信区间（见上） |
+| optimal-transport.ts | 17.0 | 最优传输：Wasserstein 漂移 + Sinkhorn + 重心（见上） |
+| information-geometry.ts | 18.0 | 信息几何：Fisher 度量自然变异 + KL 信任域（见上） |
+| optimal-stopping.ts | 19.0 | 最优停止：先知不等式 + 向后归纳 + 机会停止器（见上） |
+| sheaf-consensus.ts | 20.0 | 层论共识：胞腔层拉普拉斯 + 调和共识 + 障碍检测（见上） |
+| index-scheduling.ts | 21.0 | 最优索引调度：Gittins 指数精确计算（退休 MDP 三角形反向归纳），可证明最优模型调度 |
+| bandit-knapsack.ts | 22.0 | 预算最优路由：Bandits with Knapsacks，影子价格从预算稀缺性内生涌现 |
 
 ### 认知能量共生经济（symbiosis/）
 - **能量账本**（ledger.ts）：认知能量不可伪造，复式记账全局守恒，每笔转账 sha256 链式可审计可回放，基尼系数度量生态健康
@@ -102,7 +119,7 @@
 ### 工程基础设施
 - Raft 共识、分布式同步、热更新、AES-256-GCM 加密存储
 - 多租户隔离、基准测试引擎、零依赖 WebSocket 实时进度（原生 RFC 6455）、可视化 Dashboard
-- 18 个 Tool 注册，宿主融合层全宿主可观测与安全治理
+- 18 个 Tool 注册（+ 缺省关闭的层论共识 Tool），宿主融合层全宿主可观测与安全治理
 
 ## 自主循环（Autonomy Loop）
 
@@ -152,7 +169,7 @@ dsh web
 | 安装产物 | 改代码 → `npm run build` → 重新 `dsh plugin add` → 重启 dsh | 更新已安装的插件 |
 
 `npm run dev` 的组成：仓库根 `cordis.yml` 依次挂 logger / timer / hmr / 宿主桩 / 本插件（直接加载 `src/index.ts`，config 与 `cordis.patch.yml` 逐键一致，开发行为 = 生产 bundle 行为）；
-`dev/host-stubs.ts` 提供宿主 `tools` 服务桩，让 18 个 Tool 走完整桥接链路（宿主无该服务时插件会静默降级，桩让开发进程更接近 dsh 运行时形态）。
+`dev/host-stubs.ts` 提供宿主 `tools` 服务桩，让全部 Tool 走完整桥接链路（宿主无该服务时插件会静默降级，桩让开发进程更接近 dsh 运行时形态）。
 
 ## 配置（零手动配置）
 
@@ -164,9 +181,9 @@ dsh web
 - **多密钥故障转移**：同一厂商存在多个候选密钥时，认证失败（401/403）或配额耗尽（429）会自动轮换到下一个候选密钥重试，并升级为**健康感知路由**——按成功/失败统计选择最优密钥，429 冷却 1 分钟、401/403 冷却 5 分钟，成功后自动恢复；用户可通过 `manage_keys` 工具调整密钥使用顺序（持久化，重启保留），启动日志输出每个模型的密钥来源（不含密钥值），运行时可用 `query_memory keys` 查看各密钥健康状态；
 - 若只需单一厂商，可改用 `patches/domestic-models/` 下按厂商拆分的 patch；重新生成：`pnpm generate:patches`。
 
-完整运行配置项（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主循环 `autonomy` / 宿主融合 `hostFusion`）同样内置于 [cordis.patch.yml](./cordis.patch.yml)，无需改动；共生经济子项位于 `autonomy.symbiosis`（futarchy 表决、能量反哺等，缺省关闭）。保证层内核 12.0-16.0 子项同样缺省关闭（零漂移）：`autonomy.anytimeEvidence`（α / 水位线）、`autonomy.conformal`（α / 校准容量 / 阈值风险与置信）、`autonomy.qualityDiversity`（探索率）、`autonomy.runtimeVerification`（附加规约 `specs`）。
+完整运行配置项（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主循环 `autonomy` / 宿主融合 `hostFusion`）同样内置于 [cordis.patch.yml](./cordis.patch.yml)，无需改动；共生经济子项位于 `autonomy.symbiosis`（futarchy 表决、能量反哺等，缺省关闭）。保证层内核 12.0-16.0、几何/拓扑层内核 17.0-20.0 与最优调度层内核 21.0-22.0 子项同样缺省关闭（零漂移）：`autonomy.anytimeEvidence`（α / 水位线）、`autonomy.conformal`（α / 校准容量 / 阈值风险与置信）、`autonomy.qualityDiversity`（探索率）、`autonomy.runtimeVerification`（附加规约 `specs`）、`autonomy.optimalTransport`（监测 KPI / 窗口 / 阈值分位）、`autonomy.informationGeometry`（KL 信任域 / 步长尺度）、`autonomy.optimalStopping`（机会视野 / 最小样本）、`autonomy.sheafConsensus`（障碍失配容差）、`autonomy.indexScheduling`（贴现 / 网格）、`autonomy.banditKnapsack`（UCB α / 可行性松弛 / 视界）。
 
-## 工具一览（18 个）
+## 工具一览（18 个 + 缺省关闭的层论共识 Tool）
 
 | 分组 | 工具 |
 |------|------|
@@ -175,6 +192,7 @@ dsh web
 | 元认知 | `mental_report` · `self_knowledge` · `meta_cognition` |
 | 自主治理 | `manage_autonomy` · `manage_keys` |
 | 基础设施 | `manage_tenants` · `manage_encryption` · `manage_sync` · `manage_consensus` · `manage_hot_reload` |
+| 层论共识（缺省关闭） | `sheaf_consensus`（20.0：多源信念结构化融合 + 结构性分歧检测，`autonomy.sheafConsensus.enabled` 启用） |
 
 通过 `manage_autonomy` 获取七维自省报告：
 
@@ -197,7 +215,7 @@ dsh web
 - `manage_autonomy`：`start` / `stop` / `tick` / `kill-switch` / `revive` / `reset-circuit`
 - `query_memory`：`world-model` / `curiosity` / `governance` / `patterns` / `lessons` / `keys` 等
 
-## 离线验证（29 个，零 API Key）
+## 离线验证（31 个，零 API Key）
 
 每个内核与子系统均有离线端到端验证脚本（`node scripts/verify-*.mjs`）：
 
@@ -208,6 +226,8 @@ node scripts/verify-symbiosis.mjs     # 共生经济：账本 / 市场 / 三智�
 node scripts/verify-self-evolution.mjs # 自进化闭环：推荐采纳 / 快路径 / 三对冲机制
 node scripts/verify-anytime-evidence.mjs # 任意时刻证据：CS 时间一致性 / e-过程裁决 / e-BH FDR
 node scripts/verify-shapley.mjs       # Shapley：四公理 / 置信区间 / 协同侦测
+node scripts/verify-frontier-kernels.mjs # 几何与拓扑层 17.0→20.0：解析解对照 / 坐标不变性 / 先知 2-3 / 层障碍检测
+node scripts/verify-frontier-wiring.mjs # 几何与拓扑层接线：真实引擎端到端（漂移洞察 / 自然变异 / 数学 defer）
 ```
 
 | 分组 | 脚本 |
@@ -215,6 +235,7 @@ node scripts/verify-shapley.mjs       # Shapley：四公理 / 置信区间 / 协
 | 双心智 | verify-scientist · verify-theorist |
 | 质变内核 | verify-unified-evidence · verify-resilience-governance · verify-causal-kernel · verify-active-inference · verify-deliberation · verify-metareasoning · verify-abstraction |
 | 保证层内核 12.0-16.0 | verify-anytime-evidence · verify-conformal · verify-quality-diversity · verify-runtime-verification · verify-shapley |
+| 几何与拓扑层 17.0-20.0 | verify-frontier-kernels · verify-frontier-wiring |
 | 共生经济 | verify-symbiosis · verify-symbiosis-bridge · verify-belief-market · verify-futarchy · verify-energy-feedback · verify-full-agents · verify-observability |
 | 学习与进化 | verify-self-evolution · verify-self-evolution-v2 · verify-knowledge-distillation · verify-policy-evolution · verify-meta-cognition · verify-meta-cognition-v2 · verify-meta-edge · verify-consensus-sync |
 
@@ -226,7 +247,7 @@ node scripts/verify-shapley.mjs       # Shapley：四公理 / 置信区间 / 协
 
 - **函数插件形态 + 静态元数据**：默认导出为 `apply(ctx, config)` 函数插件，并挂载 `name` / `Config` / `provide` 静态元数据，供注册表与加载器识别；
 - **Schemastery Config schema**：`Config` 为标准 schema，加载时由 cordis `resolveConfig` 自动校验类型并填充默认值（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主智能等全部配置节）；函数型注入字段（`nodeRunner` / `judge` / `llm.fetchImpl` 等）与共生嵌套配置作为额外属性透传，不受校验影响；
-- **官方 Tool 注册链路**：宿主加载 `@deepseek-ai/dsh-tools`（`ctx.tools` 服务）时，18 个 Tool 经 duck-typing 桥接注册进官方 ToolRegistry，纳入 pre/around/post 执行管线与模型可见面（参数转为官方 JSON Schema 子集）；宿主未提供时静默降级为内部 ToolRegistry + `ctx.provide('schedulerTools')`，不引入整套 agent 栈依赖；
+- **官方 Tool 注册链路**：宿主加载 `@deepseek-ai/dsh-tools`（`ctx.tools` 服务）时，全部 Tool 经 duck-typing 桥接注册进官方 ToolRegistry，纳入 pre/around/post 执行管线与模型可见面（参数转为官方 JSON Schema 子集）；宿主未提供时静默降级为内部 ToolRegistry + `ctx.provide('schedulerTools')`，不引入整套 agent 栈依赖；
 - **依赖注入与服务声明**：经 `ctx.provide('scheduler' / 'schedulerTools')` 暴露服务面，并通过 TypeScript 声明合并（`declare module '@deepseek-ai/cordis'`）为 `Context` 注入类型；
 - **生命周期清理**：全部资源在 fiber 卸载时经 `ctx.effect` 按依赖逆序清理（含官方 Tool 注销）；
 - **发布清单**：`package.json` 声明 `dsh.bundle.patch` 指向 [cordis.patch.yml](./cordis.patch.yml) bundle 配置层，`exports` / `files` / `engines` / `keywords` 齐备，dist/ 构建产物随仓库分发（安装零构建脚本，规避 pnpm allowBuilds 拦截）。
@@ -247,9 +268,9 @@ node scripts/verify-shapley.mjs       # Shapley：四公理 / 置信区间 / 协
 ├── cordis.patch.yml              # bundle 配置层（dsh.bundle.patch 指向，全部国产模型零密钥）
 ├── symbiosis-sankey-demo.html    # 认知生态能量流 Sankey 全景（零依赖自包含）
 ├── patches/domestic-models/      # 按厂商拆分的可选 patch（9 厂商 + all-domestic.yml）
-├── scripts/                      # patch 生成器 + 29 个离线验证脚本
+├── scripts/                      # patch 生成器 + 31 个离线验证脚本
 └── src/
-    ├── index.ts                  # 插件入口：10 步主链路编排 + 18 个 Tool 注册
+    ├── index.ts                  # 插件入口：10 步主链路编排 + Tool 注册
     ├── types.ts / errors.ts      # 共享类型层 / 统一错误体系（稳定机器可读 code）
     ├── contracts.ts              # 三支柱接口契约（IMemoryStore / IReflector / IOptimizer）
     ├── llm-client.ts             # LLM 统一调用：超时 / 指数退避 / 并发信号量 / 成本统计
@@ -270,7 +291,7 @@ node scripts/verify-shapley.mjs       # Shapley：四公理 / 置信区间 / 协
     ├── autonomy-loop.ts          # 自主循环：11 步心跳编排
     ├── host-fusion.ts            # 宿主融合层：全宿主可观测 + 安全治理
     ├── dsh-host.ts               # DSH 宿主集成：LLM 客户端 / 模型目录 / Key 注入
-    ├── core/                     # 质变内核：evidence 3.0 → shapley 16.0 十四大内核
+    ├── core/                     # 质变内核：evidence 3.0 → sheaf 20.0 十八大内核
     ├── meta/                     # 元认知层：自我建模 + 元认知控制器（双环外环）
     ├── policy/                   # 策略进化器 + 安全沙盒：种群进化 / 金丝雀部署
     ├── symbiosis/                # 认知能量共生经济：账本 / 市场 / 信念市场 / 智能体 / 运行时 / Sankey

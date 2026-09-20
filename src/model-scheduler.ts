@@ -37,6 +37,8 @@ import {
   type SchedulerPolicyParams,
 } from './policy/policy-types.js';
 import type { EFEAction, EFEEvaluation, FreeEnergyEngine } from './core/free-energy.js';
+import type { ArmIndex, GittinsSnapshot, IndexArm, IndexScheduler } from './core/index-scheduling.js';
+import type { BwKRouter, BwKVerdict } from './core/bandit-knapsack.js';
 
 /** 模型调度配置 */
 export interface ModelSchedulerConfig {
@@ -116,6 +118,14 @@ export class ModelScheduler {
   private economicMultipliers = new Map<string, number>();
   /** 6.0：自由能引擎（EFE 调度模式；未挂载/未启用零漂移） */
   private freeEnergy?: FreeEnergyEngine;
+  /** 21.0：索引调度器（Gittins 指数口径；未挂载零漂移） */
+  private indexScheduler?: IndexScheduler;
+  /** 22.0：预算路由器（Bandits with Knapsacks；未挂载零漂移） */
+  private bwKRouter?: BwKRouter;
+  /** 22.0：预算提供器（每次选型时只读治理器剩余预算） */
+  private bwKBudgetProvider?: () => { tokensRemaining: number; costRemaining: number } | undefined;
+  /** 22.0：最近一次路由裁决（诊断口径；getAttachedDiagnostics 消费） */
+  private lastBwKVerdict?: BwKVerdict;
 
   constructor(params: { llm: LLMClient; memory: LongTermMemory; config?: ModelSchedulerConfig }) {
     this.llm = params.llm;
@@ -174,6 +184,40 @@ export class ModelScheduler {
   }
 
   private efeOutcomeNode = 'task.outcome';
+
+  /**
+   * 21.0：挂载索引调度器（幂等覆盖，挂载即生效）。
+   *
+   * 挂载后 assignModelWithInsight 的动态选型升级为 Gittins 索引口径：
+   * 候选（Beta 后验臂）按 effectiveIndex = ν × availability 降序取榜首。
+   * preferred 短路 / avoidModels 剔除 / 无候选抛 ExecutionError 的语义
+   * 保持不变；未挂载时动态选型与原路径逐位一致（零漂移）。
+   */
+  attachIndexScheduler(scheduler: IndexScheduler): void {
+    this.indexScheduler = scheduler;
+  }
+
+  /**
+   * 22.0：挂载预算路由器与预算提供器（幂等覆盖）。
+   *
+   * budgetProvider 在每次选型时读取剩余预算（只读，不推进状态）；
+   * 返回 undefined 或 tokensRemaining ≤ 0 时本路由不介入（走原路径）。
+   */
+  attachBwKRouter(
+    router: BwKRouter,
+    budgetProvider: () => { tokensRemaining: number; costRemaining: number } | undefined,
+  ): void {
+    this.bwKRouter = router;
+    this.bwKBudgetProvider = budgetProvider;
+  }
+
+  /** 21.0/22.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
+  getAttachedDiagnostics(): { indexScheduling?: GittinsSnapshot; lastBwK?: BwKVerdict } {
+    const diagnostics: { indexScheduling?: GittinsSnapshot; lastBwK?: BwKVerdict } = {};
+    if (this.indexScheduler) diagnostics.indexScheduling = this.indexScheduler.getTable().snapshot();
+    if (this.lastBwKVerdict) diagnostics.lastBwK = this.lastBwKVerdict;
+    return diagnostics;
+  }
 
   /** 模型的当前经济乘数（无信号 = 中性 1；economicFeedbackEnabled 关闭时恒为 1） */
   economicMultiplierOf(modelId: string): number {
@@ -362,6 +406,99 @@ export class ModelScheduler {
   }
 
   /**
+   * 21.0/22.0：已挂载数学内核的候选选型（零漂移守卫——未挂载/预算
+   * 不可用时返回 undefined，调用方走原路径，行为与升级前逐位一致）。
+   *
+   * 优先级：indexScheduler（可证明最优的 Gittins 索引口径）>
+   * bwKRouter（预算约束下的 BwK 路由）> 原评分路径。两条内核路径均
+   * 保持 preferred 短路与 avoidModels 剔除之后的候选集语义。
+   */
+  private selectWithAttachedKernels(
+    taskType: string,
+    statuses: Array<{ id: string; totalCalls: number; totalTokensUsed: number; totalCost?: number }>,
+  ): SchedulingInsight | undefined {
+    // 21.0：Gittins 索引调度——对每个候选的 Beta(α,β) 后验精确计算
+    // 折扣 bandit 最优索引（退休 MDP 三角形反向归纳），学习溢价随
+    // 证据积累自动归零（探索自我终结）。熔断/健康状态此处不可得，
+    // 可用性恒 1（候选集已由调用方按 avoid/注册态过滤）。
+    if (this.indexScheduler) {
+      const arms: IndexArm[] = statuses.map((status) => {
+        const estimate = this.memory.getBayesianEstimate(status.id, taskType);
+        return {
+          id: status.id,
+          // Beta(α,β) 含均匀先验：成功/失败计数 = α−1 / β−1（无画像即 0/0）
+          successes: estimate ? estimate.alpha - 1 : 0,
+          failures: estimate ? estimate.beta - 1 : 0,
+          availability: 1,
+        };
+      });
+      const ranked: ArmIndex[] = this.indexScheduler.rank(arms);
+      const chosen = ranked[0];
+      if (chosen) {
+        const estimate = this.memory.getBayesianEstimate(chosen.id, taskType);
+        // 探索语义：学习溢价显著且选中者并非后验均值最高（为学而选）
+        const bestMeanId = ranked.reduce((a, b) => (b.posteriorMean > a.posteriorMean ? b : a)).id;
+        const exploration = chosen.learningPremium > 0.03 && chosen.id !== bestMeanId;
+        return {
+          taskType,
+          modelId: chosen.id,
+          confidence: estimate ? estimate.posteriorMean : 0.5,
+          exploration,
+          effectiveSamples: estimate?.effectiveSamples ?? 0,
+          rationale: exploration
+            ? `探索性选择 ${chosen.id}（Gittins 索引 ${chosen.effectiveIndex.toFixed(3)}（学习溢价 ${chosen.learningPremium.toFixed(3)}）@${chosen.rank} 位，后验均值 ${chosen.posteriorMean.toFixed(3)} 非最高，不确定性溢价驱动重估）`
+            : `索引最优 ${chosen.id}（Gittins 索引 ${chosen.effectiveIndex.toFixed(3)}（学习溢价 ${chosen.learningPremium.toFixed(3)}）@${chosen.rank} 位，后验均值 ${chosen.posteriorMean.toFixed(3)}，有效样本 ${estimate?.effectiveSamples.toFixed(1) ?? '0'}）`,
+          economicMultiplier: this.economicMultiplierOf(chosen.id),
+        };
+      }
+      return undefined; // 防御：无可排名臂时走原路径
+    }
+
+    // 22.0：预算路由——治理器预算成为调度的一等约束：乐观可行性 +
+    // 预算感知贪心选臂，影子价格 λ 由「剩余预算/剩余轮数」稀缺性内生
+    // 涌现；无可行臂时选最廉臂止血（cheapest-shed，非探索）。
+    if (this.bwKRouter && this.bwKBudgetProvider) {
+      const budget = this.bwKBudgetProvider();
+      if (budget && budget.tokensRemaining > 0) {
+        const arms = statuses.map((status) => {
+          const estimate = this.memory.getBayesianEstimate(status.id, taskType);
+          return {
+            id: status.id,
+            qualityMean: estimate ? estimate.posteriorMean : 0.5,
+            samples: estimate ? estimate.effectiveSamples : 0,
+            // 模型画像平均 token 消耗（运行时累计口径；无历史 600 兜底）
+            tokensMean: status.totalCalls > 0 ? status.totalTokensUsed / status.totalCalls : 600,
+            costMean: status.totalCalls > 0 && status.totalCost !== undefined ? status.totalCost / status.totalCalls : undefined,
+          };
+        });
+        const verdict = this.bwKRouter.route(arms, {
+          tokensRemaining: budget.tokensRemaining,
+          costRemaining: budget.costRemaining,
+          roundsRemaining: this.bwKRouter.getConfig().horizonDefault,
+        });
+        this.lastBwKVerdict = verdict;
+        const chosenStatus = verdict.chosenId ? statuses.find((s) => s.id === verdict.chosenId) : undefined;
+        if (chosenStatus) {
+          const estimate = this.memory.getBayesianEstimate(chosenStatus.id, taskType);
+          // 探索语义：预算卸载（cheapest-shed）是被迫止血非探索；
+          // 其余情形影子价格 > 0 表示存在被预算卡住的高质臂（预算约束活跃）
+          const exploration = verdict.basis === 'cheapest-shed' ? false : verdict.shadowPriceTokens > 0;
+          return {
+            taskType,
+            modelId: chosenStatus.id,
+            confidence: estimate ? estimate.posteriorMean : 0.5,
+            exploration,
+            effectiveSamples: estimate?.effectiveSamples ?? 0,
+            rationale: `预算路由选择 ${chosenStatus.id}（${verdict.reason}；预算率 ${verdict.rateTokens.toFixed(0)} tok/轮，剩余 token ${Math.round(budget.tokensRemaining)}）`,
+            economicMultiplier: this.economicMultiplierOf(chosenStatus.id),
+          };
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * 为任务类型分配最优模型（能力画像 × 贝叶斯记忆画像 × 成本感知 × 探索/利用权衡）
    *
    * 第三阶段：评分核心改用策略参数化的 scoreModelWithPolicy
@@ -385,6 +522,9 @@ export class ModelScheduler {
    * 4.0：avoidModels 负向约束——经验规避模型（历史超时/能力不足）从候选剔除，
    * 推荐模型被规避时同样降级为动态评分选型（勘察修复：升级前 avoidModels
    * 产出后无人消费，负向经验在调度端断链）。
+   * 21.0/22.0：挂载索引调度器 / 预算路由器后动态选型升级为 Gittins 索引 /
+   * Bandits-with-Knapsacks 口径（preferred 短路与 avoidModels 语义不变；
+   * 未挂载时逐位保持原行为）。
    */
   assignModelWithInsight(
     taskType: string,
@@ -399,6 +539,11 @@ export class ModelScheduler {
 
     const statuses = this.llm.getModelStatuses().filter((s) => !avoid.has(s.id));
     if (statuses.length === 0) throw new ExecutionError('没有已注册的可用模型');
+
+    // 21.0/22.0：挂载数学内核时动态选型升级为索引/预算口径；
+    // 未挂载/预算不可用返回 undefined，原评分路径逐位保持不变（零漂移）
+    const kernelInsight = this.selectWithAttachedKernels(taskType, statuses);
+    if (kernelInsight) return kernelInsight;
 
     const scored = this.scoreCandidates(taskType, context, statuses);
     let best = scored[0]!;

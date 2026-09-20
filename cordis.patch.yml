@@ -243,6 +243,59 @@
           runtimeVerification:
             enabled: false
             specs: []
+          # 17.0 最优传输：元认知挂载 Wasserstein-1 形状漂移监视
+          # （均值不变而形状巨变的「换了世界」可见）。缺省关闭
+          optimalTransport:
+            enabled: false
+            kpis: [avgQuality, avgLatency]
+            windowSize: 50
+            referenceSize: 200
+            thresholdQuantile: 0.95
+            minSamples: 20
+          # 18.0 信息几何：策略变异升级为 Fisher 流形自然变异
+          # （协方差主轴联合步 + KL 信任域，步长以 nat 计价）。缺省关闭
+          informationGeometry:
+            enabled: false
+            klBudget: 1.2
+            stepScale: 0.5
+          # 19.0 最优停止：规则 C 成本闸门从魔数 defer 升级为
+          # 继续价值裁决（向后归纳精确阈值 + 先知不等式审计）。缺省关闭
+          optimalStopping:
+            enabled: false
+            horizon: 3
+            minSamples: 8
+          # 20.0 层论共识：注册 sheaf_consensus Tool（多源信念结构化
+          # 融合 + 结构性分歧检测）。缺省关闭（不注册即零漂移）
+          sheafConsensus:
+            enabled: false
+            misfitTolerance: 0.0025
+          # 21.0 最优索引调度：候选排序升级为 Gittins 指数口径（可证明
+          # 最优；学习溢价随证据积累自动归零）。缺省关闭（零漂移）
+          indexScheduling:
+            enabled: false
+            discount: 0.95
+            maxCount: 48
+          # 22.0 预算最优路由：Bandits with Knapsacks（影子价格从预算
+          # 稀缺性内生涌现；治理器未配置预算时挂载不生效）。缺省关闭
+          banditKnapsack:
+            enabled: false
+            ucbAlpha: 0.05
+            feasibilitySlack: 0.25
+            horizonDefault: 100
+          # 稳健统计（预留配置位：运行时接线随后续版本进入）。缺省关闭
+          robustStatistics:
+            enabled: false
+            alpha: 0.05
+          # 差分隐私（预留配置位：运行时接线随后续版本进入）。缺省关闭
+          privacy:
+            enabled: false
+            epsilon: 3.0
+            delta: 0.000001
+          # 容量规划（预留配置位：运行时接线随后续版本进入）。缺省关闭
+          capacityPlanning:
+            enabled: false
+            targetWaitMs: 5000
+            defaultScv: 2.0
         # 宿主融合层：全宿主工具可观测 + 安全治理；关闭后 isActive()=false
         hostFusion:
           enabled: true

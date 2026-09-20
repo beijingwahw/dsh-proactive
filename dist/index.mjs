@@ -3617,7 +3617,7 @@ var TenantManager = class {
 		}
 		this.runtimes.clear();
 	}
-	/** 加载注册表（不存在时初始化） */
+	/** 加载注册表（不存在时初始化；检测到加密结构时先解密再校验） */
 	loadRegistry() {
 		if (!fs.existsSync(this.registryPath)) return {
 			version: 1,
@@ -3626,25 +3626,66 @@ var TenantManager = class {
 		};
 		try {
 			const raw = JSON.parse(fs.readFileSync(this.registryPath, "utf-8"));
-			if (!Array.isArray(raw.tenants)) throw new Error("注册表结构非法：缺少 tenants 数组");
+			const data = this.cryptoEngine && CryptoEngine.hasEncryptedFields(raw) ? this.cryptoEngine.decryptSensitiveFields(raw).result : raw;
+			if (!Array.isArray(data.tenants)) throw new Error("注册表结构非法：缺少 tenants 数组");
 			return {
-				version: raw.version ?? 1,
-				tenants: raw.tenants,
+				version: data.version ?? 1,
+				tenants: data.tenants,
 				globalDefaults: {
 					...DEFAULT_GLOBALS,
-					...raw.globalDefaults
+					...data.globalDefaults
 				}
 			};
 		} catch (err) {
 			throw new ConfigError(`租户注册表加载失败: ${this.registryPath}`, { cause: err instanceof Error ? err.message : String(err) });
 		}
 	}
-	/** 持久化注册表（原子写入） */
+	/** 持久化注册表（原子写入；apiKey 经字段级加密后落盘，不再明文存储） */
 	persistRegistry() {
 		fs.mkdirSync(this.dataDir, { recursive: true });
 		const tmp = `${this.registryPath}.tmp.${process.pid}`;
-		fs.writeFileSync(tmp, JSON.stringify(this.registry, null, 2), "utf-8");
+		fs.writeFileSync(tmp, JSON.stringify(this.encryptRegistryForDisk(), null, 2), "utf-8");
 		fs.renameSync(tmp, this.registryPath);
+	}
+	/**
+	* 生成落盘载荷：存在加密引擎时对注册表做字段级加密（apiKey 等敏感
+	* 字段封为 __encrypted 结构）；加密失败降级为明文写并在 stderr 警告
+	* （租户持久化是关键路径，不允许因加密故障整体失败）。
+	*/
+	encryptRegistryForDisk() {
+		if (!this.cryptoEngine) return this.registry;
+		try {
+			const { result } = this.cryptoEngine.encryptSensitiveFields(this.registry);
+			return this.sealRemainingApiKeys(result);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			process.stderr.write(`[tenant-manager] 警告: 注册表字段加密失败，降级为明文写入: ${message}\n`);
+			return this.registry;
+		}
+	}
+	/**
+	* 兜底封印：深扫载荷中仍是明文字符串的 apiKey 字段（引擎的
+	* sensitiveFields 配置可能不含 apiKey），逐个用引擎的整段加密原语
+	* 封为与 EncryptedField 同构的结构（__encrypted 标记 + keyVersion），
+	* 读回路径 decryptSensitiveFields 可统一解密。不修改原对象。
+	*/
+	sealRemainingApiKeys(node) {
+		if (node === null || typeof node !== "object") return node;
+		if (Array.isArray(node)) return node.map((item) => this.sealRemainingApiKeys(item));
+		if (node.__encrypted === true) return node;
+		const out = {};
+		for (const [key, value] of Object.entries(node)) if (key === "apiKey" && typeof value === "string" && value.length > 0) {
+			const sealed = this.cryptoEngine.encryptFile(value);
+			out[key] = {
+				__encrypted: true,
+				algorithm: sealed.algorithm,
+				iv: sealed.iv,
+				tag: sealed.tag,
+				ciphertext: sealed.ciphertext,
+				keyVersion: sealed.keyVersion
+			};
+		} else out[key] = this.sealRemainingApiKeys(value);
+		return out;
 	}
 	/** 解析租户记忆库路径 */
 	resolveMemoryPath(config) {
@@ -6644,6 +6685,174 @@ var HotReloadEngine = class extends EventEmitter {
 	}
 };
 //#endregion
+//#region src/core/robust-statistics.ts
+const DEFAULT_ROBUST_CONFIG = {
+	alpha: .05,
+	maxSamples: 4096,
+	catoniMinSamples: 24,
+	momMinSamples: 8
+};
+/** MAD 稳健尺度估计: σ̂ = 1.4826 × median|x_i − median(x)| */
+function madSigma(samples) {
+	if (samples.length === 0) return 0;
+	const sorted = [...samples].sort((a, b) => a - b);
+	const mid = Math.floor(sorted.length / 2);
+	const median = sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+	const deviations = samples.map((x) => Math.abs(x - median)).sort((a, b) => a - b);
+	const mad = deviations.length % 2 === 1 ? deviations[Math.floor(deviations.length / 2)] : (deviations[deviations.length / 2 - 1] + deviations[deviations.length / 2]) / 2;
+	return Math.max(1e-9, 1.4826 * mad);
+}
+/**
+* Catoni 稳健均值: 对 θ 二分解单调方程 Σψ_δ(x_i−θ)=0。
+* 返回估计与半径 |μ̂−μ| ≤ σ̂·√(8·ln(2/α)/n) 的置信区间(钳到数据范围)。
+*/
+function catoniMean(samples, alpha = .05) {
+	const n = samples.length;
+	if (n === 0) return {
+		mean: 0,
+		lower: 0,
+		upper: 0,
+		sigma: 0,
+		radius: 0
+	};
+	const sum = samples.reduce((s, x) => s + x, 0) / n;
+	if (n < 2) return {
+		mean: sum,
+		lower: sum,
+		upper: sum,
+		sigma: 0,
+		radius: 0
+	};
+	const sigma = madSigma(samples);
+	const delta = Math.min(1, Math.sqrt(2 * Math.log(2 / alpha) / (n * sigma * sigma)));
+	let lo = Math.min(...samples);
+	let hi = Math.max(...samples);
+	const g = (theta) => {
+		let acc = 0;
+		for (const x of samples) {
+			const y = x - theta;
+			const ay = Math.abs(y);
+			acc += Math.sign(y) * Math.log(1 + delta * ay + delta * ay * ay * delta / 2);
+		}
+		return acc;
+	};
+	if (g(lo) < 0 || g(hi) > 0) return {
+		mean: sum,
+		lower: sum,
+		upper: sum,
+		sigma,
+		radius: 0
+	};
+	for (let i = 0; i < 80; i++) {
+		const mid = (lo + hi) / 2;
+		if (g(mid) > 0) lo = mid;
+		else hi = mid;
+	}
+	const mean = (lo + hi) / 2;
+	const radius = Math.min(hi - lo + sigma * Math.sqrt(8 * Math.log(2 / alpha) / n), Math.max(...samples) - Math.min(...samples));
+	return {
+		mean,
+		lower: mean - radius,
+		upper: mean + radius,
+		sigma,
+		radius
+	};
+}
+/** Median-of-Means: k = ⌈8·ln(1/α)⌉ 块连续切分, 块均值取中位数 */
+function medianOfMeans(samples, alpha = .05) {
+	const n = samples.length;
+	if (n === 0) return {
+		mean: 0,
+		blocks: 0,
+		lower: 0,
+		upper: 0,
+		sigma: 0
+	};
+	const k = Math.max(3, Math.min(n, Math.ceil(8 * Math.log(1 / Math.max(alpha, 1e-12)))));
+	if (n < k) {
+		const mean = samples.reduce((s, x) => s + x, 0) / n;
+		return {
+			mean,
+			blocks: 1,
+			lower: mean,
+			upper: mean,
+			sigma: madSigma(samples)
+		};
+	}
+	const size = Math.floor(n / k);
+	const blockMeans = [];
+	for (let b = 0; b < k; b++) {
+		const slice = samples.slice(b * size, (b + 1) * size);
+		blockMeans.push(slice.reduce((s, x) => s + x, 0) / slice.length);
+	}
+	const sorted = [...blockMeans].sort((a, b) => a - b);
+	const mid = Math.floor(sorted.length / 2);
+	const median = sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+	const sigma = madSigma(samples);
+	const radius = sigma * Math.sqrt(32 * Math.log(1 / Math.max(alpha, 1e-12)) / n);
+	return {
+		mean: median,
+		blocks: k,
+		lower: median - radius,
+		upper: median + radius,
+		sigma
+	};
+}
+/** 流式稳健估计: 环形保留最近 maxSamples 个观测, read() 自动选择方法 */
+var RobustStream = class {
+	config;
+	buffer = [];
+	constructor(config) {
+		this.config = {
+			...DEFAULT_ROBUST_CONFIG,
+			...config
+		};
+	}
+	observe(x) {
+		if (!Number.isFinite(x)) return;
+		this.buffer.push(x);
+		if (this.buffer.length > this.config.maxSamples) this.buffer.splice(0, this.buffer.length - this.config.maxSamples);
+	}
+	get size() {
+		return this.buffer.length;
+	}
+	read() {
+		const n = this.buffer.length;
+		const plainMean = n === 0 ? 0 : this.buffer.reduce((s, x) => s + x, 0) / n;
+		if (n < this.config.momMinSamples) return {
+			n,
+			mean: plainMean,
+			robustMean: plainMean,
+			lower: plainMean,
+			upper: plainMean,
+			method: "mean",
+			sigma: n ? madSigma(this.buffer) : 0
+		};
+		if (n < this.config.catoniMinSamples) {
+			const r = medianOfMeans(this.buffer, this.config.alpha);
+			return {
+				n,
+				mean: plainMean,
+				robustMean: r.mean,
+				lower: r.lower,
+				upper: r.upper,
+				method: "mom",
+				sigma: r.sigma
+			};
+		}
+		const c = catoniMean(this.buffer, this.config.alpha);
+		return {
+			n,
+			mean: plainMean,
+			robustMean: c.mean,
+			lower: c.lower,
+			upper: c.upper,
+			method: "catoni",
+			sigma: c.sigma
+		};
+	}
+};
+//#endregion
 //#region src/llm-client.ts
 /**
 * llm-client.ts — OpenAI 兼容 LLM 调用客户端（集成层基础设施）
@@ -6705,6 +6914,8 @@ var LLMClient = class {
 	models = /* @__PURE__ */ new Map();
 	fetchImpl;
 	disposed = false;
+	/** 23.0：每模型稳健延迟流（仅配置 robustLatency 时创建） */
+	robustStreams = /* @__PURE__ */ new Map();
 	constructor(config) {
 		this.config = {
 			...DEFAULT_LLM_CLIENT_CONFIG,
@@ -6730,6 +6941,7 @@ var LLMClient = class {
 			totalTokensUsed: existing?.totalTokensUsed ?? 0,
 			totalCost: existing?.totalCost ?? 0
 		});
+		if (this.config.robustLatency) this.robustStreamFor(model.id);
 	}
 	/**
 	* 获取已注册模型配置
@@ -6789,22 +7001,29 @@ var LLMClient = class {
 	* 获取所有模型的运行时状态（model_dashboard Tool 数据源）
 	*/
 	getModelStatuses() {
-		return [...this.models.values()].map((s) => ({
-			id: s.config.id,
-			name: s.config.name ?? s.config.id,
-			endpoint: s.config.endpoint,
-			activeRequests: s.active,
-			queuedRequests: s.queue.length,
-			maxConcurrency: s.maxConcurrency,
-			totalCalls: s.totalCalls,
-			successCount: s.successCount,
-			failureCount: s.failureCount,
-			successRate: s.totalCalls > 0 ? s.successCount / s.totalCalls : 1,
-			avgLatency: s.totalCalls > 0 ? Math.round(s.totalLatency / s.totalCalls) : 0,
-			totalTokensUsed: s.totalTokensUsed,
-			totalCost: Number(s.totalCost.toFixed(6)),
-			taskScores: s.config.initialCapabilities?.taskScores ?? {}
-		}));
+		return [...this.models.values()].map((s) => {
+			const robust = this.config.robustLatency ? this.robustStreamFor(s.config.id)?.read() : void 0;
+			return {
+				id: s.config.id,
+				name: s.config.name ?? s.config.id,
+				endpoint: s.config.endpoint,
+				activeRequests: s.active,
+				queuedRequests: s.queue.length,
+				maxConcurrency: s.maxConcurrency,
+				totalCalls: s.totalCalls,
+				successCount: s.successCount,
+				failureCount: s.failureCount,
+				successRate: s.totalCalls > 0 ? s.successCount / s.totalCalls : 1,
+				avgLatency: s.totalCalls > 0 ? Math.round(s.totalLatency / s.totalCalls) : 0,
+				totalTokensUsed: s.totalTokensUsed,
+				totalCost: Number(s.totalCost.toFixed(6)),
+				taskScores: s.config.initialCapabilities?.taskScores ?? {},
+				...robust ? {
+					robustAvgLatencyMs: Math.round(robust.robustMean),
+					robustLatencyMethod: robust.method
+				} : {}
+			};
+		});
 	}
 	/**
 	* 关闭客户端：拒绝所有排队中的请求
@@ -6812,7 +7031,26 @@ var LLMClient = class {
 	dispose() {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.robustStreams.clear();
 		for (const state of this.models.values()) for (const waiter of state.queue.splice(0)) waiter.reject(new LLMError("LLM 客户端已关闭，排队请求被取消"));
+	}
+	/**
+	* 23.0：取（或惰性创建）模型的稳健延迟流。
+	* 仅在配置 robustLatency 时返回流，否则返回 undefined（零开销路径）；
+	* dispose 后不再复活统计流（清空即终态）。
+	*/
+	robustStreamFor(modelId) {
+		if (!this.config.robustLatency) return void 0;
+		let stream = this.robustStreams.get(modelId);
+		if (!stream) {
+			if (this.disposed) return void 0;
+			stream = new RobustStream({
+				alpha: this.config.robustLatency.alpha,
+				maxSamples: this.config.robustLatency.maxSamples
+			});
+			this.robustStreams.set(modelId, stream);
+		}
+		return stream;
 	}
 	/** 获取并发槽位（必要时排队） */
 	acquireSlot(state) {
@@ -6849,6 +7087,7 @@ var LLMClient = class {
 				response.retries = attempt;
 				state.totalTokensUsed += response.tokensUsed;
 				state.totalCost += response.cost;
+				this.robustStreamFor(state.config.id)?.observe(response.latency);
 				this.config.onKeyOutcome?.(state.config.id, keyAttempt, true);
 				return response;
 			} catch (err) {
@@ -7243,6 +7482,14 @@ var ModelScheduler = class {
 	economicMultipliers = /* @__PURE__ */ new Map();
 	/** 6.0：自由能引擎（EFE 调度模式；未挂载/未启用零漂移） */
 	freeEnergy;
+	/** 21.0：索引调度器（Gittins 指数口径；未挂载零漂移） */
+	indexScheduler;
+	/** 22.0：预算路由器（Bandits with Knapsacks；未挂载零漂移） */
+	bwKRouter;
+	/** 22.0：预算提供器（每次选型时只读治理器剩余预算） */
+	bwKBudgetProvider;
+	/** 22.0：最近一次路由裁决（诊断口径；getAttachedDiagnostics 消费） */
+	lastBwKVerdict;
 	constructor(params) {
 		this.llm = params.llm;
 		this.memory = params.memory;
@@ -7301,6 +7548,34 @@ var ModelScheduler = class {
 		this.efeOutcomeNode = outcomeNode;
 	}
 	efeOutcomeNode = "task.outcome";
+	/**
+	* 21.0：挂载索引调度器（幂等覆盖，挂载即生效）。
+	*
+	* 挂载后 assignModelWithInsight 的动态选型升级为 Gittins 索引口径：
+	* 候选（Beta 后验臂）按 effectiveIndex = ν × availability 降序取榜首。
+	* preferred 短路 / avoidModels 剔除 / 无候选抛 ExecutionError 的语义
+	* 保持不变；未挂载时动态选型与原路径逐位一致（零漂移）。
+	*/
+	attachIndexScheduler(scheduler) {
+		this.indexScheduler = scheduler;
+	}
+	/**
+	* 22.0：挂载预算路由器与预算提供器（幂等覆盖）。
+	*
+	* budgetProvider 在每次选型时读取剩余预算（只读，不推进状态）；
+	* 返回 undefined 或 tokensRemaining ≤ 0 时本路由不介入（走原路径）。
+	*/
+	attachBwKRouter(router, budgetProvider) {
+		this.bwKRouter = router;
+		this.bwKBudgetProvider = budgetProvider;
+	}
+	/** 21.0/22.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
+	getAttachedDiagnostics() {
+		const diagnostics = {};
+		if (this.indexScheduler) diagnostics.indexScheduling = this.indexScheduler.getTable().snapshot();
+		if (this.lastBwKVerdict) diagnostics.lastBwK = this.lastBwKVerdict;
+		return diagnostics;
+	}
 	/** 模型的当前经济乘数（无信号 = 中性 1；economicFeedbackEnabled 关闭时恒为 1） */
 	economicMultiplierOf(modelId) {
 		if (this.config.economicFeedbackEnabled !== true) return 1;
@@ -7451,6 +7726,79 @@ var ModelScheduler = class {
 		};
 	}
 	/**
+	* 21.0/22.0：已挂载数学内核的候选选型（零漂移守卫——未挂载/预算
+	* 不可用时返回 undefined，调用方走原路径，行为与升级前逐位一致）。
+	*
+	* 优先级：indexScheduler（可证明最优的 Gittins 索引口径）>
+	* bwKRouter（预算约束下的 BwK 路由）> 原评分路径。两条内核路径均
+	* 保持 preferred 短路与 avoidModels 剔除之后的候选集语义。
+	*/
+	selectWithAttachedKernels(taskType, statuses) {
+		if (this.indexScheduler) {
+			const arms = statuses.map((status) => {
+				const estimate = this.memory.getBayesianEstimate(status.id, taskType);
+				return {
+					id: status.id,
+					successes: estimate ? estimate.alpha - 1 : 0,
+					failures: estimate ? estimate.beta - 1 : 0,
+					availability: 1
+				};
+			});
+			const ranked = this.indexScheduler.rank(arms);
+			const chosen = ranked[0];
+			if (chosen) {
+				const estimate = this.memory.getBayesianEstimate(chosen.id, taskType);
+				const bestMeanId = ranked.reduce((a, b) => b.posteriorMean > a.posteriorMean ? b : a).id;
+				const exploration = chosen.learningPremium > .03 && chosen.id !== bestMeanId;
+				return {
+					taskType,
+					modelId: chosen.id,
+					confidence: estimate ? estimate.posteriorMean : .5,
+					exploration,
+					effectiveSamples: estimate?.effectiveSamples ?? 0,
+					rationale: exploration ? `探索性选择 ${chosen.id}（Gittins 索引 ${chosen.effectiveIndex.toFixed(3)}（学习溢价 ${chosen.learningPremium.toFixed(3)}）@${chosen.rank} 位，后验均值 ${chosen.posteriorMean.toFixed(3)} 非最高，不确定性溢价驱动重估）` : `索引最优 ${chosen.id}（Gittins 索引 ${chosen.effectiveIndex.toFixed(3)}（学习溢价 ${chosen.learningPremium.toFixed(3)}）@${chosen.rank} 位，后验均值 ${chosen.posteriorMean.toFixed(3)}，有效样本 ${estimate?.effectiveSamples.toFixed(1) ?? "0"}）`,
+					economicMultiplier: this.economicMultiplierOf(chosen.id)
+				};
+			}
+			return;
+		}
+		if (this.bwKRouter && this.bwKBudgetProvider) {
+			const budget = this.bwKBudgetProvider();
+			if (budget && budget.tokensRemaining > 0) {
+				const arms = statuses.map((status) => {
+					const estimate = this.memory.getBayesianEstimate(status.id, taskType);
+					return {
+						id: status.id,
+						qualityMean: estimate ? estimate.posteriorMean : .5,
+						samples: estimate ? estimate.effectiveSamples : 0,
+						tokensMean: status.totalCalls > 0 ? status.totalTokensUsed / status.totalCalls : 600,
+						costMean: status.totalCalls > 0 && status.totalCost !== void 0 ? status.totalCost / status.totalCalls : void 0
+					};
+				});
+				const verdict = this.bwKRouter.route(arms, {
+					tokensRemaining: budget.tokensRemaining,
+					costRemaining: budget.costRemaining,
+					roundsRemaining: this.bwKRouter.getConfig().horizonDefault
+				});
+				this.lastBwKVerdict = verdict;
+				const chosenStatus = verdict.chosenId ? statuses.find((s) => s.id === verdict.chosenId) : void 0;
+				if (chosenStatus) {
+					const estimate = this.memory.getBayesianEstimate(chosenStatus.id, taskType);
+					const exploration = verdict.basis === "cheapest-shed" ? false : verdict.shadowPriceTokens > 0;
+					return {
+						taskType,
+						modelId: chosenStatus.id,
+						confidence: estimate ? estimate.posteriorMean : .5,
+						exploration,
+						effectiveSamples: estimate?.effectiveSamples ?? 0,
+						rationale: `预算路由选择 ${chosenStatus.id}（${verdict.reason}；预算率 ${verdict.rateTokens.toFixed(0)} tok/轮，剩余 token ${Math.round(budget.tokensRemaining)}）`,
+						economicMultiplier: this.economicMultiplierOf(chosenStatus.id)
+					};
+				}
+			}
+		}
+	}
+	/**
 	* 为任务类型分配最优模型（能力画像 × 贝叶斯记忆画像 × 成本感知 × 探索/利用权衡）
 	*
 	* 第三阶段：评分核心改用策略参数化的 scoreModelWithPolicy
@@ -7473,6 +7821,9 @@ var ModelScheduler = class {
 	* 4.0：avoidModels 负向约束——经验规避模型（历史超时/能力不足）从候选剔除，
 	* 推荐模型被规避时同样降级为动态评分选型（勘察修复：升级前 avoidModels
 	* 产出后无人消费，负向经验在调度端断链）。
+	* 21.0/22.0：挂载索引调度器 / 预算路由器后动态选型升级为 Gittins 索引 /
+	* Bandits-with-Knapsacks 口径（preferred 短路与 avoidModels 语义不变；
+	* 未挂载时逐位保持原行为）。
 	*/
 	assignModelWithInsight(taskType, preferred, context, options) {
 		const avoid = new Set(options?.avoidModels ?? []);
@@ -7485,6 +7836,8 @@ var ModelScheduler = class {
 		}, true);
 		const statuses = this.llm.getModelStatuses().filter((s) => !avoid.has(s.id));
 		if (statuses.length === 0) throw new ExecutionError("没有已注册的可用模型");
+		const kernelInsight = this.selectWithAttachedKernels(taskType, statuses);
+		if (kernelInsight) return kernelInsight;
 		const scored = this.scoreCandidates(taskType, context, statuses);
 		let best = scored[0];
 		for (const s of scored) if (s.total > best.total) best = s;
@@ -7822,7 +8175,7 @@ var TaskExecutor = class {
 				if (!this.breakers.canExecute(modelId).allowed) continue;
 			}
 			try {
-				const { output, quality, tokensUsed } = await this.runWithTimeout(node, modelId, context, signal, attempt);
+				const { output, quality, tokensUsed } = await this.runWithTimeout(node, modelId, context, signal, attempt, abortSignal);
 				const threshold = this.reflection?.getCurrentThreshold() ?? this.config.qualityThreshold;
 				let verdict = {
 					quality,
@@ -7949,21 +8302,24 @@ var TaskExecutor = class {
 		};
 	}
 	/** 带节点级超时的 nodeRunner 调用 */
-	async runWithTimeout(node, modelId, context, signal, attempt) {
+	async runWithTimeout(node, modelId, context, signal, attempt, abortSignal) {
 		const timeout = node.timeout ?? this.config.nodeTimeout;
 		let timer;
 		const timeoutPromise = new Promise((_resolve, reject) => {
 			timer = setTimeout(() => reject(new TimeoutError(`节点 ${node.id} 执行超时（${timeout}ms）`, { nodeId: node.id })), timeout);
 			timer.unref?.();
 		});
+		const exec = this.nodeRunner({
+			node,
+			modelId,
+			context,
+			signal,
+			attempt,
+			abortSignal
+		});
+		exec.then(() => {}, () => {});
 		try {
-			return await Promise.race([this.nodeRunner({
-				node,
-				modelId,
-				context,
-				signal,
-				attempt
-			}), timeoutPromise]);
+			return await Promise.race([exec, timeoutPromise]);
 		} finally {
 			if (timer) clearTimeout(timer);
 		}
@@ -7983,7 +8339,7 @@ var TaskExecutor = class {
 				`任务类型: ${node.type}`,
 				contextText ? `上游依赖产出:\n${contextText}` : ""
 			].filter(Boolean).join("\n")
-		}]);
+		}], { signal: params.abortSignal });
 		return {
 			output: response.content,
 			quality: response.content.trim().length > 0 ? Math.min(1, .75 + Math.min(.2, response.content.length / 1e4)) : 0,
@@ -9207,6 +9563,276 @@ function loadDashboardHtml() {
 	return "<html><body><h1>dashboard 页面未找到</h1></body></html>";
 }
 //#endregion
+//#region src/core/optimal-stopping.ts
+/**
+* optimal-stopping.ts — 最优停止内核（项目 19.0「等待有了数学价格」质变基座）
+*
+* 升级前的根本局限（defer 决策的拍脑袋阈值）：
+* - 「紧急度 < 0.3 且成本 > 5000 → 延迟 5 分钟」——两个魔数没有任何
+*   最优性依据：为什么是 0.3？为什么延迟恰好 5 分钟？延迟之后世界
+*   会更好还是更差？现有口径一概不知，defer 只是「不敢做」的委婉语；
+* - 「现在做」vs「等下一个机会」之间没有价值权衡：信号到达是随机的
+*   流，当前机会的紧急度是一次抽样——如果未来还会来 k 个机会，
+*   当前这次值不值得占坑，是一个标准的最优停止问题，但系统从没
+*   把它当最优停止问题对待过；
+* - 无竞争性保证：任何在线停止策略都至少要回答「最坏比能看到的
+*   最好的差多少」（先知差距）——没有这个下界，defer 策略无法
+*   自证不是在系统性放弃价值。
+*
+* 本内核引入最优停止理论（经典秘书问题谱系：Krengel–Sucheston–
+* Garling 先知不等式；Samuel-Cahn 1984 阈值规则；Bruss 2000 赔率算法）：
+*
+* 1. **精确向后归纳（经验分布上的最优解）**：机会价值 ~ 经验分布
+*      Vₙ = E[X]；V_k = E[max(X, V_{k+1})] = (1/m) Σᵢ max(xᵢ, V_{k+1})
+*    还剩 k 次机会时的期望所得 V_k 逐层精确递推（经验测度下无近似）；
+*    最优策略是阈值策略：当前值 ≥ V_{k−1}（继续价值）即停。
+*
+* 2. **先知基准（prophet value）**：E[max X₁..Xₙ] 由次序统计量精确计算
+*      P(M ≤ x) = F(x)ⁿ ⇒ E[M] = Σᵢ x₍ᵢ₎·[(i/m)ⁿ − ((i−1)/m)ⁿ]
+*    任何在线策略的所得 ≤ 先知所得——先知差距（competitive ratio）
+*    衡量停止策略的成色。
+*
+* 3. **Samuel-Cahn 单阈值规则（分布无关 ½ 保证）**：取 τ = max 的中位数
+*    （F(τ)ⁿ = 1/2 的解），首见 X ≥ τ 即停。对**任意分布**保证
+*      E[规则所得] ≥ ½·E[先知所得]
+*    ——不需要知道分布形状的保守底线，且对适中的 n 常显著超过 ½。
+*
+* 4. **秘书问题与赔率算法（序贯选择的另两把刀）**：
+*    - 1/e 规则（n 已知、只见相对名次）：跳过前 n/e 个，之后取首个
+*      纪录——以恰好 1/e 概率选中全局最优，渐近最优；
+*    - Bruss 赔率算法（独立事件「最后一个成功」）：赔率 r = p/(1−p)，
+*      从最后一个 Σ r ≥ 1 的下标起在首个成功处停——期望停止次数
+*      与最优相差 ≤ 1 的优雅定理。
+*
+* 5. **机会停止器（OpportunityStopper）**：按上下文（信号类型）流式
+*    积累机会价值经验分布，`assess(当前值, 剩余机会数)` 返回
+*    { act, threshold, ruleValue, prophetValue, competitiveRatio }——
+*    defer/execute 第一次由「继续价值的精确阈值」而非拍脑袋魔数裁决。
+*
+* 与 8.0 的关系：8.0 元推理回答「**思考**何时停」（内部计算的最优
+* 分配），本内核回答「**等待**何时停」（外部机会的最优锁定）——
+* 内外两种停止问题共用「继续价值 vs 立即价值」的同一数学骨架；
+* 与 12.0 的关系：12.0 保证「随时下结论不夸大」（证据侧），本内核
+* 保证「何时下结论不吃亏」（行动侧）——结论的有效性与结论的时机
+* 构成决策的完整两面；与 18.0 的关系：18.0 约束单步变异的信息量，
+* 本内核约束单步等待的机会成本——进化与行动都有了自己的最优性口径。
+*/
+/**
+* 先知价值 E[max X₁..Xₙ]（经验分布次序统计量精确计算）。
+*
+* m 个样本的经验分布上：P(Mₙ ≤ x₍ᵢ₎) = (i/m)ⁿ，故
+*   E[Mₙ] = Σᵢ x₍ᵢ₎·[(i/m)ⁿ − ((i−1)/m)ⁿ]
+* @param samples 经验样本（机会价值历史）
+* @param n 未来机会次数
+*/
+function prophetValue(samples, n) {
+	const m = samples.length;
+	if (m === 0 || n <= 0) return 0;
+	const sorted = [...samples].sort((a, b) => a - b);
+	let expected = 0;
+	for (let i = 1; i <= m; i += 1) {
+		const cdfJump = Math.pow(i / m, n) - Math.pow((i - 1) / m, n);
+		expected += sorted[i - 1] * cdfJump;
+	}
+	return expected;
+}
+/**
+* 向后归纳最优停止价值 V_k（经验测度精确递推）。
+*
+* V_k = 还剩 k 次机会时的期望所得；thresholds[k] = V_{k−1} 为
+* 「剩 k 次时的最优接受阈值」（当前值 ≥ thresholds[k] 即停）。
+* @returns [V₁..Vₙ]（剩 k 次的价值）与对应阈值
+*/
+function backwardInduction(samples, n) {
+	const m = samples.length;
+	if (m === 0 || n <= 0) return {
+		values: [],
+		thresholds: []
+	};
+	const values = new Array(n);
+	let v = samples.reduce((s, x) => s + x, 0) / m;
+	values[n - 1] = v;
+	for (let k = n - 1; k >= 1; k -= 1) {
+		v = samples.reduce((s, x) => s + Math.max(x, v), 0) / m;
+		values[k - 1] = v;
+	}
+	return {
+		values,
+		thresholds: values.slice(0, n - 1).map((x) => x)
+	};
+}
+/**
+* Samuel-Cahn 单阈值规则：τ = Mₙ 的中位数（F(τ)ⁿ = 1/2）。
+*
+* 分布无关保证：E[规则所得] ≥ ½·E[先知所得]（任意分布）。
+* @returns 阈值 τ 与规则期望所得
+*/
+function samuelCahnRule(samples, n) {
+	const m = samples.length;
+	if (m === 0 || n <= 0) return {
+		threshold: Infinity,
+		ruleValue: 0,
+		prophet: 0
+	};
+	const sorted = [...samples].sort((a, b) => a - b);
+	let threshold = sorted[sorted.length - 1];
+	for (let i = 1; i <= m; i += 1) if (Math.pow(i / m, n) >= .5) {
+		threshold = sorted[i - 1];
+		break;
+	}
+	const p = samples.filter((x) => x >= threshold).length / m;
+	const exceedGain = samples.filter((x) => x >= threshold).reduce((s, x) => s + x, 0) / m;
+	const ruleValue = p > 0 ? exceedGain * (1 - Math.pow(1 - p, n)) / p : exceedGain;
+	return {
+		threshold,
+		ruleValue,
+		prophet: prophetValue(samples, n)
+	};
+}
+/**
+* 1/e 规则（秘书问题，n 已知）：跳过前 ⌊n/e⌋ 个候选，之后录取首个
+* 纪录（比已见全部更好者）。选中全局最优的概率 → 1/e（渐近最优）。
+* @returns 观察期内应跳过的数量
+*/
+function secretarySkipCount(n) {
+	if (n <= 1) return 0;
+	return Math.max(1, Math.floor(n / Math.E));
+}
+/**
+* Bruss 赔率算法（最后一个成功问题）：独立事件成功概率 p₁..pₙ，
+* 赔率 r = p/(1−p)。s* = 最大下标使后缀赔差和 Σ_{k≥s} rₖ ≥ 1
+* （从最后一个事件往前累加，和首次达到 1 的下标即 s*）；从 s* 起
+* 在首个成功处停。定理：期望停止次数与最优策略相差 ≤ 1（若存在 s*）。
+* p=1 的臂赔差为 Infinity：后缀和必 ≥ 1，规则自然落在最后一个 p=1
+* 位置处或其后（Infinity 仅参与加法与比较，不产生 NaN）。
+* @returns 起始下标 s*（1 起；无 s* 返回 0 = 全程不押）
+*/
+function brussOddsIndex(successProbabilities) {
+	const n = successProbabilities.length;
+	let suffix = 0;
+	let sStar = 0;
+	for (let i = n - 1; i >= 0; i -= 1) {
+		const p = Math.max(0, Math.min(1, successProbabilities[i]));
+		const odds = p >= 1 ? Infinity : p / (1 - p);
+		suffix += odds;
+		if (suffix >= 1) {
+			sStar = i + 1;
+			break;
+		}
+	}
+	return sStar;
+}
+const DEFAULT_OPTIMAL_STOPPING_CONFIG = {
+	minSamples: 8,
+	maxSamples: 200,
+	thresholdMultiplier: 1
+};
+/**
+* 机会停止器：按上下文流式积累机会价值分布，精确裁决「现在 vs 等待」。
+*
+* 用法：
+*   const stopper = new OpportunityStopper();
+*   stopper.note('deploy-request', 0.62);  // 每次机会到达时喂值
+*   const v = stopper.assess('deploy-request', 0.58, 3);  // 现值 0.58、还会来 ~3 次
+*   if (v.act) 执行(); else 等待();       // 阈值由 V_{k−1} 精确给出
+*
+* 数学保证：act = (value ≥ V_{remaining}) 是经验测度下的精确最优
+* 策略（阈值策略）；competitiveRatio ≥ 0.5 由 Samuel-Cahn 定理背书
+* （报告侧审计用）。
+*/
+var OpportunityStopper = class {
+	config;
+	contexts = /* @__PURE__ */ new Map();
+	/** 最近裁决审计 */
+	recent = [];
+	constructor(config) {
+		this.config = {
+			...DEFAULT_OPTIMAL_STOPPING_CONFIG,
+			...config
+		};
+	}
+	/** 记录一次机会价值观测（FIFO 容量控制） */
+	note(context, value) {
+		let ctx = this.contexts.get(context);
+		if (!ctx) {
+			ctx = { samples: [] };
+			this.contexts.set(context, ctx);
+		}
+		ctx.samples.push(Math.max(0, Math.min(1, value)));
+		if (ctx.samples.length > this.config.maxSamples) ctx.samples.shift();
+	}
+	/** 上下文样本量 */
+	sampleCount(context) {
+		return this.contexts.get(context)?.samples.length ?? 0;
+	}
+	/**
+	* 裁决「立即行动 vs 等待」。
+	*
+	* @param context 上下文（如信号类型）
+	* @param value 当前机会价值（0~1 口径）
+	* @param remaining 预计剩余机会数（缺省 1——等价于最后一搏）
+	*/
+	assess(context, value, remaining = 1) {
+		const samples = this.contexts.get(context)?.samples ?? [];
+		const v = Math.max(0, Math.min(1, value));
+		const k = Math.max(1, Math.floor(remaining));
+		const insufficient = {
+			act: true,
+			threshold: 0,
+			value: v,
+			remaining: k,
+			optimalValue: 0,
+			ruleValue: 0,
+			prophet: 0,
+			competitiveRatio: 0,
+			samples: samples.length,
+			basis: "insufficient",
+			interpretation: `经验不足（${samples.length}/${this.config.minSamples}）——弃权口径：不阻止行动，先积累机会分布`
+		};
+		if (samples.length < this.config.minSamples) return insufficient;
+		const { values } = backwardInduction(samples, k);
+		const threshold = (k >= 2 ? values[k - 2] : mean$1(samples)) * this.config.thresholdMultiplier;
+		const sc = samuelCahnRule(samples, k);
+		const competitiveRatio = sc.prophet > 1e-12 ? sc.ruleValue / sc.prophet : 0;
+		const act = v >= threshold;
+		const verdict = {
+			act,
+			threshold: round$16(threshold),
+			value: round$16(v),
+			remaining: k,
+			optimalValue: round$16(values[k - 1]),
+			ruleValue: round$16(sc.ruleValue),
+			prophet: round$16(sc.prophet),
+			competitiveRatio: round$16(competitiveRatio),
+			samples: samples.length,
+			basis: "backward-induction",
+			interpretation: act ? `现值 ${v.toFixed(3)} ≥ 继续价值 ${threshold.toFixed(3)}（剩 ${k} 次机会的最优接受线，${samples.length} 样本精确归纳）——立即行动即最优` : `现值 ${v.toFixed(3)} < 继续价值 ${threshold.toFixed(3)}（等下一个机会期望更优；先知上界 ${sc.prophet.toFixed(3)}，单阈值规则成色 ${(competitiveRatio * 100).toFixed(0)}%）——等待有数学价格`
+		};
+		this.recent.push({
+			context,
+			at: Date.now(),
+			act,
+			value: round$16(v),
+			threshold: round$16(threshold),
+			competitiveRatio: round$16(competitiveRatio)
+		});
+		if (this.recent.length > 50) this.recent.shift();
+		return verdict;
+	}
+	/** 最近裁决审计 */
+	recentVerdicts(limit = 10) {
+		return this.recent.slice(-limit);
+	}
+};
+function mean$1(xs) {
+	if (xs.length === 0) return 0;
+	return xs.reduce((s, x) => s + x, 0) / xs.length;
+}
+/** 六位小数圆整（项目统一展示口径） */
+function round$16(x) {
+	return Number(x.toFixed(6));
+}
+//#endregion
 //#region src/decision-engine.ts
 /**
 * decision-engine.ts — 战略决策引擎（闭环"决策"环节深度优化）
@@ -9270,11 +9896,33 @@ var DecisionEngine = class {
 		strategistCalls: 0,
 		heuristicFallbacks: 0
 	};
+	/** 19.0：机会停止器（挂载后 defer/execute 由继续价值阈值裁决） */
+	stopper;
+	/** 19.0：defer 窗口内的预计剩余机会数（继续价值 V_{k−1} 的口径） */
+	stopperHorizon = 3;
+	/** 19.0：停止器裁决审计（最近若干次） */
+	stopperVerdicts = [];
 	constructor(config) {
 		this.config = {
 			...DEFAULT_DECISION_ENGINE_CONFIG,
 			...config
 		};
+	}
+	/**
+	* 19.0：挂载最优停止内核（幂等；挂载后规则 C 的成本闸门从
+	* 「urgency < 0.3 且 cost > 5000 → defer」的魔数口径升级为
+	* 继续价值裁决：每类信号的紧急度流喂入经验分布，defer 窗口内
+	* 预计还有 horizon 次同类机会——当前紧急度 ≥ V_{horizon}（向后
+	* 归纳精确阈值）即执行（占坑数学最优），否则 defer（等待有价）。
+	* 不 attach 即零漂移（原魔数规则）。
+	*/
+	attachOptimalStopper(options) {
+		this.stopper = new OpportunityStopper({ minSamples: options?.minSamples });
+		this.stopperHorizon = Math.max(1, Math.floor(options?.horizon ?? 3));
+	}
+	/** 19.0：最近停止器裁决审计 */
+	getStopperVerdicts(limit = 10) {
+		return this.stopperVerdicts.slice(-limit);
 	}
 	/**
 	* 对一批信号做决策（四级流水线）
@@ -9285,6 +9933,9 @@ var DecisionEngine = class {
 	async decide(signals, history) {
 		const results = /* @__PURE__ */ new Map();
 		const needStrategist = [];
+		if (this.stopper) {
+			for (const signal of signals) if (typeof signal.urgency === "number" && Number.isFinite(signal.urgency)) this.stopper.note(signal.type, signal.urgency);
+		}
 		for (const signal of signals) {
 			const fingerprint = fingerprintOf(signal);
 			const ruleDecision = this.applyRules(signal, fingerprint, history.get(signal.type));
@@ -9411,18 +10062,51 @@ var DecisionEngine = class {
 		};
 		if (stats && stats.avgTokenCost > 0 && signal.urgency !== void 0) {
 			const estimatedCost = stats.avgTokenCost;
-			if (signal.urgency < .3 && estimatedCost > 5e3) return {
-				action: "defer",
-				urgency: signal.urgency,
-				confidence: .7,
-				reason: `高成本任务（约 ${estimatedCost} tokens）且紧急度低，延迟到空闲期`,
-				source: "rule",
-				deferMs: 3e5,
-				estimatedCost,
-				decidedAt: now
-			};
+			if (signal.urgency < .3 && estimatedCost > 5e3) {
+				const stopperVerdict = this.assessOpportunity(signal.type, signal.urgency);
+				if (stopperVerdict?.act) return {
+					action: "execute",
+					urgency: signal.urgency,
+					confidence: .75,
+					reason: `高成本但现值已过继续价值线：${stopperVerdict.interpretation}`,
+					source: "rule",
+					estimatedCost,
+					decidedAt: now
+				};
+				return {
+					action: "defer",
+					urgency: signal.urgency,
+					confidence: .7,
+					reason: stopperVerdict ? `高成本任务（约 ${estimatedCost} tokens）且 ${stopperVerdict.interpretation}` : `高成本任务（约 ${estimatedCost} tokens）且紧急度低，延迟到空闲期`,
+					source: "rule",
+					deferMs: 3e5,
+					estimatedCost,
+					decidedAt: now
+				};
+			}
 		}
 		return null;
+	}
+	/**
+	* 19.0：机会价值评估（规则 C 内部调用）。
+	*
+	* 紧急度流已在 decide() 逐信号喂入停止器；此处评估当前抽值是否
+	* 越过继续价值。未挂载或经验不足（insufficient）返回 undefined
+	* ——回退原魔数口径（诚实弃权，零漂移）。
+	*/
+	assessOpportunity(signalType, urgency) {
+		if (!this.stopper) return void 0;
+		const verdict = this.stopper.assess(signalType, urgency, this.stopperHorizon);
+		if (verdict.basis !== "backward-induction") return void 0;
+		this.stopperVerdicts.push({
+			signalType,
+			at: Date.now(),
+			act: verdict.act,
+			value: verdict.value,
+			threshold: verdict.threshold
+		});
+		if (this.stopperVerdicts.length > 50) this.stopperVerdicts.shift();
+		return verdict;
 	}
 	/** 第 2 级：缓存查询（校验 TTL 与置信度） */
 	lookupCache(fingerprint) {
@@ -10686,6 +11370,326 @@ function lessonsToInsights(lessons) {
 	}));
 }
 //#endregion
+//#region src/core/optimal-transport.ts
+/**
+* optimal-transport.ts — 最优传输内核（项目 17.0「漂移检测看见分布的形状」质变基座）
+*
+* 升级前的根本局限（均值水位检测的形状盲区）：
+* - 12.0 的 e-过程 / 置信序列盯的是**均值水位**（μ 是否越过水位线）——
+*   一个均值不变、形状巨变的分布（双峰化、方差爆炸、尾部变厚）在
+*   水位线检测下完全隐形：μ̂ 纹丝不动，系统却已经换了世界；
+* - z-score / 方差检测只看一两个矩——矩相同而分布不同的两个世界
+*   无穷多，二阶统计不足以充当「世界没变」的证书；
+* - KL 散度在不相交支撑（旧窗口全是 0.6，新窗口全是 0.9）上
+*   发散为 ∞，既不可比较也不可累积；平方误差只看均值差。
+*
+* 本内核引入 Monge–Kantorovich 最优传输理论（Villani 2009 Fields /
+* Cuturi 2013 Sinkhorn / Peyré–Cuturi 2019 计算最优传输）：
+*
+* 1. **一维精确 Wasserstein-p**（分位数耦合）：
+*      W_p(μ, ν) = ( ∫₀¹ |F_μ⁻¹(q) − F_ν⁻¹(q)|ᵖ dq )^{1/p}
+*    一维情形最优耦合就是分位数单调配对（秩相依 / comonotone 耦合），
+*    经验分布上排序后逐分位配对即**精确值**——不是近似，O(n log n)。
+*    W₁ = 「把分布 μ 的土搬到 ν 的最小搬运代价」，单位就是被监测
+*    量本身的单位（质量分 / 延迟毫秒）——可解释、可设定阈。
+*
+* 2. **熵正则 Sinkhorn（任意代价矩阵的离散 OT）**：
+*      min_π ⟨C, π⟩ + ε·KL(π ‖ a bᵀ),  s.t. π1 = μ, πᵀ1 = ν
+*    Cuturi 2013：Sinkhorn 不动点迭代在 Hilbert 度量下收缩，
+*    O(k²) 每步、线性收敛；对数域稳定化（log-sum-exp）防下溢。
+*    代价矩阵可以是任意「行为距离」——预算在 niche 网格间的
+*    最小移动方案（探索预算再平衡）有了数学最优解。
+*
+* 3. **Wasserstein 重心（barycenter）**：
+*    一维固定质量情形，重心 = 分位数平均：B⁻¹(q) = Σ wᵢ Fᵢ⁻¹(q)。
+*    多个窗口 / 多个模型的分布信息融合为一条「共识分布」——
+*    比「平均的均值」保留全部形状（均值融合丢掉形状，重心融合
+*    保留形状），11.0 定律归纳的分布版。
+*
+* 4. **形状感知漂移监视器（TransportDriftMonitor）**：
+*    滑动窗 vs 基准窗的 W₁ 持续计算；阈值不是拍的——历史窗口间
+*    W₁ 的经验分布给出「正常漂移」的分位数（conformal 式阈值，
+*    与 13.0 同一哲学：让数据自己定阈），超越即报 shape-drift。
+*
+* 与 12.0 的关系：12.0 盯水位（均值），本内核盯形状（全分布）——
+* 「水平没变但世界换了」第一次可见；与 13.0 的关系：保形覆盖保证
+* 在分布漂移下失效，本内核是保形区间的**绊线**（先见漂移、再谈覆盖）；
+* 与 14.0 的关系：Sinkhorn 给出探索预算跨 niche 的最优搬运方案，
+* 多样性维护从「均匀采样」升维为「最小代价再平衡」。
+*/
+/**
+* 一维经验 Wasserstein-p 距离（精确：分位数单调耦合）。
+*
+* 两个样本集各自视为等权经验分布；排序后按分位配对：
+*   W_p = ( (1/m) Σ |a_(i) − b_(i)|ᵖ )^{1/p}（m = n 时逐秩配对；
+*   m ≠ n 时按经验分位数网格插值）。
+*
+* @param p 距离阶数（1 = 搬运代价，2 = 能量距离；缺省 1）
+*/
+function wasserstein1D(samplesA, samplesB, p = 1) {
+	const a = [...samplesA].filter(Number.isFinite).sort((x, y) => x - y);
+	const b = [...samplesB].filter(Number.isFinite).sort((x, y) => x - y);
+	if (a.length === 0 || b.length === 0) return 0;
+	const grid = 256;
+	let acc = 0;
+	for (let i = 0; i < grid; i += 1) {
+		const q = (i + .5) / grid;
+		const delta = quantileSorted(a, q) - quantileSorted(b, q);
+		acc += Math.pow(Math.abs(delta), p);
+	}
+	return Math.pow(acc / grid, 1 / p);
+}
+/** 排序数组的经验分位数（线性插值；q ∈ [0,1]） */
+function quantileSorted(sorted, q) {
+	if (sorted.length === 0) return 0;
+	if (sorted.length === 1) return sorted[0];
+	const pos = Math.max(0, Math.min(1, q)) * (sorted.length - 1);
+	const lo = Math.floor(pos);
+	const hi = Math.ceil(pos);
+	if (lo === hi) return sorted[lo];
+	return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+/**
+* 一维 Wasserstein 重心（分位数平均）：多个经验分布按权重融合为一条共识分布。
+*
+* B⁻¹(q) = Σᵢ wᵢ Fᵢ⁻¹(q)——保留全部形状信息的「分布平均」
+* （均值的平均只留一个数，重心的平均留一条曲线）。
+*
+* @returns 重心的代表样本集（分位数网格采样），可直接参与后续 W 距离计算
+*/
+function wassersteinBarycenter1D(distributions, weights) {
+	const valid = distributions.filter((d) => d.length > 0);
+	if (valid.length === 0) return [];
+	const w = weights && weights.length === valid.length && weights.reduce((s, x) => s + x, 0) > 0 ? weights.map((x) => x / weights.reduce((s, y) => s + y, 0)) : valid.map(() => 1 / valid.length);
+	const sorted = valid.map((d) => [...d].sort((x, y) => x - y));
+	const grid = 128;
+	const result = [];
+	for (let i = 0; i < grid; i += 1) {
+		const q = (i + .5) / grid;
+		result.push(sorted.reduce((acc, s, k) => acc + w[k] * quantileSorted(s, q), 0));
+	}
+	return result;
+}
+const DEFAULT_SINKHORN_CONFIG = {
+	epsilon: .05,
+	maxIterations: 300,
+	tolerance: 1e-8,
+	maxCost: 100
+};
+/**
+* 对数域稳定化 Sinkhorn 求解器
+*
+* 不动点迭代（Hilbert 度量压缩，Franklin–Lorenz 1989；Cuturi 2013）：
+*   f_i ← −ε log Σ_j exp((g_j − C_ij)/ε) a_j
+*   g_j ← −ε log Σ_i exp((f_i − C_ij)/ε) b_i
+* 全程 log-sum-exp，指数下溢免疫；f、g 为对偶势（Kantorovich 最优
+* 对偶变量的熵正则版）。
+*/
+function sinkhorn(cost, sourceMass, targetMass, config) {
+	const cfg = {
+		...DEFAULT_SINKHORN_CONFIG,
+		...config
+	};
+	const n = sourceMass.length;
+	const m = targetMass.length;
+	if (n === 0 || m === 0 || cost.length !== n) return {
+		plan: [],
+		cost: 0,
+		converged: false,
+		iterations: 0,
+		residual: Infinity
+	};
+	const sumA = sourceMass.reduce((s, x) => s + x, 0);
+	const sumB = targetMass.reduce((s, x) => s + x, 0);
+	if (!(sumA > 0) || !(sumB > 0)) return {
+		plan: [],
+		cost: 0,
+		converged: false,
+		iterations: 0,
+		residual: Infinity
+	};
+	const a = sourceMass.map((x) => x / sumA);
+	const b = targetMass.map((x) => x / sumB);
+	const logC = [];
+	for (let i = 0; i < n; i += 1) {
+		const row = [];
+		for (let j = 0; j < m; j += 1) {
+			const c = Math.max(0, Math.min(cfg.maxCost, Math.abs(cost[i]?.[j] ?? 0)));
+			row.push(-c / cfg.epsilon);
+		}
+		logC.push(row);
+	}
+	const logA = a.map((x) => x > 0 ? Math.log(x) : -Infinity);
+	const logB = b.map((x) => x > 0 ? Math.log(x) : -Infinity);
+	const f = new Float64Array(n);
+	const g = new Float64Array(m);
+	const prevF = new Float64Array(n);
+	const prevG = new Float64Array(m);
+	let converged = false;
+	let iterations = 0;
+	let residual = Infinity;
+	for (let iter = 0; iter < cfg.maxIterations; iter += 1) {
+		iterations = iter + 1;
+		for (let i = 0; i < n; i += 1) f[i] = -logSumExp$1(logC[i].map((lc, j) => g[j] + lc + logB[j]));
+		for (let j = 0; j < m; j += 1) g[j] = -logSumExp$1(logC.map((row, i) => f[i] + row[j] + logA[i]));
+		let maxDrift = 0;
+		for (let i = 0; i < n; i += 1) maxDrift = Math.max(maxDrift, Math.abs(f[i] - prevF[i]));
+		for (let j = 0; j < m; j += 1) maxDrift = Math.max(maxDrift, Math.abs(g[j] - prevG[j]));
+		residual = maxDrift;
+		if (maxDrift < cfg.tolerance) {
+			converged = true;
+			break;
+		}
+		prevF.set(f);
+		prevG.set(g);
+	}
+	const plan = [];
+	let transportCost = 0;
+	for (let i = 0; i < n; i += 1) {
+		const row = [];
+		for (let j = 0; j < m; j += 1) {
+			const pij = a[i] * b[j] * Math.exp(f[i] + g[j] + logC[i][j]);
+			row.push(pij);
+			transportCost += pij * Math.abs(cost[i][j] ?? 0);
+		}
+		plan.push(row);
+	}
+	return {
+		plan,
+		cost: round$15(transportCost),
+		converged,
+		iterations,
+		residual: round$15(residual)
+	};
+}
+/** log-sum-exp（数值稳定） */
+function logSumExp$1(xs) {
+	let max = -Infinity;
+	for (const x of xs) if (x > max) max = x;
+	if (max === -Infinity) return -Infinity;
+	let acc = 0;
+	for (const x of xs) acc += Math.exp(x - max);
+	return max + Math.log(acc);
+}
+const DEFAULT_TRANSPORT_DRIFT_CONFIG = {
+	windowSize: 50,
+	referenceSize: 200,
+	thresholdQuantile: .95,
+	minSamples: 20,
+	severityScale: 1
+};
+/**
+* 形状感知传输漂移监视器
+*
+* 用法：
+*   const monitor = new TransportDriftMonitor();
+*   monitor.observe(0.82);  // 持续喂入被监测量（质量分 / 延迟 / 收益）
+*   monitor.drift();        // 任意时刻读取（W₁ 原单位 + 自适应阈值）
+*
+* 几何细节：基准窗取**滑动窗之前**的样本（两窗不相交）——若拿
+* 包含自身的历史当基准，W₁ 被窗口⊂基准的相关性系统性压低，
+* 阈值口径失真。阈值哲学（与 13.0 同源）：不拍脑袋——历史平稳期
+* 两两 W₁ 构成「正常漂移」经验分布，thresholdQuantile 分位即阈值；
+* 新 W₁ 入账前先裁决，漂移期样本不污染基准。
+*/
+var TransportDriftMonitor = class {
+	config;
+	buffer = [];
+	historyW1 = [];
+	lastDrifting = false;
+	events = [];
+	constructor(config) {
+		this.config = {
+			...DEFAULT_TRANSPORT_DRIFT_CONFIG,
+			...config
+		};
+	}
+	/** 观测一次被监测量 */
+	observe(x) {
+		const v = Number.isFinite(x) ? x : 0;
+		this.buffer.push(v);
+		if (this.buffer.length > this.config.referenceSize) this.buffer.shift();
+		const view = this.drift();
+		if (!view.drifting && view.samples.window >= this.config.minSamples) {
+			this.historyW1.push(view.w1);
+			if (this.historyW1.length > 200) this.historyW1.shift();
+		}
+		if (view.drifting !== this.lastDrifting) {
+			this.events.push({
+				at: Date.now(),
+				kind: view.kind,
+				severity: view.severity,
+				w1: view.w1,
+				threshold: view.threshold
+			});
+			if (this.events.length > 50) this.events.shift();
+			this.lastDrifting = view.drifting;
+		}
+		return view;
+	}
+	/** 当前漂移视图（纯读取） */
+	drift() {
+		const window = this.buffer.slice(-this.config.windowSize);
+		const baseline = this.buffer.slice(0, Math.max(0, this.buffer.length - this.config.windowSize));
+		const w1 = wasserstein1D(window, baseline, 1);
+		const threshold = this.currentThreshold(baseline);
+		const drifting = window.length >= this.config.minSamples && baseline.length >= this.config.minSamples && w1 > threshold;
+		const meanShift = mean(window) - mean(baseline);
+		const spreadRatio = stddev(baseline) > 1e-12 ? stddev(window) / stddev(baseline) : 1;
+		const levelDominant = Math.abs(meanShift) > .5 * w1 + 1e-12 && Math.abs(meanShift) > .02;
+		const kind = !drifting ? "none" : levelDominant && (spreadRatio > 1.25 || spreadRatio < .8) ? "both" : levelDominant ? "level" : "shape";
+		return {
+			w1: round$15(w1),
+			threshold: round$15(threshold),
+			drifting,
+			severity: round$15(drifting ? (w1 / Math.max(threshold, 1e-12) - 1) * this.config.severityScale : 0),
+			meanShift: round$15(meanShift),
+			spreadRatio: round$15(spreadRatio),
+			kind,
+			samples: {
+				window: window.length,
+				reference: baseline.length
+			},
+			interpretation: this.interpret(kind, w1, threshold, spreadRatio, window.length)
+		};
+	}
+	/** 漂移事件审计（翻转沿） */
+	recentEvents(limit = 10) {
+		return this.events.slice(-limit);
+	}
+	/** 当前自适应阈值（历史 W₁ 的分位；历史不足时退化为 2.5σ 启发） */
+	currentThreshold(baseline) {
+		if (this.historyW1.length >= 10) {
+			const sorted = [...this.historyW1].sort((x, y) => x - y);
+			return Math.max(1e-12, quantileSorted(sorted, this.config.thresholdQuantile));
+		}
+		if (baseline.length >= this.config.minSamples) return Math.max(1e-12, 2.5 * stddev(baseline));
+		return Infinity;
+	}
+	interpret(kind, w1, threshold, spreadRatio, windowCount) {
+		if (kind === "none") return windowCount < this.config.minSamples ? `样本积累中（${windowCount}/${this.config.minSamples}），形状监测待命` : `分布形状稳定（W₁=${w1.toFixed(4)} ≤ 阈值 ${threshold.toFixed(4)}）`;
+		if (kind === "level") return `分布整体位移（W₁=${w1.toFixed(4)} > ${threshold.toFixed(4)}）：均值水位漂移，形状未变`;
+		if (kind === "shape") {
+			const spread = spreadRatio > 1 ? `展宽 ×${spreadRatio.toFixed(2)}（双峰化/尾部变厚）` : `收窄 ×${spreadRatio.toFixed(2)}（分布聚集）`;
+			return `形状漂移（W₁=${w1.toFixed(4)} > ${threshold.toFixed(4)}）：均值水位基本未动但${spread}——水位检测盲区，先知漂移再谈覆盖`;
+		}
+		return `复合漂移（W₁=${w1.toFixed(4)} > ${threshold.toFixed(4)}）：均值与形状同时改变，世界已换`;
+	}
+};
+function mean(xs) {
+	if (xs.length === 0) return 0;
+	return xs.reduce((s, x) => s + x, 0) / xs.length;
+}
+function stddev(xs) {
+	if (xs.length < 2) return 0;
+	const m = mean(xs);
+	return Math.sqrt(xs.reduce((s, x) => s + (x - m) * (x - m), 0) / (xs.length - 1));
+}
+/** 六位小数圆整（与 12.0/13.0/16.0 统一展示口径） */
+function round$15(x) {
+	return Number(x.toFixed(6));
+}
+//#endregion
 //#region src/meta-cognition.ts
 /** 默认配置 */
 const DEFAULT_META_COGNITION_CONFIG = {
@@ -10757,6 +11761,10 @@ var MetaCognitionEngine = class {
 	scientistMind;
 	/** 12.0：KPI 保证层（挂载后退化/恢复判定获得任意时刻有效背书） */
 	anytimeGuards;
+	/** 17.0：形状感知传输漂移监视（挂载后分布形状变化可见） */
+	transportDrift;
+	/** 17.0：各 KPI 的上次漂移态（翻转沿触发洞察） */
+	transportDriftState = /* @__PURE__ */ new Map();
 	/** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
 	guardAlpha = .05;
 	/**
@@ -10800,6 +11808,50 @@ var MetaCognitionEngine = class {
 			reference: this.config.qualityTarget
 		})]]);
 		this.regimeWatches = /* @__PURE__ */ new Map();
+	}
+	/**
+	* 17.0：挂载形状感知传输漂移监视（幂等；缺省覆盖 avgQuality / avgLatency）。
+	*
+	* 12.0 保证层盯**均值水位**（μ 是否越过目标线），本层盯**分布形状**
+	* （滑动窗 vs 基准窗的 Wasserstein-1）——均值不变而形状巨变
+	* （双峰化 / 尾部变厚）的「换了世界」第一次可见；13.0 保形区间的
+	* 覆盖保证在漂移下失效，本层是其绊线。阈值自适应（历史 W₁ 分位），
+	* 不 attach 即零漂移。
+	*/
+	attachTransportDrift(options) {
+		const kpis = options?.kpis ?? ["avgQuality", "avgLatency"];
+		const monitorOptions = {};
+		for (const key of [
+			"windowSize",
+			"referenceSize",
+			"thresholdQuantile",
+			"minSamples"
+		]) {
+			const v = options?.[key];
+			if (typeof v === "number" && Number.isFinite(v)) monitorOptions[key] = v;
+		}
+		this.transportDrift = /* @__PURE__ */ new Map();
+		for (const kpi of kpis) this.transportDrift.set(kpi, new TransportDriftMonitor(monitorOptions));
+	}
+	/** 17.0：形状漂移检验（每批快照后调用；翻转沿产出洞察，稳态不重复打扰） */
+	checkTransportDrift(kpi, value) {
+		const monitor = this.transportDrift?.get(kpi);
+		if (!monitor) return [];
+		const view = monitor.observe(value);
+		const last = this.transportDriftState.get(kpi) ?? false;
+		this.transportDriftState.set(kpi, view.drifting);
+		if (!view.drifting || last) return [];
+		return [{
+			source: "meta-cognition",
+			category: "distribution-shape-drift",
+			severity: Math.min(.95, .5 + view.severity * .2),
+			message: `KPI ${kpi} 分布形状漂移（${view.interpretation}）`,
+			suggestion: view.kind === "shape" || view.kind === "both" ? "均值水位未动但分布已变形：保形区间/置信序列的口径前提正在失效，优先排查上游数据源或模型行为变化，必要时重建校准集" : "分布整体位移：结合因果旋钮排序实施干预，并观察 12.0 保证层的后续裁决"
+		}];
+	}
+	/** 17.0：各 KPI 的当前形状漂移视图（纯读取；未挂载返回 undefined） */
+	transportDriftView(kpi) {
+		return this.transportDrift?.get(kpi)?.drift();
 	}
 	/**
 	* 12.0：保证层检验（每批快照后调用）。
@@ -10918,6 +11970,11 @@ var MetaCognitionEngine = class {
 		if (this.anytimeGuards) {
 			insights.push(...this.checkGuarantee("successRate", snapshot.successRate));
 			insights.push(...this.checkGuarantee("avgQuality", snapshot.avgQuality));
+		}
+		if (this.transportDrift) for (const [kpi, monitor] of this.transportDrift) {
+			const value = kpi === "avgLatency" ? snapshot.avgLatency : kpi === "cacheHitRate" ? snapshot.cacheHitRate : kpi === "successRate" ? snapshot.successRate : snapshot.avgQuality;
+			if (monitor === void 0 || !Number.isFinite(value)) continue;
+			insights.push(...this.checkTransportDrift(kpi, value));
 		}
 		if (this.history.length >= 5) {
 			for (const kpi of [
@@ -11107,14 +12164,26 @@ var MetaCognitionEngine = class {
 		}
 		if (!action) {
 			if (kpi === "successRate") {
-				const relaxed = Math.max(.5, target - .05);
-				if (relaxed < target) action = {
-					parameter: "qualityThreshold",
-					from: target,
-					to: relaxed,
-					reason: `成功率 ${value.toFixed(2)} 低于目标 ${target}，放宽质量阈值减少重试风暴`,
-					timestamp: Date.now()
-				};
+				if (this.config.getQualityThreshold) {
+					const from = Math.min(.95, Math.max(.5, this.config.getQualityThreshold()));
+					const to = Math.max(.5, Number((from - .05).toFixed(2)));
+					if (to < from) action = {
+						parameter: "qualityThreshold",
+						from,
+						to,
+						reason: `成功率 ${value.toFixed(2)} 低于目标 ${target}，放宽质量阈值：当前 ${from.toFixed(2)} → ${to.toFixed(2)}，减少重试风暴`,
+						timestamp: Date.now()
+					};
+				} else {
+					const relaxed = Math.max(.5, target - .05);
+					if (relaxed < target) action = {
+						parameter: "qualityThreshold",
+						from: target,
+						to: relaxed,
+						reason: `成功率 ${value.toFixed(2)} 低于目标 ${target}，放宽质量阈值减少重试风暴`,
+						timestamp: Date.now()
+					};
+				}
 			} else if (kpi === "avgQuality") action = {
 				parameter: "maxRetries",
 				from: 2,
@@ -11242,10 +12311,10 @@ var MapElitesArchive = class {
 		return {
 			nichesOccupied: this.elites.size,
 			totalNiches: this.totalNiches,
-			coverage: round$8(this.elites.size / this.totalNiches),
-			qdScore: round$8(qd),
-			meanFitness: this.elites.size > 0 ? round$8(qd / this.elites.size) : 0,
-			bestFitness: this.elites.size > 0 ? round$8(bestFit) : 0,
+			coverage: round$14(this.elites.size / this.totalNiches),
+			qdScore: round$14(qd),
+			meanFitness: this.elites.size > 0 ? round$14(qd / this.elites.size) : 0,
+			bestFitness: this.elites.size > 0 ? round$14(bestFit) : 0,
 			placements: this.placements,
 			promotions: this.promotions
 		};
@@ -11254,7 +12323,7 @@ var MapElitesArchive = class {
 	report() {
 		const elites = [...this.elites.entries()].map(([niche, e]) => ({
 			niche,
-			fitness: round$8(e.fitness),
+			fitness: round$14(e.fitness),
 			candidate: e.candidate
 		})).sort((a, b) => b.fitness - a.fitness);
 		return {
@@ -11329,7 +12398,280 @@ function strategyBehaviorDescriptor(genes) {
 		Math.min(1, Math.max(0, vigilance))
 	];
 }
-function round$8(x) {
+function round$14(x) {
+	return Number(x.toFixed(6));
+}
+//#endregion
+//#region src/core/information-geometry.ts
+const DEFAULT_INFORMATION_GEOMETRY_CONFIG = {
+	klBudget: 1.2,
+	stepScale: .5,
+	maxDimension: 32
+};
+/**
+* 收缩协方差估计：Σ̂ = (1−λ)·S + λ·(tr S / d)·I。
+*
+* λ 缺省 = 2/(n+2)（贝叶斯收缩的经典口径：n 个样本时各向同性先验
+* 占 2/(n+2)——种群越小收缩越强，Cholesky 良态有保证）。
+*/
+function shrinkageCovariance(points, intensity) {
+	const n = points.length;
+	const d = points[0]?.length ?? 0;
+	if (n === 0 || d === 0) return [];
+	const lambda = intensity ?? 2 / (n + 2);
+	const mean = new Float64Array(d);
+	for (const p of points) for (let i = 0; i < d; i += 1) mean[i] += p[i] / n;
+	const cov = Array.from({ length: d }, () => new Array(d).fill(0));
+	for (const p of points) for (let i = 0; i < d; i += 1) for (let j = 0; j < d; j += 1) cov[i][j] += (p[i] - mean[i]) * (p[j] - mean[j]) / Math.max(1, n - 1);
+	let trace = 0;
+	for (let i = 0; i < d; i += 1) trace += cov[i][i];
+	const isotropic = trace / d;
+	for (let i = 0; i < d; i += 1) for (let j = 0; j < d; j += 1) cov[i][j] = (1 - lambda) * cov[i][j] + (i === j ? lambda * isotropic : 0);
+	return cov;
+}
+/** Cholesky 分解（下三角；非正定时加抖动重试，仍失败返回 undefined） */
+function cholesky(matrix) {
+	const d = matrix.length;
+	const a = matrix.map((row) => [...row]);
+	for (const jitter of [
+		0,
+		1e-10,
+		1e-8,
+		1e-6
+	]) {
+		const L = Array.from({ length: d }, () => new Array(d).fill(0));
+		let ok = true;
+		for (let i = 0; i < d && ok; i += 1) for (let j = 0; j <= i && ok; j += 1) {
+			let sum = a[i][j] + (i === j ? jitter : 0);
+			for (let k = 0; k < j; k += 1) sum -= L[i][k] * L[j][k];
+			if (i === j) {
+				if (sum <= 0) {
+					ok = false;
+					break;
+				}
+				L[i][j] = Math.sqrt(sum);
+			} else L[i][j] = sum / L[j][j];
+		}
+		if (ok) return L;
+	}
+}
+/** 条件数 κ = λ_max / λ_min（幂迭代 + 逆幂迭代近似；奇异返回 Infinity） */
+function conditionNumber(matrix) {
+	if (matrix.length === 0) return 1;
+	const max = largestEigenvalue$1(matrix);
+	const min = smallestEigenvalue(matrix);
+	if (min <= 1e-15) return Infinity;
+	return max / min;
+}
+/** 参与比（有效维数）：(tr Σ)² / tr(Σ²) ∈ [1, d] */
+function participationRatio(matrix) {
+	const d = matrix.length;
+	if (d === 0) return 0;
+	let tr = 0;
+	let trSq = 0;
+	for (let i = 0; i < d; i += 1) for (let j = 0; j < d; j += 1) {
+		const v = matrix[i][j];
+		if (i === j) tr += v;
+		trSq += v * v;
+	}
+	if (trSq <= 1e-15) return d;
+	return Math.max(1, Math.min(d, tr * tr / trSq));
+}
+/**
+* Fisher 几何引擎：估计种群几何 + 自然变异 + 诊断
+*
+* 用法：
+*   const geo = new FisherGeometryEngine({ klBudget: 1.2 });
+*   geo.estimate(populationPoints);          // 归一化参数点（[0,1]^d）
+*   const { child } = geo.naturalMutate(parentPoint);  // 沿流形测地方向变异
+*   geo.report();                            // 条件数 / 有效维数 / 步长审计
+*
+* 所有点在**归一化空间**（各维 [0,1]）进出——坐标不变量保证这些
+* 数值与外部标定无关。
+*/
+var FisherGeometryEngine = class {
+	config;
+	rng;
+	dimension = 0;
+	samples = 0;
+	shrinkageUsed = 0;
+	covariance = [];
+	choleskyFactor;
+	/** 最近变异步长审计（信任域触发率 / 均值口径） */
+	recentSteps = [];
+	constructor(config) {
+		this.config = {
+			...DEFAULT_INFORMATION_GEOMETRY_CONFIG,
+			...config
+		};
+		this.rng = this.config.rng ?? Math.random;
+	}
+	/**
+	* 估计种群几何（归一化点集 → 收缩协方差 + Cholesky）。
+	*
+	* 点集通常为当前种群全部个体（含精英）；样本 ≤ 1 时几何退化为
+	* 各向同性（自然变异回退坐标无关的等幅噪声）。
+	*/
+	estimate(points) {
+		const n = points.length;
+		const d = points[0]?.length ?? 0;
+		if (n === 0 || d === 0 || d > this.config.maxDimension) return false;
+		let diverse = false;
+		for (let i = 1; i < n && !diverse; i += 1) for (let j = 0; j < d; j += 1) if (Math.abs(points[i][j] - points[0][j]) > 1e-9) {
+			diverse = true;
+			break;
+		}
+		if (!diverse) {
+			this.covariance = identity(d, Math.max(1e-4, 1 / (d * d)));
+			this.choleskyFactor = cholesky(this.covariance);
+		} else {
+			this.shrinkageUsed = this.config.shrinkageIntensity ?? 2 / (n + 2);
+			this.covariance = shrinkageCovariance(points, this.shrinkageUsed);
+			this.choleskyFactor = cholesky(this.covariance);
+			if (!this.choleskyFactor) {
+				this.shrinkageUsed = 1;
+				this.covariance = identity(d, Math.max(1e-4, averageDiagonal(this.covariance)));
+				this.choleskyFactor = cholesky(this.covariance);
+			}
+		}
+		this.dimension = d;
+		this.samples = n;
+		return this.choleskyFactor !== void 0;
+	}
+	/**
+	* 自然变异：ε ~ N(0,I) 沿 Cholesky 主轴展开，KL 信任域封顶。
+	*
+	* 未估计几何（estimate 未调用 / 失败）时回退各向同性小步——
+	* 调用方无需关心几何是否可用（优雅降级，零漂移）。
+	*/
+	naturalMutate(parent, scale) {
+		const d = parent.length;
+		if (d === 0) return {
+			child: [],
+			mahalanobis: 0,
+			klStep: 0,
+			trustRegionClipped: false
+		};
+		const sigma = (scale ?? this.config.stepScale) / Math.max(1e-12, Math.sqrt(Math.max(1, this.dimension)));
+		const epsilon = new Array(d);
+		for (let i = 0; i < d; i += 1) epsilon[i] = standardNormal(this.rng);
+		const delta = new Array(d);
+		if (this.choleskyFactor && this.dimension === d) {
+			const L = this.choleskyFactor;
+			for (let i = 0; i < d; i += 1) {
+				let acc = 0;
+				for (let k = 0; k <= i; k += 1) acc += L[i][k] * epsilon[k];
+				delta[i] = sigma * acc;
+			}
+		} else for (let i = 0; i < d; i += 1) delta[i] = sigma * epsilon[i];
+		let mahalanobis = d;
+		if (this.choleskyFactor && this.dimension === d) mahalanobis = norm(forwardSubstitute(this.choleskyFactor, delta));
+		else mahalanobis = norm(delta) / Math.max(1e-12, sigma);
+		let clipped = false;
+		if (mahalanobis > this.config.klBudget && mahalanobis > 0) {
+			const factor = this.config.klBudget / mahalanobis;
+			for (let i = 0; i < d; i += 1) delta[i] *= factor;
+			mahalanobis = this.config.klBudget;
+			clipped = true;
+		}
+		const child = parent.map((v, i) => v + delta[i]);
+		this.recentSteps.push({
+			mahalanobis,
+			clipped
+		});
+		if (this.recentSteps.length > 100) this.recentSteps.shift();
+		return {
+			child,
+			mahalanobis: round$13(mahalanobis),
+			klStep: round$13(mahalanobis * mahalanobis / 2),
+			trustRegionClipped: clipped
+		};
+	}
+	/** 几何诊断报告 */
+	report() {
+		const clippedCount = this.recentSteps.filter((s) => s.clipped).length;
+		const meanStep = this.recentSteps.length > 0 ? this.recentSteps.reduce((s, r) => s + r.mahalanobis, 0) / this.recentSteps.length : 0;
+		const kappa = this.covariance.length > 0 ? conditionNumber(this.covariance) : 1;
+		const effDim = this.covariance.length > 0 ? participationRatio(this.covariance) : this.dimension;
+		return {
+			samples: this.samples,
+			dimension: this.dimension,
+			shrinkage: round$13(this.shrinkageUsed),
+			conditionNumber: kappa === Infinity ? Infinity : round$13(kappa),
+			effectiveDimension: round$13(effDim),
+			meanStep: round$13(meanStep),
+			trustRegionRate: this.recentSteps.length > 0 ? round$13(clippedCount / this.recentSteps.length) : 0,
+			interpretation: this.samples === 0 ? "几何未估计（estimate 喂入种群后生效；当前自然变异为各向同性回退）" : `搜索流形 d=${this.dimension}（有效维 ${effDim.toFixed(1)}），条件数 κ=${kappa === Infinity ? "∞" : kappa.toFixed(1)}，平均步长 ${meanStep.toFixed(2)}（信任域 ${this.config.klBudget}，触发率 ${(this.recentSteps.length > 0 ? clippedCount / this.recentSteps.length * 100 : 0).toFixed(0)}%）——步长以 nat 计价，坐标不变`
+		};
+	}
+};
+/** 单位矩阵 × 标量 */
+function identity(d, scale) {
+	return Array.from({ length: d }, (_, i) => Array.from({ length: d }, (_, j) => i === j ? scale : 0));
+}
+/** 对角均值 */
+function averageDiagonal(matrix) {
+	if (matrix.length === 0) return 1e-4;
+	let acc = 0;
+	for (let i = 0; i < matrix.length; i += 1) acc += matrix[i][i];
+	return Math.max(1e-4, acc / matrix.length);
+}
+/** Box–Muller 标准正态采样 */
+function standardNormal(rng) {
+	const u1 = Math.max(1e-12, rng());
+	const u2 = rng();
+	return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+/** 欧氏范数 */
+function norm(xs) {
+	return Math.sqrt(xs.reduce((s, x) => s + x * x, 0));
+}
+/** 前代换：解 L y = b（L 下三角） */
+function forwardSubstitute(L, b) {
+	const d = b.length;
+	const y = new Array(d).fill(0);
+	for (let i = 0; i < d; i += 1) {
+		let acc = b[i];
+		for (let k = 0; k < i; k += 1) acc -= L[i][k] * y[k];
+		y[i] = acc / L[i][i];
+	}
+	return y;
+}
+/** 幂迭代最大特征值 */
+function largestEigenvalue$1(matrix) {
+	const d = matrix.length;
+	let v = new Array(d).fill(1 / Math.sqrt(Math.max(1, d)));
+	let eigenvalue = 0;
+	for (let iter = 0; iter < 100; iter += 1) {
+		const Av = multiplyMatrixVector(matrix, v);
+		const next = norm(Av);
+		if (next < 1e-15) return 0;
+		eigenvalue = next;
+		v = Av.map((x) => x / next);
+	}
+	return eigenvalue;
+}
+/** 幂迭代最小特征值（移位反幂：A − σI 近似逆用 CG 太重，直接用移位幂迭代兜底） */
+function smallestEigenvalue(matrix) {
+	const d = matrix.length;
+	let best = Infinity;
+	for (let trial = 0; trial < 16; trial += 1) {
+		const v = new Array(d);
+		for (let i = 0; i < d; i += 1) v[i] = Math.random() - .5;
+		const nv = norm(v);
+		if (nv < 1e-12) continue;
+		const unit = v.map((x) => x / nv);
+		const Av = multiplyMatrixVector(matrix, unit);
+		const rayleigh = unit.reduce((s, x, i) => s + x * Av[i], 0);
+		best = Math.min(best, rayleigh);
+	}
+	return best === Infinity ? 0 : best;
+}
+function multiplyMatrixVector(matrix, v) {
+	return matrix.map((row) => row.reduce((s, a, j) => s + a * v[j], 0));
+}
+/** 六位小数圆整（项目统一展示口径） */
+function round$13(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -11420,6 +12762,8 @@ var StrategyEvolutionEngine = class {
 	qdArchive;
 	/** 14.0：前沿 niche 采样概率（探索预算占比） */
 	qdExploreRate = .25;
+	/** 18.0：Fisher 几何引擎（attach 后变异沿搜索流形测地方向） */
+	geometry;
 	constructor(config) {
 		this.config = {
 			...DEFAULT_STRATEGY_EVOLUTION_CONFIG,
@@ -11454,6 +12798,33 @@ var StrategyEvolutionEngine = class {
 			tieTolerance: 1e-9
 		});
 		for (const genome of this.population) this.qdArchive.place(genome);
+	}
+	/**
+	* 18.0：挂载信息几何内核（幂等；挂载后变异从坐标轴加噪升级为
+	* Fisher 流形上的自然变异）。
+	*
+	* 变异路径变化：种群归一化协方差（Ledoit–Wolf 收缩）→ Cholesky
+	* 主轴展开的**联合相关**变异（显性基因组合完整传递；各向同性
+	* 加噪被结构性替代）→ KL 信任域（Mahalanobis 半径）封顶单步
+	* 信息量——步长以 nat 计价，仿射重参数化下严格不变。
+	* 几何每代进化前从当前种群重估。不 attach 即零漂移（原高斯路径）。
+	*/
+	attachInformationGeometry(options) {
+		this.geometry = new FisherGeometryEngine({
+			klBudget: options?.klBudget,
+			stepScale: options?.stepScale,
+			rng: options?.rng ?? this.rng
+		});
+		this.estimateGeometry();
+	}
+	/** 18.0：从当前种群重估搜索几何（归一化 [0,1]^d 参数空间） */
+	estimateGeometry() {
+		if (!this.geometry) return;
+		this.geometry.estimate(this.population.map((g) => normalizeGenes(g.genes)));
+	}
+	/** 18.0：几何诊断报告（未挂载返回 undefined） */
+	geometryReport() {
+		return this.geometry?.report();
 	}
 	/**
 	* UCB1 选择当前基因组（探索-利用平衡；4.0 利用项 = 证据化适应度）
@@ -11506,6 +12877,7 @@ var StrategyEvolutionEngine = class {
 	evolve(force = false) {
 		if (!force && this.applicationsSinceEvolution < this.config.minApplicationsBetweenEvolutions) return null;
 		this.generation += 1;
+		this.estimateGeometry();
 		const ranked = [...this.population].sort((a, b) => this.fitness(b) - this.fitness(a));
 		const elites = ranked.filter((g) => g.applications >= this.config.minApplicationsForElite).slice(0, this.config.eliteCount);
 		const report = {
@@ -11561,7 +12933,8 @@ var StrategyEvolutionEngine = class {
 			bestGenome: this.bestGenome().id,
 			recentEvolutions: this.evolutionHistory.slice(-5),
 			qd: this.qdArchive?.metrics(),
-			anytime: this.anytime?.report()
+			anytime: this.anytime?.report(),
+			geometry: this.geometry?.report()
 		};
 	}
 	/** 进化历史 */
@@ -11679,8 +13052,18 @@ var StrategyEvolutionEngine = class {
 		}
 		return winner;
 	}
-	/** 高斯变异：按变异概率逐基因扰动 */
+	/**
+	* 变异产生后代
+	*
+	* 18.0 挂载后：Fisher 流形上的自然变异（种群协方差主轴展开的
+	* 联合相关步 + KL 信任域封顶——步长以 nat 计价，坐标不变）；
+	* 未挂载：原各基因独立近似高斯变异（坐标空间，零漂移回退）。
+	*/
 	mutate(parent) {
+		if (this.geometry) {
+			const { child } = this.geometry.naturalMutate(normalizeGenes(parent.genes), this.config.mutationStrength);
+			return this.createGenome(denormalizeGenes(child), this.generation);
+		}
 		const genes = { ...parent.genes };
 		for (const key of Object.keys(GENE_BOUNDS)) {
 			if (this.rng() > this.config.mutationRate) continue;
@@ -11700,6 +13083,23 @@ var StrategyEvolutionEngine = class {
 		return applied.reduce((sum, g) => sum + g.meanReward, 0) / applied.length;
 	}
 };
+/** 基因 → 归一化参数点 [0,1]^d（18.0：几何运算都在归一化空间，坐标不变量） */
+function normalizeGenes(genes) {
+	return Object.keys(GENE_BOUNDS).map((key) => {
+		const bounds = GENE_BOUNDS[key];
+		return Math.max(0, Math.min(1, (genes[key] - bounds.min) / (bounds.max - bounds.min)));
+	});
+}
+/** 归一化参数点 → 基因（反弹边界 + 整数基因圆整） */
+function denormalizeGenes(point) {
+	const genes = {};
+	Object.keys(GENE_BOUNDS).forEach((key, i) => {
+		const bounds = GENE_BOUNDS[key];
+		const value = bounds.min + Math.max(0, Math.min(1, point[i] ?? .5)) * (bounds.max - bounds.min);
+		genes[key] = bounds.integer ? Math.round(value) : Number(value.toFixed(3));
+	});
+	return genes;
+}
 //#endregion
 //#region src/autonomy-loop.ts
 /** 默认配置 */
@@ -11735,6 +13135,8 @@ var AutonomyLoop = class {
 	metaCognitionBridge;
 	/** 第五阶段 Phase 2.5：共生进化桥接（可选注入，缺省不启用） */
 	symbiosis;
+	/** 25.0：容量规划顾问（可选注入；心跳 2.5 段消费，缺省零改动） */
+	capacityAdvisor;
 	worldModel;
 	curiosity;
 	governor;
@@ -11763,6 +13165,7 @@ var AutonomyLoop = class {
 		this.policyEvolution = params.policyEvolution;
 		this.metaCognitionBridge = params.metaCognitionBridge;
 		this.symbiosis = params.symbiosis;
+		this.capacityAdvisor = params.capacityAdvisor;
 		this.worldModel = params.worldModel;
 		this.curiosity = params.curiosity;
 		this.governor = params.governor;
@@ -11861,6 +13264,12 @@ var AutonomyLoop = class {
 					});
 				}
 				this.worldModel.settleCalibrations();
+			}
+		} catch {}
+		try {
+			if (this.capacityAdvisor) {
+				const capacityInsights = this.capacityAdvisor();
+				if (capacityInsights && capacityInsights.length > 0) insights.push(...capacityInsights);
 			}
 		} catch {}
 		try {
@@ -12651,6 +14060,7 @@ var PolicyEvolver = class {
 				totalCandidatesEvaluated: this.totalCandidatesEvaluated,
 				totalCycles: this.totalCycles,
 				cycleReports: this.cycleReports.slice(-20),
+				policyCounter: this.policyCounter,
 				savedAt: Date.now()
 			};
 			const tmp = `${persistPath}.tmp.${process.pid}`;
@@ -12682,6 +14092,19 @@ var PolicyEvolver = class {
 				this.canary = parsed.canary?.status === "active" ? parsed.canary : void 0;
 				this.totalCandidatesEvaluated = parsed.totalCandidatesEvaluated ?? 0;
 				this.totalCycles = parsed.totalCycles ?? 0;
+				const persistedCounter = typeof parsed.policyCounter === "number" && Number.isFinite(parsed.policyCounter) && parsed.policyCounter > 0 ? Math.floor(parsed.policyCounter) : 0;
+				let maxIdSuffix = 0;
+				for (const policy of [
+					this.current,
+					this.previousPolicy,
+					...this.deployedHistory,
+					...this.population
+				]) {
+					if (!policy?.id) continue;
+					const match = /^policy-(\d+)$/.exec(policy.id);
+					if (match) maxIdSuffix = Math.max(maxIdSuffix, Number(match[1]));
+				}
+				this.policyCounter = Math.max(persistedCounter, maxIdSuffix);
 				this.config.onDeploy?.(this.getCurrentPolicy());
 			}
 		} catch {}
@@ -15402,16 +16825,16 @@ var CausalKernel = class {
 		return {
 			from,
 			to,
-			ate: round$7(ate),
-			lower: round$7(Math.max(-1, conservativeLower)),
-			upper: round$7(Math.min(1, conservativeUpper)),
-			pDo: round$7(pDo),
-			pDoNot: round$7(pDoNot),
+			ate: round$12(ate),
+			lower: round$12(Math.max(-1, conservativeLower)),
+			upper: round$12(Math.min(1, conservativeUpper)),
+			pDo: round$12(pDo),
+			pDoNot: round$12(pDoNot),
 			interventionalSamples,
 			observationalSamples: obsAll,
-			observationalAssociation: round$7(obsAssociation),
-			confounding: round$7(confounding),
-			confidence: round$7(confidence),
+			observationalAssociation: round$12(obsAssociation),
+			confounding: round$12(confounding),
+			confidence: round$12(confidence),
 			direction,
 			established
 		};
@@ -15448,7 +16871,7 @@ var CausalKernel = class {
 			const divergence = Math.abs(eff.observationalAssociation - eff.ate);
 			if (divergence >= this.config.confoundingThreshold) flagged.push({
 				...eff,
-				divergence: round$7(divergence)
+				divergence: round$12(divergence)
 			});
 		}
 		return flagged.sort((a, b) => b.divergence - a.divergence);
@@ -15475,7 +16898,7 @@ var CausalKernel = class {
 		const xm = this.effect(from, mediator, now);
 		const my = this.effect(mediator, to, now);
 		const xy = this.effect(from, to, now);
-		const total = round$7(xy.ate);
+		const total = round$12(xy.ate);
 		const indirect = xm.ate * my.ate;
 		const direct = total - indirect;
 		const share = Math.abs(total) > .05 ? Math.min(1, Math.abs(indirect) / Math.abs(total)) : 0;
@@ -15491,7 +16914,7 @@ var CausalKernel = class {
 			total,
 			indirect,
 			direct,
-			share: round$7(share),
+			share: round$12(share),
 			path: {
 				xm,
 				my,
@@ -15516,15 +16939,15 @@ var CausalKernel = class {
 		const estimatedProb = altEffect.pDo;
 		let verdict;
 		if (samples < 4) verdict = `证据不足（${samples} 样本）：「若选 ${actionAlternative}」暂无法可靠回答，建议登记为因果实验`;
-		else if (actualY && estimatedProb - actualProb > .1) verdict = `反事实遗憾：${actionAlternative} 的估计成功概率（${round$7(estimatedProb)}）高于实际路径（${round$7(actualProb)}）`;
-		else if (!actualY && estimatedProb > .6) verdict = `反事实教训：失败路径下 ${actionAlternative} 估计成功概率 ${round$7(estimatedProb)}，下次优先`;
-		else verdict = `实际选择已接近最优（${actionAlternative} 估计 ${round$7(estimatedProb)} vs 实际 ${round$7(actualProb)}）`;
+		else if (actualY && estimatedProb - actualProb > .1) verdict = `反事实遗憾：${actionAlternative} 的估计成功概率（${round$12(estimatedProb)}）高于实际路径（${round$12(actualProb)}）`;
+		else if (!actualY && estimatedProb > .6) verdict = `反事实教训：失败路径下 ${actionAlternative} 估计成功概率 ${round$12(estimatedProb)}，下次优先`;
+		else verdict = `实际选择已接近最优（${actionAlternative} 估计 ${round$12(estimatedProb)} vs 实际 ${round$12(actualProb)}）`;
 		return {
 			alternative: actionAlternative,
-			estimatedProb: round$7(estimatedProb),
-			lower: round$7(Math.max(0, estimatedProb - margin)),
-			upper: round$7(Math.min(1, estimatedProb + margin)),
-			actualProb: round$7(actualProb),
+			estimatedProb: round$12(estimatedProb),
+			lower: round$12(Math.max(0, estimatedProb - margin)),
+			upper: round$12(Math.min(1, estimatedProb + margin)),
+			actualProb: round$12(actualProb),
 			evidenceSamples: samples,
 			verdict
 		};
@@ -15548,9 +16971,9 @@ var CausalKernel = class {
 				from: edge.from,
 				to: edge.to,
 				suggestedArm: eff.ate >= 0 || eff.observationalAssociation >= 0,
-				infoGain: round$7(infoGain),
-				hypothesis: `假设：对 ${edge.from} 实施 do=${eff.ate >= 0 || eff.observationalAssociation >= 0 ? "启用" : "停用"} 将使 ${edge.to} ${eff.ate >= 0 || eff.observationalAssociation >= 0 ? "提升" : "下降"}（当前不确定区间 [${round$7(eff.lower)}, ${round$7(eff.upper)}]）`,
-				uncertainty: round$7(uncertainty)
+				infoGain: round$12(infoGain),
+				hypothesis: `假设：对 ${edge.from} 实施 do=${eff.ate >= 0 || eff.observationalAssociation >= 0 ? "启用" : "停用"} 将使 ${edge.to} ${eff.ate >= 0 || eff.observationalAssociation >= 0 ? "提升" : "下降"}（当前不确定区间 [${round$12(eff.lower)}, ${round$12(eff.upper)}]）`,
+				uncertainty: round$12(uncertainty)
 			});
 		}
 		return candidates.sort((a, b) => b.infoGain - a.infoGain).slice(0, budget);
@@ -15656,16 +17079,28 @@ function coalitionValue(members) {
 	return 1 - failAll;
 }
 /**
-* 精确 Shapley 值（子集枚举，n ≤ 16 时精确；更大时按权重截断）。
+* Shapley 值（n ≤ 12 子集枚举精确；n > 12 确定性置换采样估计）。
 *
-* φ_i = Σ_{S ⊆ N∖{i}} [|S|! (n−|S|−1)! / n!] · [v(S ∪ {i}) − v(S)]
+* 精确路径：φ_i = Σ_{S ⊆ N∖{i}} [|S|! (n−|S|−1)! / n!] · [v(S ∪ {i}) − v(S)]
+*
+* 采样路径（n > 12）：固定 512 个随机排列（缺省 mulberry32 种子
+* 0xC0FFEE，确定性可复现；可注入自定义 rng），每个排列沿前缀逐步
+* 计算各贡献者的边际贡献，取全体排列的平均 —— 无偏估计，
+* 复杂度 O(512·n)。分界理由：n > 12 时 2^n 联盟枚举超过 4096 次
+* 联盟估值（n·2^(n−1) 次边际差），精确解成本指数膨胀而采样方差
+* 可控；且位掩码枚举在 n ≥ 33 时 `1 << others` 溢出 32 位整数
+* （死循环/错值），采样路径不依赖位掩码，任意 n 安全。
 *
 * 质变点：分红不再按「表现分的线性份额」（搭便车者只要有正分就
 * 永远分钱），而按「边际反事实贡献」——拔掉你，任务成功率掉多少，
 * 你就分多少。两个都干了活的智能体平分；只挂名不出力的边际贡献
 * ≈ 0，自然饿死（能量经济的真公平）。
+*
+* @param contributors 贡献者及其个体成功概率
+* @param rng 可选随机源注入（缺省 mulberry32(0xC0FFEE)，确定性采样）
+* @returns agentId → Shapley 值（采样路径下为边际贡献均值）
 */
-function shapleyValues(contributors) {
+function shapleyValues(contributors, rng) {
 	const n = contributors.length;
 	const result = /* @__PURE__ */ new Map();
 	if (n === 0) return result;
@@ -15673,6 +17108,7 @@ function shapleyValues(contributors) {
 		result.set(contributors[0].agentId, coalitionValue(contributors));
 		return result;
 	}
+	if (n > 12) return shapleyByPermutationSampling(contributors, rng);
 	const cache = /* @__PURE__ */ new Map();
 	const valueOf = (mask) => {
 		let v = cache.get(mask);
@@ -15704,6 +17140,56 @@ function shapleyValues(contributors) {
 	}
 	return result;
 }
+/** 置换采样数（n > 12 时的 Shapley 估计样本量；方差随样本数 1/m 收敛） */
+const SHAPLEY_PERMUTATION_SAMPLES = 512;
+/**
+* 置换采样 Shapley 估计（n > 12 路径）。
+*
+* 每个随机排列 π 下，沿前缀依次加入成员，第 j 位成员的边际贡献 =
+* v(π₁..πⱼ) − v(π₁..πⱼ₋₁)；对所有排列取平均即为 Shapley 值的无偏估计。
+* noisy-OR 联盟价值可增量维护（v(S) = 1 − Π_{i∈S}(1−p_i)），
+* 故单排列 O(n)、总复杂度 O(512·n)，不依赖位掩码（无 n ≥ 33 溢出）。
+*/
+function shapleyByPermutationSampling(contributors, rng) {
+	const n = contributors.length;
+	const rand = rng ?? mulberry32(12648430);
+	const sums = new Array(n).fill(0);
+	const failProbs = contributors.map((c) => Math.max(0, 1 - c.prob));
+	for (let s = 0; s < SHAPLEY_PERMUTATION_SAMPLES; s += 1) {
+		const order = contributors.map((_, i) => i);
+		for (let i = n - 1; i > 0; i -= 1) {
+			const j = Math.floor(rand() * (i + 1));
+			const tmp = order[i];
+			order[i] = order[j];
+			order[j] = tmp;
+		}
+		let failAll = 1;
+		let v = 0;
+		for (const idx of order) {
+			failAll *= failProbs[idx];
+			const nv = 1 - failAll;
+			sums[idx] += nv - v;
+			v = nv;
+		}
+	}
+	const result = /* @__PURE__ */ new Map();
+	for (let i = 0; i < n; i += 1) result.set(contributors[i].agentId, sums[i] / SHAPLEY_PERMUTATION_SAMPLES);
+	return result;
+}
+/**
+* mulberry32：32 位确定性伪随机源（种子固定时序列完全可复现）。
+* 供 Shapley 置换采样在无外部 rng 注入时使用。
+*/
+function mulberry32(seed) {
+	let a = seed >>> 0;
+	return () => {
+		a = a + 1831565813 >>> 0;
+		let t = a;
+		t = Math.imul(t ^ t >>> 15, t | 1);
+		t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+}
 function popcount$1(x) {
 	let c = 0;
 	while (x) {
@@ -15712,7 +17198,7 @@ function popcount$1(x) {
 	}
 	return c;
 }
-function round$7(x) {
+function round$12(x) {
 	return Number(x.toFixed(4));
 }
 //#endregion
@@ -15852,14 +17338,14 @@ var FreeEnergyEngine = class {
 		const efe = pragmatic - this.config.epistemicWeight * epistemic;
 		return {
 			actionId: action.id,
-			pragmatic: round$6(pragmatic),
-			epistemic: round$6(epistemic),
-			efe: round$6(efe),
-			alpha: round$6(alpha),
-			beta: round$6(beta),
+			pragmatic: round$11(pragmatic),
+			epistemic: round$11(epistemic),
+			efe: round$11(efe),
+			alpha: round$11(alpha),
+			beta: round$11(beta),
 			boltzmannProb: 0,
-			curiosityShare: round$6(pragmatic + epistemic > 1e-9 ? epistemic / (pragmatic + epistemic) : 0),
-			expectedUncertaintyReduction: round$6(epistemic / Math.max(1e-9, h0))
+			curiosityShare: round$11(pragmatic + epistemic > 1e-9 ? epistemic / (pragmatic + epistemic) : 0),
+			expectedUncertaintyReduction: round$11(epistemic / Math.max(1e-9, h0))
 		};
 	}
 	/**
@@ -15877,7 +17363,7 @@ var FreeEnergyEngine = class {
 		const weights = evals.map((e) => Math.exp(-(e.efe - minG) / T));
 		const sum = weights.reduce((a, b) => a + b, 0);
 		evals.forEach((e, i) => {
-			e.boltzmannProb = round$6(weights[i] / sum);
+			e.boltzmannProb = round$11(weights[i] / sum);
 		});
 		return evals.sort((a, b) => a.efe - b.efe);
 	}
@@ -15897,7 +17383,7 @@ var FreeEnergyEngine = class {
 			const p = Math.min(1 - eps, Math.max(eps, a.pSuccess));
 			const strength = a.interventionalSamples + .5 * a.observationalSamples;
 			const theta = sampleBeta(p * strength + 1, (1 - p) * strength + 1);
-			samples[a.id] = round$6(theta);
+			samples[a.id] = round$11(theta);
 			if (theta > best) {
 				best = theta;
 				winner = a.id;
@@ -15957,14 +17443,14 @@ var FreeEnergyEngine = class {
 			total += kl;
 			perBelief.push({
 				id: b.id,
-				beliefProb: round$6(b.beliefProb),
-				modelProb: round$6(p),
-				kl: round$6(kl)
+				beliefProb: round$11(b.beliefProb),
+				modelProb: round$11(p),
+				kl: round$11(kl)
 			});
 		}
 		const worstEntry = [...perBelief].sort((a, b) => b.kl - a.kl)[0];
 		return {
-			totalFreeEnergy: round$6(total),
+			totalFreeEnergy: round$11(total),
 			perBelief: perBelief.sort((a, b) => b.kl - a.kl),
 			driftDetected: total >= this.config.driftThreshold,
 			worst: worstEntry ? {
@@ -16005,7 +17491,7 @@ function gaussian() {
 	while (v === 0) v = Math.random();
 	return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
-function round$6(x) {
+function round$11(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -16153,7 +17639,7 @@ var DeliberationEngine = class {
 			abstractInfo = {
 				source: prior.source,
 				strength: prior.strength,
-				mean: round$5(prior.mean)
+				mean: round$10(prior.mean)
 			};
 		} else {
 			alpha = 1 + successes;
@@ -16172,12 +17658,12 @@ var DeliberationEngine = class {
 		return {
 			state,
 			action,
-			pSuccess: round$5(p),
+			pSuccess: round$10(p),
 			alpha,
 			beta,
 			evidence: successes + failures,
-			lower: round$5(Math.max(0, p - 1.645 * sigma)),
-			upper: round$5(Math.min(1, p + 1.645 * sigma)),
+			lower: round$10(Math.max(0, p - 1.645 * sigma)),
+			upper: round$10(Math.min(1, p + 1.645 * sigma)),
 			successor,
 			abstract: abstractInfo
 		};
@@ -16226,12 +17712,12 @@ var DeliberationEngine = class {
 				state,
 				action,
 				nextState: post.successor,
-				pStep: round$5(p),
-				evidence: round$5(post.evidence + lambda),
-				pragmatic: round$5(pragmatic),
-				epistemic: round$5(epistemic),
-				efe: round$5(efe),
-				discounted: round$5(discounted)
+				pStep: round$10(p),
+				evidence: round$10(post.evidence + lambda),
+				pragmatic: round$10(pragmatic),
+				epistemic: round$10(epistemic),
+				efe: round$10(efe),
+				discounted: round$10(discounted)
 			});
 			totalEfe += discounted;
 			undiscounted += efe;
@@ -16244,16 +17730,16 @@ var DeliberationEngine = class {
 			const before = steps.slice(0, s.step).reduce((prod, x) => prod * x.pStep, 1);
 			return {
 				step: s.step,
-				pFailAt: round$5(before * (1 - s.pStep))
+				pFailAt: round$10(before * (1 - s.pStep))
 			};
 		});
 		return {
 			startState,
 			actions: [...actions],
 			states,
-			totalEfe: round$5(totalEfe),
-			undiscountedEfe: round$5(undiscounted),
-			pAllSuccess: round$5(pAll),
+			totalEfe: round$10(totalEfe),
+			undiscountedEfe: round$10(undiscounted),
+			pAllSuccess: round$10(pAll),
 			steps,
 			riskProfile,
 			epistemicMonotone: checkEpistemicMonotone(steps)
@@ -16343,8 +17829,8 @@ var DeliberationEngine = class {
 		if (existing) {
 			existing.usages += 1;
 			existing.successes += 1;
-			existing.value = round$5(.7 * existing.value + .3 * value);
-			existing.reliability = round$5(.7 * existing.reliability + .3 * reliability);
+			existing.value = round$10(.7 * existing.value + .3 * value);
+			existing.reliability = round$10(.7 * existing.reliability + .3 * reliability);
 			existing.confidence = Math.min(1, .5 + existing.usages * .1);
 			existing.lastUsedAt = Date.now();
 			return existing;
@@ -16358,8 +17844,8 @@ var DeliberationEngine = class {
 			id: `skill-${++this.skillCounter}`,
 			initiation,
 			actions: [...actions],
-			value: round$5(value),
-			reliability: round$5(reliability),
+			value: round$10(value),
+			reliability: round$10(reliability),
 			confidence: .5,
 			usages: 1,
 			successes: 1,
@@ -16375,8 +17861,8 @@ var DeliberationEngine = class {
 		const existing = this.skills.find((s) => s.initiation === initiation && s.actions.join("|") === signature);
 		if (!existing) return;
 		existing.usages += 1;
-		existing.value = round$5(existing.value - penalty);
-		existing.reliability = round$5(Math.max(0, existing.reliability * .8));
+		existing.value = round$10(existing.value - penalty);
+		existing.reliability = round$10(Math.max(0, existing.reliability * .8));
 		existing.confidence = Math.min(1, .5 + existing.usages * .1);
 	}
 	/**
@@ -16435,10 +17921,10 @@ var DeliberationEngine = class {
 				step: i,
 				state,
 				action,
-				predicted: round$5(predicted),
+				predicted: round$10(predicted),
 				actual,
-				surprisal: round$5(surprisal),
-				error: round$5(error)
+				surprisal: round$10(surprisal),
+				error: round$10(error)
 			});
 			surprisalSum += surprisal;
 			errorSum += error;
@@ -16473,15 +17959,15 @@ var DeliberationEngine = class {
 		return {
 			steps,
 			overallSuccess,
-			meanSurprisal: round$5(plan.length > 0 ? surprisalSum / plan.length : 0),
-			calibrationEma: round$5(this.calibrationEma ?? 0),
+			meanSurprisal: round$10(plan.length > 0 ? surprisalSum / plan.length : 0),
+			calibrationEma: round$10(this.calibrationEma ?? 0),
 			skillAction,
 			skillId
 		};
 	}
 	/** 梦校准误差（EMA；未对账过时 undefined） */
 	currentCalibration() {
-		return this.calibrationEma === void 0 ? void 0 : round$5(this.calibrationEma);
+		return this.calibrationEma === void 0 ? void 0 : round$10(this.calibrationEma);
 	}
 	/** 已对账计划数（可观测） */
 	settledCount() {
@@ -16550,20 +18036,20 @@ var DeliberationEngine = class {
 			state: prefix.state,
 			action,
 			nextState,
-			pStep: round$5(p),
-			evidence: round$5(post.evidence + lambda),
-			pragmatic: round$5(pragmatic),
-			epistemic: round$5(epistemic),
-			efe: round$5(efe),
-			discounted: round$5(discounted)
+			pStep: round$10(p),
+			evidence: round$10(post.evidence + lambda),
+			pragmatic: round$10(pragmatic),
+			epistemic: round$10(epistemic),
+			efe: round$10(efe),
+			discounted: round$10(discounted)
 		};
 		return {
 			state: nextState,
 			actions: [...prefix.actions, action],
 			states: [...prefix.states, nextState],
 			steps: [...prefix.steps, step],
-			totalEfe: round$5(prefix.totalEfe + discounted),
-			pSuccess: round$5(prefix.pSuccess * p),
+			totalEfe: round$10(prefix.totalEfe + discounted),
+			pSuccess: round$10(prefix.pSuccess * p),
 			imaginedUses
 		};
 	}
@@ -16595,12 +18081,12 @@ var DeliberationEngine = class {
 			actions: node.actions,
 			states: node.states,
 			totalEfe: node.totalEfe,
-			undiscountedEfe: round$5(node.steps.reduce((s, x) => s + x.efe, 0)),
+			undiscountedEfe: round$10(node.steps.reduce((s, x) => s + x.efe, 0)),
 			pAllSuccess: node.pSuccess,
 			steps: node.steps,
 			riskProfile: node.steps.map((s) => ({
 				step: s.step,
-				pFailAt: round$5(before(s.step) * (1 - s.pStep))
+				pFailAt: round$10(before(s.step) * (1 - s.pStep))
 			})),
 			epistemicMonotone: checkEpistemicMonotone(node.steps)
 		};
@@ -16620,7 +18106,7 @@ function checkEpistemicMonotone(steps) {
 	}
 	return true;
 }
-function round$5(x) {
+function round$10(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -16729,11 +18215,11 @@ var RationalMetareasoner = class {
 			state,
 			mode: "reactive",
 			actions: [best.action],
-			costNat: round$4(singles.length * this.config.natPerNode),
+			costNat: round$9(singles.length * this.config.natPerNode),
 			nodesExpanded: singles.length,
 			depthStopped: 1,
 			firstActionStable: true,
-			reactiveGap: round$4(gap === Infinity ? 0 : gap),
+			reactiveGap: round$9(gap === Infinity ? 0 : gap),
 			rationale: singles.length === 1 ? `唯一候选 → 直接反应（${best.action}）` : `优劣悬殊（gap ${gap.toFixed(3)} ≥ ${this.dynamicGap.toFixed(3)} nat，证据 ${best.evidence.toFixed(0)}）→ 深思不会改变选择，VOC ≈ 0`
 		});
 		const search = this.searchAnytime(state, candidates, preference, opts?.useSkills, opts?.advance);
@@ -16742,11 +18228,11 @@ var RationalMetareasoner = class {
 			mode: "deliberative",
 			actions: search.report.actions,
 			report: search.report,
-			costNat: round$4(search.nodes * this.config.natPerNode),
+			costNat: round$9(search.nodes * this.config.natPerNode),
 			nodesExpanded: search.nodes,
 			depthStopped: search.depthStopped,
 			firstActionStable: search.stable,
-			reactiveGap: round$4(gap === Infinity ? 0 : gap),
+			reactiveGap: round$9(gap === Infinity ? 0 : gap),
 			rationale: search.stable ? `深思收敛：首行动 ${search.report.actions[0]} 连续 ${search.stableRounds} 层不变（深度 ${search.depthStopped} 早停，省 ${((this.config.maxDepth - search.depthStopped) * candidates.length).toFixed(0)} 节点）` : `深思预算耗尽（${search.nodes} 节点 / ${this.config.budgetNat} nat），首行动 ${search.report.actions[0]}（未收敛，结果存疑）`
 		});
 	}
@@ -16845,7 +18331,7 @@ var RationalMetareasoner = class {
 						actions: [...taken],
 						consecutiveSuccesses: candidate.successes,
 						usages: 0,
-						reliability: round$4(reliability),
+						reliability: round$9(reliability),
 						createdAt: Date.now(),
 						lastUsedAt: Date.now()
 					});
@@ -16861,7 +18347,7 @@ var RationalMetareasoner = class {
 	}
 	/** 当前动态反应门槛（元学习可观测） */
 	currentDecisivenessGap() {
-		return round$4(this.dynamicGap);
+		return round$9(this.dynamicGap);
 	}
 	/** 习惯库只读视图（审计） */
 	allHabits() {
@@ -16874,10 +18360,10 @@ var RationalMetareasoner = class {
 	/** 认知经济报告：思考的价格与价值的统一核算 */
 	cognitiveEconomy() {
 		const decisions = this.modeCounts.habit + this.modeCounts.reactive + this.modeCounts.deliberative;
-		const share = (m) => decisions === 0 ? 0 : round$4(this.modeCounts[m] / decisions);
-		const avgDepth = this.deliberationDepths.length > 0 ? round$4(this.deliberationDepths.reduce((a, b) => a + b, 0) / this.deliberationDepths.length) : 0;
+		const share = (m) => decisions === 0 ? 0 : round$9(this.modeCounts[m] / decisions);
+		const avgDepth = this.deliberationDepths.length > 0 ? round$9(this.deliberationDepths.reduce((a, b) => a + b, 0) / this.deliberationDepths.length) : 0;
 		const modeSuccessRate = {};
-		for (const [mode, stat] of Object.entries(this.modeOutcomes)) if (stat.ema !== void 0) modeSuccessRate[mode] = round$4(stat.ema);
+		for (const [mode, stat] of Object.entries(this.modeOutcomes)) if (stat.ema !== void 0) modeSuccessRate[mode] = round$9(stat.ema);
 		const interpretation = decisions === 0 ? "尚未决策：元推理待命" : this.staleHabitRegrets > 0 ? `习惯失灵 ${this.staleHabitRegrets} 次：世界在漂移，摊销经验需重建（已自动作废）` : this.habitHitRate(decisions) > .5 ? `认知经济健康：${(this.habitHitRate(decisions) * 100).toFixed(0)}% 决策走习惯直答，累计省 ${this.habitSavingsNat.toFixed(2)} nat` : this.modeCounts.reactive > this.modeCounts.deliberative * 3 ? "反应主导：多数决策证据充分，深思预算集中用在疑难处" : "深思主导：局势不确定，思考是主要开销——观察收敛深度是否下降";
 		return {
 			decisions,
@@ -16886,11 +18372,11 @@ var RationalMetareasoner = class {
 				reactive: share("reactive"),
 				deliberative: share("deliberative")
 			},
-			habitSavingsNat: round$4(this.habitSavingsNat),
-			totalSpendNat: round$4(this.totalSpendNat),
+			habitSavingsNat: round$9(this.habitSavingsNat),
+			totalSpendNat: round$9(this.totalSpendNat),
 			totalNodes: this.totalNodes,
 			habits: this.habits.size,
-			habitHitRate: round$4(this.habitHitRate(decisions)),
+			habitHitRate: round$9(this.habitHitRate(decisions)),
 			staleHabitRegrets: this.staleHabitRegrets,
 			reactiveFailures: this.reactiveFailures,
 			modeSuccessRate,
@@ -16903,7 +18389,7 @@ var RationalMetareasoner = class {
 	}
 	/** 同长度深思的成本估算（习惯节省额入账口径） */
 	estimateDeliberationCost(steps) {
-		return round$4(steps * this.config.beamBreadth * this.config.natPerNode * 2);
+		return round$9(steps * this.config.beamBreadth * this.config.natPerNode * 2);
 	}
 	/** 决策入账（pending 登记 + 认知经济计数） */
 	record(input) {
@@ -16944,7 +18430,7 @@ var RationalMetareasoner = class {
 function budgetExhausted(nodes, config) {
 	return nodes * config.natPerNode >= config.budgetNat;
 }
-function round$4(x) {
+function round$9(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -17211,7 +18697,7 @@ var AbstractionEngine = class {
 				actions: [...entry.actions],
 				domains: entry.domains.size,
 				successes: entry.successes,
-				value: round$3(entry.successes / (entry.successes + 1))
+				value: round$8(entry.successes / (entry.successes + 1))
 			});
 		} else {
 			entry.domains.delete(domain);
@@ -17337,7 +18823,7 @@ function decompose(state) {
 		hasSkeleton: true
 	};
 }
-function round$3(x) {
+function round$8(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -17462,16 +18948,16 @@ var ScientistMind = class {
 				from: q.from,
 				to: q.to,
 				arm: best.arm,
-				armEig: round$2(best.eig),
-				confoundingBonus: round$2(bonus),
-				lawBonus: round$2(lawBonus),
-				totalEig: round$2(totalEig),
-				netValue: round$2(netValue),
+				armEig: round$7(best.eig),
+				confoundingBonus: round$7(bonus),
+				lawBonus: round$7(lawBonus),
+				totalEig: round$7(totalEig),
+				netValue: round$7(netValue),
 				priorAlpha: best.alpha,
 				priorBeta: best.beta,
-				predictedP: round$2(best.p),
+				predictedP: round$7(best.p),
 				hypothesis: `假设：do(${q.from}=${best.arm ? "启用" : "停用"}) 对 ${q.to} 的效应将落在当前后验 ${best.p.toFixed(2)} 附近（混杂分歧 ${divergence.toFixed(2)}${divergence > 0 ? "，唯有干预可裁决" : ""}）`,
-				rationale: divergence > 0 ? `混杂加成 +${round$2(bonus)} nat：观测关联 ${eff.observationalAssociation.toFixed(2)} vs 干预效应 ${eff.ate.toFixed(2)} 背离——该边因果问题只能由干预裁决` : lawBonus > 0 ? `定律试验 +${round$2(lawBonus)} nat：该边在定律 ${law.id}（${law.members.length} 条边，P≈${law.lawP.toFixed(2)}）作用域内——一次实验校准整个作用域` : `最优臂 do=${best.arm}：一步期望熵收缩 ${best.eig.toFixed(3)} nat（另一臂 ${(best.eig === evals[0].eig ? evals[1].eig : evals[0].eig).toFixed(3)} nat）`
+				rationale: divergence > 0 ? `混杂加成 +${round$7(bonus)} nat：观测关联 ${eff.observationalAssociation.toFixed(2)} vs 干预效应 ${eff.ate.toFixed(2)} 背离——该边因果问题只能由干预裁决` : lawBonus > 0 ? `定律试验 +${round$7(lawBonus)} nat：该边在定律 ${law.id}（${law.members.length} 条边，P≈${law.lawP.toFixed(2)}）作用域内——一次实验校准整个作用域` : `最优臂 do=${best.arm}：一步期望熵收缩 ${best.eig.toFixed(3)} nat（另一臂 ${(best.eig === evals[0].eig ? evals[1].eig : evals[0].eig).toFixed(3)} nat）`
 			});
 		}
 		designs.sort((a, b) => b.netValue - a.netValue);
@@ -17512,9 +18998,9 @@ var ScientistMind = class {
 			to: design.to,
 			arm: design.arm,
 			observedY,
-			promisedEig: round$2(design.totalEig),
-			realizedInfo: round$2(realized),
-			surprisal: round$2(surprisal),
+			promisedEig: round$7(design.totalEig),
+			realizedInfo: round$7(realized),
+			surprisal: round$7(surprisal),
 			settledAt: now
 		};
 		this.ledger.push(entry);
@@ -17537,12 +19023,12 @@ var ScientistMind = class {
 		return {
 			questions: this.questions.size,
 			confoundedQuestions: confounded,
-			residualEntropyNat: round$2(residual),
+			residualEntropyNat: round$7(residual),
 			experimentsRun: this.ledger.length,
-			cumulativePromisedNat: round$2(this.cumulativePromised),
-			cumulativeRealizedNat: round$2(this.cumulativeRealized),
-			deliveryRate: round$2(delivered),
-			designCalibration: round$2(this.calibrationEma ?? 0),
+			cumulativePromisedNat: round$7(this.cumulativePromised),
+			cumulativeRealizedNat: round$7(this.cumulativeRealized),
+			deliveryRate: round$7(delivered),
+			designCalibration: round$7(this.calibrationEma ?? 0),
 			interpretation
 		};
 	}
@@ -17570,7 +19056,7 @@ function eigOfBeta(alpha, beta) {
 function clampProb(p) {
 	return Math.min(1 - 1e-6, Math.max(1e-6, p));
 }
-function round$2(x) {
+function round$7(x) {
 	return Number(x.toFixed(6));
 }
 //#endregion
@@ -17719,7 +19205,7 @@ var TheoristEngine = class {
 			theories: this.cached.length,
 			compressedEdges: compressed,
 			outlierEdges: outliers,
-			compressionNat: round$1(compression),
+			compressionNat: round$6(compression),
 			zeroShotPredictions: this.zeroShotCount,
 			paradigmShifts: this.paradigmShiftCount,
 			interpretation
@@ -17733,17 +19219,17 @@ var TheoristEngine = class {
 		const lawLogMl = lnBeta(1 + S, 1 + F);
 		const compressionNat = lawLogMl - members.reduce((a, m) => a + m.standaloneLogMlNat, 0);
 		for (const m of members) {
-			m.fitsLawNat = round$1(lawLogMl - lnBeta(1 + S - m.successes, 1 + F - m.failures) - m.standaloneLogMlNat);
+			m.fitsLawNat = round$6(lawLogMl - lnBeta(1 + S - m.successes, 1 + F - m.failures) - m.standaloneLogMlNat);
 			m.anomalous = m.fitsLawNat <= 0;
 		}
 		return {
 			lawAlpha: 1 + S,
 			lawBeta: 1 + F,
-			lawP: round$1(lawP),
-			lawLower: round$1(wilsonLowerBound(S, F)),
-			lawUpper: round$1(wilsonUpperBound(S, F)),
+			lawP: round$6(lawP),
+			lawLower: round$6(wilsonLowerBound(S, F)),
+			lawUpper: round$6(wilsonUpperBound(S, F)),
 			members,
-			compressionNat: round$1(compressionNat),
+			compressionNat: round$6(compressionNat),
 			status: members.some((m) => m.anomalous) ? "contested" : "law",
 			inducedAt: 0
 		};
@@ -17758,8 +19244,1824 @@ function familyOf(id) {
 	const idx = id.indexOf(":");
 	return idx > 0 ? id.slice(0, idx) : id;
 }
-function round$1(x) {
+function round$6(x) {
 	return Number(x.toFixed(6));
+}
+//#endregion
+//#region src/core/sheaf-consensus.ts
+/**
+* 胞腔层：图上的局部一致性结构 + 调和共识求解器。
+*
+* 用法：
+*   const sheaf = new CellularSheaf();
+*   sheaf.addVertex('market', 1);        // 市场价信念（标量）
+*   sheaf.addVertex('stats', 1);         // 统计估计信念（标量）
+*   sheaf.addEdge('market', 'stats');    // 标量等值约束（缺省单位映射）
+*   const report = sheaf.harmonize([
+*     { id: 'market', values: [0.82], weight: 1 },
+*     { id: 'stats', values: [0.55], weight: 2 },
+*   ]);
+*   // consensus ≈ 加权调解；structuralConflict = false（标量等值总有解）
+*
+* 结构性障碍示例：三方循环硬约束 0.9 / 0.1 / 0.5（α→大）——
+* 调和后能量地板 > 0，obstruction = 'structural-conflict'：
+* 平均会说 0.5，本内核说「无解，先解决矛盾再谈共识」。
+*/
+var CellularSheaf = class {
+	vertexIds = [];
+	vertexDims = /* @__PURE__ */ new Map();
+	edges = [];
+	/** 添加顶点（幂等：重复 id 覆盖维度声明，边失效自检） */
+	addVertex(id, dim) {
+		if (!this.vertexDims.has(id)) this.vertexIds.push(id);
+		this.vertexDims.set(id, Math.max(1, Math.floor(dim)));
+		return this;
+	}
+	/** 添加一致性约束边（速记自动展开为投影矩阵） */
+	addEdge(spec) {
+		const dimA = this.vertexDims.get(spec.a);
+		const dimB = this.vertexDims.get(spec.b);
+		if (!dimA || !dimB) throw new Error(`边的端点未声明: ${spec.a}(${spec.a in this.vertexDims}) ↔ ${spec.b}(${spec.b in this.vertexDims})`);
+		let mapA = spec.mapA;
+		let mapB = spec.mapB;
+		if (!mapA || !mapB) {
+			const sharedA = spec.sharedA ?? Array.from({ length: Math.min(dimA, dimB) }, (_, i) => i);
+			const sharedB = spec.sharedB ?? Array.from({ length: Math.min(dimA, dimB) }, (_, i) => i);
+			if (sharedA.length !== sharedB.length) throw new Error("共享坐标数不一致: sharedA/sharedB 长度必须相等");
+			mapA = selectionMatrix(sharedA, dimA);
+			mapB = selectionMatrix(sharedB, dimB);
+		}
+		if (mapA.length !== mapB.length) throw new Error("限制映射的共享维度不一致（mapA/mapB 行数应相等）");
+		this.edges.push({
+			a: spec.a,
+			b: spec.b,
+			mapA,
+			mapB
+		});
+		return this;
+	}
+	/** 顶点数 / 边数 */
+	get size() {
+		return {
+			vertices: this.vertexIds.length,
+			edges: this.edges.length,
+			dimension: this.vertexDims.size
+		};
+	}
+	/** 全局维度布局：顶点 → 起始行号 */
+	layout() {
+		const offset = /* @__PURE__ */ new Map();
+		let acc = 0;
+		for (const id of this.vertexIds) {
+			offset.set(id, acc);
+			acc += this.vertexDims.get(id);
+		}
+		return offset;
+	}
+	/** 总维度 */
+	totalDim() {
+		return this.vertexIds.reduce((s, id) => s + this.vertexDims.get(id), 0);
+	}
+	/**
+	* 层拉普拉斯 L_F（D×D 块矩阵；D = Σ 各顶点维度）。
+	*
+	* L[v][v] = Σ_{e∋v} Fᵀ_{v≺e}F_{v≺e}；L[v][w] = −Fᵀ_{v≺e}F_{w≺e}
+	* （F 为 d_e×d 的限制映射；FᵀF 与 FᵀG 对共享维度 i 单重求和）
+	*/
+	buildLaplacian() {
+		const D = this.totalDim();
+		const offset = this.layout();
+		const L = Array.from({ length: D }, () => new Array(D).fill(0));
+		for (const edge of this.edges) {
+			const oa = offset.get(edge.a);
+			const ob = offset.get(edge.b);
+			const de = edge.mapA.length;
+			const da = edge.mapA[0]?.length ?? 0;
+			const db = edge.mapB[0]?.length ?? 0;
+			for (let i = 0; i < de; i += 1) {
+				for (let p = 0; p < da; p += 1) {
+					for (let q = 0; q < da; q += 1) L[oa + p][oa + q] += edge.mapA[i][p] * edge.mapA[i][q];
+					for (let q = 0; q < db; q += 1) {
+						const cross = -edge.mapA[i][p] * edge.mapB[i][q];
+						L[oa + p][ob + q] += cross;
+						L[ob + q][oa + p] += cross;
+					}
+				}
+				for (let p = 0; p < db; p += 1) for (let q = 0; q < db; q += 1) L[ob + p][ob + q] += edge.mapB[i][p] * edge.mapB[i][q];
+			}
+		}
+		return L;
+	}
+	/**
+	* 加权调和共识（双解口径）：
+	*
+	* - 软调解解 x_soft：min_x E_disagree(x) + Σ αᵢ‖xᵢ − bᵢ‖²
+	*   —— 正规方程 (L_F + A)x = Ab，一致性与观测忠诚度的最优折衷；
+	* - 完美共识解 x_hard：min Σ αᵢ‖xᵢ − bᵢ‖² s.t. L_F x = 0
+	*   —— 刚度惩罚 (A + M·L_F)x = Ab（M 大）实现约束最小二乘：
+	*   **完美共识流形上对观测的最佳拟合**；
+	* - 障碍裁决：x_hard 的加权锚定失配
+	*     misfit = Σ α‖x_hard − b‖² / Σ α
+	*   超过容差 ⇒ 任何完美共识都无法解释观测——**结构性障碍**
+	*   （平均化会编造共识，本内核宣布无解）；否则共识 = x_hard
+	*   （完美一致 + 最忠实观测），障碍时共识 = x_soft（冲突下的
+	*   最小翻供调解），两态各得其所。
+	*
+	* @param anchors 观测锚点（至少 1 个；其余顶点由结构外推——
+	*                完全无锚的连通分量无信息，解退化为 0 向量）
+	* @param options.misfitTolerance 障碍判定的加权失配容差
+	*        （均方差口径；缺省 0.0025 ≈ 5% 标准差）
+	*/
+	harmonize(anchors, options) {
+		const D = this.totalDim();
+		const offset = this.layout();
+		const L = this.buildLaplacian();
+		const alpha = new Float64Array(D);
+		const observed = new Float64Array(D);
+		const hasAnchor = new Uint8Array(D);
+		for (const anchor of anchors) {
+			const dim = this.vertexDims.get(anchor.id);
+			const start = offset.get(anchor.id);
+			if (dim === void 0 || start === void 0) continue;
+			const w = Math.max(0, anchor.weight ?? 1);
+			for (let i = 0; i < dim && i < anchor.values.length; i += 1) {
+				alpha[start + i] = w;
+				observed[start + i] = anchor.values[i];
+				hasAnchor[start + i] = 1;
+			}
+		}
+		let anchorWeightSum = 0;
+		for (let i = 0; i < D; i += 1) anchorWeightSum += alpha[i];
+		const rhs = Array.from({ length: D }, (_, i) => alpha[i] * observed[i]);
+		const softMatrix = L.map((row, i) => [...row]);
+		for (let i = 0; i < D; i += 1) softMatrix[i][i] += alpha[i];
+		const xSoft = solveLinearSystem(softMatrix, rhs);
+		const stiffness = 1e8 * Math.max(1, ...L.flat().map(Math.abs));
+		const hardMatrix = L.map((row, i) => row.map((v) => v * stiffness));
+		for (let i = 0; i < D; i += 1) hardMatrix[i][i] += alpha[i] + 1e-9;
+		const xHard = solveLinearSystem(hardMatrix, rhs);
+		let hardMisfit = 0;
+		for (let i = 0; i < D; i += 1) if (hasAnchor[i]) hardMisfit += alpha[i] * (xHard[i] - observed[i]) ** 2;
+		const misfit = anchorWeightSum > 0 ? hardMisfit / anchorWeightSum : 0;
+		const misfitTolerance = options?.misfitTolerance ?? .0025;
+		const obstruction = misfit > misfitTolerance ? "structural-conflict" : "none";
+		const solution = obstruction === "none" ? xHard : xSoft;
+		let disagreementEnergy = 0;
+		for (const edge of this.edges) {
+			const oa = offset.get(edge.a);
+			const ob = offset.get(edge.b);
+			for (let i = 0; i < edge.mapA.length; i += 1) {
+				const pa = edge.mapA[i].reduce((s, m, p) => s + m * solution[oa + p], 0);
+				const pb = edge.mapB[i].reduce((s, m, p) => s + m * solution[ob + p], 0);
+				disagreementEnergy += (pa - pb) ** 2;
+			}
+		}
+		const consensus = {};
+		const deviations = {};
+		for (const id of this.vertexIds) {
+			const start = offset.get(id);
+			const dim = this.vertexDims.get(id);
+			consensus[id] = Array.from({ length: dim }, (_, i) => round$5(solution[start + i]));
+			const anchor = anchors.find((a) => a.id === id);
+			if (anchor) {
+				let dev = 0;
+				for (let i = 0; i < dim && i < anchor.values.length; i += 1) dev += (solution[start + i] - anchor.values[i]) ** 2;
+				deviations[id] = round$5(Math.sqrt(dev));
+			}
+		}
+		const tolerance = Math.sqrt(misfitTolerance);
+		const outliers = Object.entries(deviations).filter(([, d]) => d > tolerance).sort((x, y) => y[1] - x[1]).map(([id]) => id);
+		const normalized = Math.min(1, misfit / Math.max(1e-15, misfitTolerance * 4));
+		return {
+			consensus,
+			disagreementEnergy: round$5(disagreementEnergy),
+			normalizedDisagreement: round$5(normalized),
+			obstruction,
+			deviations,
+			outliers,
+			spectralRadius: round$5(largestEigenvalue(L)),
+			size: {
+				vertices: this.vertexIds.length,
+				edges: this.edges.length,
+				dimension: D
+			},
+			interpretation: this.interpret(obstruction, misfit, misfitTolerance, outliers)
+		};
+	}
+	interpret(obstruction, misfit, tolerance, outliers) {
+		if (obstruction === "structural-conflict") {
+			const who = outliers.length > 0 ? `（翻供最大者：${outliers.slice(0, 3).join("、")}）` : "";
+			return `结构性分歧：任何完美共识都无法解释观测（加权失配 ${misfit.toFixed(4)} > 容差 ${tolerance}）——平均化会编造不存在的共识，共识 = 最小翻供调解${who}`;
+		}
+		return `共识达成：完美一致流形上的最优拟合（加权失配 ${misfit.toExponential(2)} ≤ 容差 ${tolerance}）${outliers.length > 0 ? `；翻供最大者：${outliers.slice(0, 3).join("、")}` : ""}`;
+	}
+};
+/**
+* 标量等值层（经典平均共识的层论化）：全部顶点标量信念、边为单位
+* 等值约束——调和共识退化为加权平均，但额外输出翻供距离与
+* （多维时）障碍检测。快路径工具与对照实验用。
+*/
+function scalarAgreementSheaf(ids) {
+	const sheaf = new CellularSheaf();
+	for (const id of ids) sheaf.addVertex(id, 1);
+	for (let i = 1; i < ids.length; i += 1) sheaf.addEdge({
+		a: ids[i - 1],
+		b: ids[i]
+	});
+	return sheaf;
+}
+/**
+* 声明重叠层（多源向量信念融合的标准形）：每个源一个顶点，维度 =
+* 其本地声明表长度；边声明两侧共享声明的坐标映射。
+*
+* 例：模型 A 信念表 [c1,c2,c3]，模型 B 信念表 [c1,c2,c4]——
+*   overlapSheaf([dimA=3, dimB=3], edges=[{a,b,sharedA:[0,1],sharedB:[0,1]}])
+* c1/c2 上强制一致，c3/c4 各自独立保留——「在哪一致、在哪各说各话」
+* 逐声明精确声明。
+*/
+function overlapSheaf(vertices, edges) {
+	const sheaf = new CellularSheaf();
+	for (const v of vertices) sheaf.addVertex(v.id, v.dim);
+	for (const e of edges) sheaf.addEdge(e);
+	return sheaf;
+}
+/** 坐标选择矩阵（d_e × d：选出指定坐标到共享空间） */
+function selectionMatrix(indices, dim) {
+	return indices.map((idx) => Array.from({ length: dim }, (_, j) => j === Math.max(0, Math.min(dim - 1, Math.floor(idx))) ? 1 : 0));
+}
+/** 高斯消元（部分主元；奇异系统返回最小范数近似解并告警 NaN 防护） */
+function solveLinearSystem(A, b) {
+	const n = A.length;
+	const M = A.map((row, i) => [...row, b[i]]);
+	for (let col = 0; col < n; col += 1) {
+		let pivot = col;
+		for (let r = col + 1; r < n; r += 1) if (Math.abs(M[r][col]) > Math.abs(M[pivot][col])) pivot = r;
+		if (Math.abs(M[pivot][col]) < 1e-14) continue;
+		[M[col], M[pivot]] = [M[pivot], M[col]];
+		for (let r = 0; r < n; r += 1) {
+			if (r === col) continue;
+			const factor = M[r][col] / M[col][col];
+			if (factor === 0) continue;
+			for (let c = col; c <= n; c += 1) M[r][c] -= factor * M[col][c];
+		}
+	}
+	const x = new Array(n).fill(0);
+	for (let i = 0; i < n; i += 1) {
+		const diag = M[i][i];
+		x[i] = Math.abs(diag) > 1e-14 ? M[i][n] / diag : 0;
+		if (!Number.isFinite(x[i])) x[i] = 0;
+	}
+	return x;
+}
+/** 幂迭代最大特征值（L_F 对称 PSD ⇒ λ_max = 谱半径） */
+function largestEigenvalue(A) {
+	const n = A.length;
+	if (n === 0) return 0;
+	let v = new Array(n).fill(1 / Math.sqrt(n));
+	let eigenvalue = 0;
+	for (let iter = 0; iter < 128; iter += 1) {
+		const Av = A.map((row) => row.reduce((s, a, j) => s + a * v[j], 0));
+		const next = Math.sqrt(Av.reduce((s, x) => s + x * x, 0));
+		if (next < 1e-15) return 0;
+		eigenvalue = next;
+		v = Av.map((x) => x / next);
+	}
+	return eigenvalue;
+}
+/** 六位小数圆整（项目统一展示口径） */
+function round$5(x) {
+	return Number.isFinite(x) ? Number(x.toFixed(6)) : 0;
+}
+//#endregion
+//#region src/core/index-scheduling.ts
+const DEFAULT_GITTINS_CONFIG = {
+	discount: .95,
+	maxCount: 48,
+	bisectionRounds: 26
+};
+/** 惰性 Gittins 指数表: 每个后验状态首次查询时精确计算并缓存 */
+var GittinsIndexTable = class {
+	discount;
+	maxCount;
+	bisectionRounds;
+	cache = /* @__PURE__ */ new Map();
+	cacheHits = 0;
+	constructor(config) {
+		const cfg = {
+			...DEFAULT_GITTINS_CONFIG,
+			...config
+		};
+		if (cfg.discount <= 0 || cfg.discount >= 1) throw new Error(`GittinsIndexTable: discount 必须在 (0,1) 开区间, 收到 ${cfg.discount}`);
+		this.discount = cfg.discount;
+		this.maxCount = Math.max(4, Math.floor(cfg.maxCount));
+		this.bisectionRounds = Math.max(8, Math.floor(cfg.bisectionRounds));
+	}
+	/**
+	* 状态 (α, β) 的 Gittins 指数。计数超网格时按比例钳制到边界并标记 clamped
+	* (大样本后验的学习溢价本就趋零, 钳制误差有界)。
+	*/
+	index(alpha, beta) {
+		let a = Math.max(1, Math.round(alpha));
+		let b = Math.max(1, Math.round(beta));
+		let clamped = false;
+		const n = a + b;
+		if (n > this.maxCount) {
+			const scale = this.maxCount / n;
+			a = Math.max(1, Math.floor(a * scale));
+			b = Math.max(1, this.maxCount - a);
+			clamped = true;
+		}
+		const key = `${a}:${b}`;
+		const hit = this.cache.get(key);
+		if (hit) {
+			this.cacheHits += 1;
+			return hit.index;
+		}
+		const value = this.computeIndex(a, b);
+		this.cache.set(key, {
+			index: value,
+			clamped
+		});
+		return value;
+	}
+	/** 是否经过了网格钳制(审计口径) */
+	clamped(alpha, beta) {
+		return Math.round(alpha) + Math.round(beta) > this.maxCount;
+	}
+	snapshot() {
+		return {
+			discount: this.discount,
+			maxCount: this.maxCount,
+			computedStates: this.cache.size,
+			cacheHits: this.cacheHits
+		};
+	}
+	/**
+	* 核心: 对退休金 R 反向归纳求 V_R(a0,b0), 返回「播放是否最优」。
+	* 只在 (a0,b0) 可达的三角形 (a≥a0, b≥b0, a+b ≤ maxCount) 上归纳。
+	*/
+	playOptimal(a0, b0, R) {
+		const gamma = this.discount;
+		const inv = 1 / (1 - gamma);
+		const retire = R * inv;
+		const n0 = a0 + b0;
+		const v = /* @__PURE__ */ new Map();
+		for (let n = this.maxCount; n >= n0; n--) for (let a = a0; a <= n - b0; a++) {
+			const b = n - a;
+			const p = a / n;
+			let playV;
+			if (n === this.maxCount) playV = p * inv;
+			else {
+				const vS = v.get(`${a + 1}:${b}`) ?? p * inv;
+				const vF = v.get(`${a}:${b + 1}`) ?? p * inv;
+				playV = p * (1 + gamma * vS) + (1 - p) * (gamma * vF);
+			}
+			v.set(`${a}:${b}`, Math.max(retire, playV));
+		}
+		const p0 = a0 / (a0 + b0);
+		return (a0 + b0 === this.maxCount ? p0 * inv : p0 * (1 + gamma * (v.get(`${a0 + 1}:${b0}`) ?? p0 * inv)) + (1 - p0) * (gamma * (v.get(`${a0}:${b0 + 1}`) ?? p0 * inv))) >= retire - 1e-12;
+	}
+	computeIndex(a, b) {
+		let lo = 0;
+		let hi = 1;
+		for (let i = 0; i < this.bisectionRounds; i++) {
+			const mid = (lo + hi) / 2;
+			if (this.playOptimal(a, b, mid)) lo = mid;
+			else hi = mid;
+		}
+		return round$4(lo);
+	}
+};
+/**
+* 索引调度器: 把候选模型(臂)按 effectiveIndex 降序排列。
+* 与 UCB 的本质区别: UCB 是乐观置信上界启发式, Gittins 是折扣 bandit 的
+* **可证明最优**指数; 挂载后调度器的候选排序升级为最优口径(零漂移: 不挂载即旧行为)。
+*/
+var IndexScheduler = class {
+	table;
+	constructor(table) {
+		this.table = table ?? new GittinsIndexTable();
+	}
+	getTable() {
+		return this.table;
+	}
+	rank(arms) {
+		const scored = [];
+		for (const arm of arms) {
+			if (!arm || typeof arm.id !== "string" || !arm.id) continue;
+			const availability = clamp01$1(arm.availability ?? 1);
+			if (availability <= 0) continue;
+			const alpha = 1 + Math.max(0, arm.successes);
+			const beta = 1 + Math.max(0, arm.failures);
+			const posteriorMean = alpha / (alpha + beta);
+			const gittinsIndex = this.table.index(alpha, beta);
+			scored.push({
+				id: arm.id,
+				alpha,
+				beta,
+				posteriorMean: round$4(posteriorMean),
+				gittinsIndex,
+				learningPremium: round$4(gittinsIndex - posteriorMean),
+				availability: round$4(availability),
+				effectiveIndex: round$4(gittinsIndex * availability),
+				rank: 0,
+				clamped: this.table.clamped(alpha, beta)
+			});
+		}
+		scored.sort((x, y) => y.effectiveIndex - x.effectiveIndex || x.id.localeCompare(y.id));
+		scored.forEach((s, i) => {
+			s.rank = i + 1;
+		});
+		return scored;
+	}
+};
+function clamp01$1(x) {
+	return Math.min(1, Math.max(0, x));
+}
+function round$4(x) {
+	return Math.round(x * 1e6) / 1e6;
+}
+//#endregion
+//#region src/core/bandit-knapsack.ts
+/**
+* 22.0 预算最优路由内核 —— Bandits with Knapsacks(Badanidiyuru–Kleinberg–Slivkins 2013;
+* Agrawal–Devanur 2014): 预算约束下最大化累计质量, 成本权重从对偶中内生涌现。
+*
+* 问题形式化(每轮选一个臂 = 模型执行一次):
+*     max E[ Σ_t q_{i_t} ]   s.t.  Σ_t c_{i_t} ≤ B_tokens, Σ_t cost_{i_t} ≤ B_cost
+* LP 松弛: max Σ π_i q_i s.t. Σ π_i c_i ≤ b, Σ π = 1(b = 剩余预算率);
+* 对偶影子价格 λ ≥ 0 使最优集中于 argmax(q_i − λ c_i) —— 固定 costWeight=0.2 只是 λ 的
+* 一次性猜测, 本内核让 λ 由「剩余预算 / 剩余轮数」的稀缺性实时决定。
+*
+* 在线算法(乐观可行性 + 预算感知贪心, BalK 结构):
+*   1. 质量采用乐观上界 q⁺ = q̂ + r_q(r_q 为 12.0 经验伯恩斯坦半径, 复用
+*      fixedSampleUpperBound), token 消耗半径用无界支撑的 EB 公式;
+*   2. 可行性: 均值消耗 ≤ 剩余预算率 × (1 + slack) —— slack 为噪声与突发留缓冲;
+*   3. 无可行臂 → 选最廉臂并标记 urgent(必须卸载负载, 而非假装最优仍存在);
+*   4. 影子价格: 取「最高质量但不可行臂 f」与「选中臂 c」的混合 LP 解
+*      λ = (q⁺_f − q⁺_c) / (c_f − c_c) —— 两臂混合 t* = (b − c_c)/(c_f − c_c) 是 LP 最优顶点,
+*      λ 即该顶点处预算约束的对偶变量(边际质量/单位 token)。
+*
+* 零漂移: 未挂载时调度器行为与升级前逐位一致。
+*/
+const DEFAULT_BWK_CONFIG = {
+	ucbAlpha: .05,
+	feasibilitySlack: .25,
+	minSamples: 1,
+	horizonDefault: 100
+};
+var BwKRouter = class {
+	config;
+	constructor(config) {
+		this.config = {
+			...DEFAULT_BWK_CONFIG,
+			...config
+		};
+	}
+	getConfig() {
+		return this.config;
+	}
+	route(arms, budgets) {
+		const valid = arms.filter((a) => a && typeof a.id === "string" && a.id && Number.isFinite(a.qualityMean) && Number.isFinite(a.tokensMean) && a.tokensMean >= 0);
+		if (valid.length === 0) return {
+			chosenId: "",
+			basis: "empty",
+			urgent: false,
+			rateTokens: 0,
+			rateCost: 0,
+			shadowPriceTokens: 0,
+			shadowPriceCost: 0,
+			candidates: [],
+			reason: "无可用臂"
+		};
+		const rounds = Math.max(1, Math.floor(budgets.roundsRemaining || this.config.horizonDefault));
+		const rateTokens = Math.max(0, budgets.tokensRemaining) / rounds;
+		const rateCost = budgets.costRemaining != null && budgets.costRemaining > 0 ? Math.max(0, budgets.costRemaining) / rounds : 0;
+		const candidates = valid.map((arm) => {
+			const radiusQuality = qualityRadius(arm, this.config.ucbAlpha, this.config.minSamples);
+			const optimisticQuality = clamp01(arm.qualityMean + radiusQuality);
+			const feasible = arm.tokensMean <= rateTokens * (1 + this.config.feasibilitySlack) && (rateCost <= 0 || (arm.costMean ?? 0) <= rateCost * (1 + this.config.feasibilitySlack));
+			return {
+				id: arm.id,
+				optimisticQuality,
+				tokensMean: arm.tokensMean,
+				feasible,
+				radiusQuality: round$3(radiusQuality)
+			};
+		});
+		const feasible = candidates.filter((c) => c.feasible);
+		if (feasible.length === 0) {
+			const cheapest = [...candidates].sort((x, y) => x.tokensMean - y.tokensMean || y.optimisticQuality - x.optimisticQuality)[0];
+			return {
+				chosenId: cheapest.id,
+				basis: "cheapest-shed",
+				urgent: true,
+				rateTokens: round$3(rateTokens),
+				rateCost: round$3(rateCost),
+				shadowPriceTokens: 0,
+				shadowPriceCost: 0,
+				candidates,
+				reason: `预算率 ${rateTokens.toFixed(0)} tok/轮 低于最廉臂 ${cheapest.tokensMean.toFixed(0)} tok, 触发负载卸载`
+			};
+		}
+		const chosen = [...feasible].sort((x, y) => y.optimisticQuality - x.optimisticQuality || x.tokensMean - y.tokensMean)[0];
+		let shadowPriceTokens = 0;
+		let bottleneckArmId;
+		const infeasible = candidates.filter((c) => !c.feasible);
+		for (const f of infeasible) {
+			if (f.optimisticQuality <= chosen.optimisticQuality) continue;
+			const denom = valid.find((a) => a.id === f.id).tokensMean - chosen.tokensMean;
+			if (denom > 1e-9) {
+				const lambda = (f.optimisticQuality - chosen.optimisticQuality) / denom;
+				if (lambda > shadowPriceTokens) {
+					shadowPriceTokens = lambda;
+					bottleneckArmId = f.id;
+				}
+			}
+		}
+		return {
+			chosenId: chosen.id,
+			basis: "ucb-feasible",
+			urgent: false,
+			rateTokens: round$3(rateTokens),
+			rateCost: round$3(rateCost),
+			shadowPriceTokens: round$3(shadowPriceTokens),
+			shadowPriceCost: 0,
+			bottleneckArmId,
+			candidates,
+			reason: shadowPriceTokens > 0 ? `选中 ${chosen.id}(乐观质量 ${chosen.optimisticQuality.toFixed(3)}); 影子价格 λ=${shadowPriceTokens.toFixed(4)} 质量/token, 高质臂 ${bottleneckArmId} 被预算率卡在门外` : `选中 ${chosen.id}(乐观质量 ${chosen.optimisticQuality.toFixed(3)}), 预算充裕无影子价格`
+		};
+	}
+};
+/** 质量 ∈ [0,1] 的乐观半径: 复用 12.0 经验伯恩斯坦上界减均值 */
+function qualityRadius(arm, alpha, minSamples) {
+	if (arm.samples < Math.max(1, minSamples) || arm.samples < 1) return .5;
+	const mean = clamp01(arm.qualityMean);
+	const variance = Math.max(0, arm.qualityVar ?? mean * (1 - mean));
+	const upper = fixedSampleUpperBound(arm.samples, mean, variance, alpha);
+	const radius = Math.max(0, upper - mean);
+	return Number.isFinite(radius) ? Math.min(1, radius) : .5;
+}
+function clamp01(x) {
+	return Math.min(1, Math.max(0, x));
+}
+function round$3(x) {
+	return Math.round(x * 1e6) / 1e6;
+}
+//#endregion
+//#region src/core/differential-privacy.ts
+const DEFAULT_PRIVACY_CONFIG = {
+	epsilon: 3,
+	delta: 1e-6
+};
+/** RDP 组合采用的固定阶 */
+const RDP_ORDER = 8;
+/** Laplace(0, b) 噪声: 逆 CDF 采样, U(0,1) → −b·sign(u−½)·ln(1−2|u−½|) */
+function laplaceNoise(scale, rng = Math.random) {
+	const u = Math.max(1e-12, Math.min(1 - 1e-12, rng()));
+	return -scale * Math.sign(u - .5) * Math.log(1 - 2 * Math.abs(u - .5));
+}
+/** 标准正态噪声(Box–Muller) */
+function gaussianNoise(rng = Math.random) {
+	const u1 = Math.max(1e-12, rng());
+	const u2 = rng();
+	return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+/** Laplace 机制单值: (ε,0)-DP, 无记账(机制级原语) */
+function dpValue(value, epsilon, sensitivity = 1, rng = Math.random) {
+	return value + laplaceNoise(sensitivity / Math.max(epsilon, 1e-9), rng);
+}
+/** 钳位均值 + Laplace: 敏感度 (hi−lo)/n */
+function dpMeanClamped(values, epsilon, lo, hi, rng = Math.random) {
+	const clamped = values.map((v) => Math.min(hi, Math.max(lo, v)));
+	return dpValue(clamped.length ? clamped.reduce((s, x) => s + x, 0) / clamped.length : (lo + hi) / 2, epsilon, (hi - lo) / Math.max(1, clamped.length), rng);
+}
+/** 直方图 + Laplace: 不相交桶并行组合, 敏感度 1 */
+function dpHistogram(counts, epsilon, rng = Math.random) {
+	return counts.map((c) => Math.max(0, dpValue(c, epsilon, 1, rng)));
+}
+/** RDP(α_ord) 转 (ε, δ): 单阶记账的解析转换 */
+function rdpToEpsilon(rdpAtOrder, order, delta) {
+	return rdpAtOrder + Math.log(1 / Math.max(delta, 1e-15)) / (order - 1);
+}
+/**
+* 差分隐私账本: 折半分账的预算管理。
+* 每次 gaussianRdp/laplace 调用消耗剩余预算的一半 —— 几何级数保证总消耗 ≤ ε,
+* 且任何时刻可读出已耗/剩余。
+*/
+var PrivacyAccountant = class {
+	config;
+	rng;
+	spent = 0;
+	releases = [];
+	releaseLimit = 200;
+	constructor(config, rng) {
+		this.config = {
+			...DEFAULT_PRIVACY_CONFIG,
+			...config
+		};
+		this.rng = rng ?? Math.random;
+	}
+	get remaining() {
+		return Math.max(0, this.config.epsilon - this.spent);
+	}
+	get exhausted() {
+		return this.remaining <= 1e-6;
+	}
+	/** Laplace 发布(消耗折半预算); 超限返回 undefined */
+	laplace(value, sensitivity, tag) {
+		const alloc = this.allocate(tag, "laplace");
+		if (alloc == null) return void 0;
+		return dpValue(value, alloc, sensitivity, this.rng);
+	}
+	/**
+	* Gaussian + RDP 发布: σ 由本次分配的 ε 与固定阶推得;
+	* 返回加噪后的数值数组, 超限返回 undefined。
+	*/
+	gaussianRdp(values, l2Sensitivity, tag) {
+		const alloc = this.allocate(tag, "gaussian-rdp");
+		if (alloc == null) return void 0;
+		const sigma = l2Sensitivity * Math.sqrt(8 / (2 * alloc));
+		return values.map((v) => v + gaussianNoise(this.rng) * sigma);
+	}
+	/** 状态快照(自身不含敏感数值) */
+	status() {
+		return {
+			epsilonBudget: this.config.epsilon,
+			epsilonSpent: round$2(this.spent),
+			epsilonRemaining: round$2(this.remaining),
+			delta: this.config.delta,
+			releases: [...this.releases],
+			exhausted: this.exhausted
+		};
+	}
+	allocate(tag, mechanism) {
+		if (this.exhausted || this.releases.length >= this.releaseLimit) return null;
+		const alloc = this.remaining / 2;
+		if (alloc < 1e-4) return null;
+		this.spent += alloc;
+		this.releases.push({
+			tag: `${mechanism}:${tag}`,
+			mechanism,
+			epsilonSpent: round$2(alloc),
+			at: Date.now()
+		});
+		return alloc;
+	}
+};
+/**
+* 通用视图扰动: 深度优先遍历 JSON 视图, 对数值叶子施加 Laplace(敏感度 1)。
+* 跳过 id/时间戳/版本/计数类键(这些字段本身不可逆推个体), 每次调用最多扰动 maxFields 个
+* 数值以控制预算燃烧。预算耗尽后剩余字段原样返回(不静默失败——status 可审计)。
+*/
+function perturbNumbers(view, accountant, maxFields = 24) {
+	let touched = 0;
+	const SKIP = /(^|[^a-z])(id|at|ts|version|seq|count|port|index|rank|generation|tick)s?$/i;
+	const walk = (node) => {
+		if (Array.isArray(node)) return node.map(walk);
+		if (node && typeof node === "object") {
+			const out = {};
+			for (const [k, v] of Object.entries(node)) if (typeof v === "number" && Number.isFinite(v) && !SKIP.test(k)) {
+				if (touched < maxFields) {
+					const noisy = accountant.laplace(v, 1, k);
+					touched += 1;
+					out[k] = noisy ?? v;
+				} else out[k] = v;
+			} else out[k] = walk(v);
+			return out;
+		}
+		return node;
+	};
+	return walk(view);
+}
+function round$2(x) {
+	return Math.round(x * 1e6) / 1e6;
+}
+//#endregion
+//#region src/core/capacity-planning.ts
+const DEFAULT_CAPACITY_CONFIG = {
+	targetWaitMs: 5e3,
+	maxConcurrency: 64,
+	defaultScv: 2
+};
+/** M/M/c Erlang-C 精确指标。λ 每单位时间到达数, μ 单台每单位时间服务率, c 台 */
+function erlangC(lambda, mu, servers) {
+	if (!(lambda > 0) || !(mu > 0) || servers < 1) return {
+		servers,
+		rho: 0,
+		stable: false,
+		waitProbability: 0,
+		avgWait: 0,
+		avgQueueLength: 0,
+		basis: "invalid"
+	};
+	const a = lambda / mu;
+	const c = Math.floor(servers);
+	const rho = a / c;
+	if (rho >= 1) return {
+		servers: c,
+		rho: round$1(rho),
+		stable: false,
+		waitProbability: 1,
+		avgWait: Infinity,
+		avgQueueLength: Infinity,
+		basis: "unstable"
+	};
+	let b = 1;
+	for (let k = 1; k <= c; k++) b = a * b / (k + a * b);
+	const waitProb = b / (1 - rho * (1 - b));
+	const avgWait = waitProb / (c * mu - lambda);
+	return {
+		servers: c,
+		rho: round$1(rho),
+		stable: true,
+		waitProbability: round$1(waitProb),
+		avgWait,
+		avgQueueLength: round$1(lambda * avgWait),
+		basis: "erlang-c"
+	};
+}
+/** M/G/c Kingman 重尾近似; scv = 服务时间平方变异系数 C_s² */
+function kingmanWq(lambda, mu, servers, scv) {
+	const c = Math.max(1, Math.floor(servers));
+	const rho = lambda / mu / c;
+	if (rho >= 1) return Infinity;
+	return (1 + Math.max(0, scv)) / 2 * (rho / (1 - rho)) * (1 / mu) / c;
+}
+/** Little 定律自检: 返回实测与理论在途数之比(< 0.5 或 > 2 提示模型失配) */
+function littleCheck(lambda, avgSojournMs, observedInFlight) {
+	const theoretical = lambda * avgSojournMs;
+	return {
+		theoretical: round$1(theoretical),
+		observed: observedInFlight,
+		ratio: theoretical > 1e-9 ? round$1(observedInFlight / theoretical) : 0
+	};
+}
+/** 容量规划器: 由预测到达率与服务统计反解最小并发 */
+var CapacityPlanner = class {
+	config;
+	constructor(config) {
+		this.config = {
+			...DEFAULT_CAPACITY_CONFIG,
+			...config
+		};
+	}
+	getConfig() {
+		return this.config;
+	}
+	/**
+	* @param input.predictedArrivalPerSec 预测到达率(次/秒, 世界模型 predictArrivals ÷ horizon 秒)
+	* @param input.serviceMeanMs 稳健平均服务时长(毫秒, 建议 23.0 robustMean)
+	* @param input.serviceScv 服务 SCV(σ̂²/μ̂², 缺省 defaultScv)
+	* @param input.currentConcurrency 当前该池并发上限
+	*/
+	plan(input) {
+		const lambda = Math.max(0, input.predictedArrivalPerSec);
+		const meanMs = Math.max(.001, input.serviceMeanMs);
+		const scv = Math.max(.01, input.serviceScv ?? this.config.defaultScv);
+		const current = Math.max(1, Math.floor(input.currentConcurrency));
+		const mu = 1e3 / meanMs;
+		const waitMs = (c) => {
+			return (scv === 1 ? erlangC(lambda, mu, c).avgWait : kingmanWq(lambda, mu, c, scv)) * 1e3;
+		};
+		const minStable = Math.floor(lambda / mu) + 1;
+		let lo = Math.max(1, minStable);
+		let hi = Math.max(this.config.maxConcurrency, current, minStable);
+		if (waitMs(hi) > this.config.targetWaitMs) return this.build(lambda, mu, scv, hi, current, false, waitMs(hi));
+		while (lo < hi) {
+			const mid = Math.floor((lo + hi) / 2);
+			if (waitMs(mid) <= this.config.targetWaitMs) hi = mid;
+			else lo = mid + 1;
+		}
+		return this.build(lambda, mu, scv, lo, current, true, waitMs(lo));
+	}
+	build(lambda, mu, scv, recommended, current, feasible, waitMs) {
+		const metrics = scv === 1 ? erlangC(lambda, mu, recommended) : {
+			servers: recommended,
+			rho: round$1(lambda / (recommended * mu)),
+			stable: lambda / (recommended * mu) < 1,
+			waitProbability: NaN,
+			avgWait: waitMs / 1e3,
+			avgQueueLength: round$1(lambda * waitMs / 1e3),
+			basis: "kingman"
+		};
+		return {
+			recommendedConcurrency: recommended,
+			currentConcurrency: current,
+			rho: metrics.rho,
+			expectedWaitMs: round$1(waitMs),
+			targetWaitMs: this.config.targetWaitMs,
+			feasible,
+			headroom: round$1(recommended / Math.max(1, current)),
+			basis: feasible ? scv === 1 ? "erlang-c 精解二分反解" : `Kingman(SCV=${scv.toFixed(2)}) 二分反解` : "并发上限内无法满足目标等待(需扩容或降载)",
+			metricsAtRecommended: metrics
+		};
+	}
+};
+function round$1(x) {
+	return Math.round(x * 1e6) / 1e6;
+}
+//#endregion
+//#region src/symbiosis/ledger.ts
+/**
+* ledger.ts — 认知能量账本（共生进化架构第五阶段 1/4）
+*
+* 质变设计（相对"agent.energy 公开字段"草案的三重升级）：
+*
+* 1. 能量不可伪造：智能体没有 energy 字段，能量只存在于账本账户中，
+*    只能经 transfer/mint/burn 流转；每笔流转双方平衡（复式记账），
+*    全局守恒律恒成立：Σ(所有账户余额) === initialSupply + minted。
+*
+* 2. 链式哈希审计：每笔转账携带 sha256 链哈希（前序哈希 + 本笔内容），
+*    任何对历史凭证的篡改都会导致 verifyChain() 失败——能量流向可审计、
+*    可回放、不可抵赖。这是"玩具模拟"与"经济系统"的分水岭。
+*
+* 3. 生态健康可观测：giniCoefficient() 度量能量分布集中度——
+*    能量过度集中 = 垄断 = 认知生态死亡信号（单一智能体买断全部资源，
+*    多样性消失，进化停滞）。监管层可据此调节铸币与救济策略。
+*
+* 账户语义：
+* - treasury：央行国库（初始供给 + 任务成功铸币收入池），仅 runtime 持有账本引用
+* - burn（INCINERATOR）：燃烧池，burn 的能量退出流通但保留审计痕迹
+* - escrow：行动预扣托管（提案批准 → 预扣；执行完毕 → 燃烧/退还）
+*
+* 权限模型（Phase 1）：EnergyLedger 实例仅由 SymbiosisRuntime / CognitiveMarket
+* 持有；智能体只拿到只读快照（Perception.ownBalance），无法绕过市场直接转账。
+*/
+/** 央行国库：初始供给与铸币收入池 */
+const TREASURY = "treasury";
+/** 燃烧池：burn 的能量退出流通（余额保留供审计） */
+const INCINERATOR = "burn";
+/** 行动预扣托管账户 */
+const ESCROW = "escrow";
+const GENESIS_HASH = "0".repeat(64);
+var EnergyLedger = class {
+	balances = /* @__PURE__ */ new Map();
+	frozen = /* @__PURE__ */ new Set();
+	journal = [];
+	chainHead = GENESIS_HASH;
+	/** 链锚点：被裁剪的最后一条凭证哈希（verifyChain 由此起验） */
+	chainAnchor = GENESIS_HASH;
+	seqCounter = 0;
+	mintedTotal = 0;
+	initialSupply;
+	journalLimit;
+	constructor(config = {}) {
+		this.initialSupply = Math.max(0, config.initialSupply ?? 1e4);
+		this.journalLimit = Math.max(10, config.journalLimit ?? 2e3);
+		this.balances.set(TREASURY, this.initialSupply);
+		this.balances.set(INCINERATOR, 0);
+		this.balances.set(ESCROW, 0);
+	}
+	/** 开户（零余额；初始注资由调用方经 treasury transfer 完成） */
+	openAccount(id) {
+		if (this.balances.has(id)) return false;
+		this.balances.set(id, 0);
+		return true;
+	}
+	hasAccount(id) {
+		return this.balances.has(id);
+	}
+	balance(id) {
+		return this.balances.get(id) ?? 0;
+	}
+	isFrozen(id) {
+		return this.frozen.has(id);
+	}
+	freeze(id) {
+		if (this.balances.has(id)) this.frozen.add(id);
+	}
+	unfreeze(id) {
+		this.frozen.delete(id);
+	}
+	/** 原子转账：余额不足/冻结/非法金额全部拒绝，拒绝时状态零变更 */
+	transfer(from, to, amount, reason, refId) {
+		if (!(amount > 0) || !Number.isFinite(amount)) return {
+			ok: false,
+			error: "non-positive-amount"
+		};
+		if (from === to) return {
+			ok: false,
+			error: "self-transfer"
+		};
+		if (!this.balances.has(from) || !this.balances.has(to)) return {
+			ok: false,
+			error: "unknown-account"
+		};
+		if (this.frozen.has(from)) return {
+			ok: false,
+			error: "frozen-account"
+		};
+		if ((this.balances.get(from) ?? 0) < amount) return {
+			ok: false,
+			error: "insufficient-funds"
+		};
+		this.balances.set(from, (this.balances.get(from) ?? 0) - amount);
+		this.balances.set(to, (this.balances.get(to) ?? 0) + amount);
+		return {
+			ok: true,
+			transfer: this.appendEntry(from, to, amount, reason, refId)
+		};
+	}
+	/** 央行铸币：向 to 增发能量（对应真实价值注入：任务成功/知识生效）。
+	*  仅 runtime 持有账本引用时调用；破坏守恒律的唯一入口且被显式记账。 */
+	mint(to, amount, reason, refId) {
+		if (!(amount > 0) || !Number.isFinite(amount)) return {
+			ok: false,
+			error: "non-positive-amount"
+		};
+		if (!this.balances.has(to)) return {
+			ok: false,
+			error: "unknown-account"
+		};
+		this.balances.set(to, (this.balances.get(to) ?? 0) + amount);
+		this.mintedTotal += amount;
+		return {
+			ok: true,
+			transfer: this.appendEntry("(mint)", to, amount, reason, refId)
+		};
+	}
+	/** 燃烧：能量转入燃烧池退出流通（余额保留供审计与守恒校验） */
+	burn(from, amount, reason, refId) {
+		return this.transfer(from, INCINERATOR, amount, reason, refId);
+	}
+	/** 已燃烧总量 */
+	burned() {
+		return this.balance(INCINERATOR);
+	}
+	/** 央行铸币总量 */
+	minted() {
+		return this.mintedTotal;
+	}
+	/** 守恒总供给 = initialSupply + minted */
+	totalSupply() {
+		return this.initialSupply + this.mintedTotal;
+	}
+	/** 流通供给 = 总供给 - 燃烧池余额 - 托管余额 */
+	circulatingSupply() {
+		return this.totalSupply() - this.balance(INCINERATOR) - this.balance(ESCROW);
+	}
+	/**
+	* 基尼系数（0 完全平等 → 1 完全垄断）。
+	* 默认只统计智能体账户（排除 treasury/burn/escrow 内部账户）——
+	* 内部账户是基础设施而非生态成员，计入会稀释真实集中度信号。
+	* 零余额账户**保留**在统计内：这是基尼系数的标准口径（零收入人口
+	* 计入分母）——饿死归零 / 尚未入场的智能体都是生态成员，「很多
+	* 零余额者」本身就是分布的事实而非统计噪声，剔除会系统性低估
+	* 集中度（[100,0] 标准值 0.5，剔除后虚降为 0）
+	*/
+	giniCoefficient(includeInternal = false) {
+		const INTERNAL = /* @__PURE__ */ new Set([
+			TREASURY,
+			INCINERATOR,
+			ESCROW
+		]);
+		const values = [];
+		for (const [id, bal] of this.balances) {
+			if (!includeInternal && INTERNAL.has(id)) continue;
+			values.push(bal);
+		}
+		const n = values.length;
+		if (n === 0) return 0;
+		const total = values.reduce((a, b) => a + b, 0);
+		if (total <= 0) return 0;
+		const sorted = [...values].sort((a, b) => a - b);
+		let weightedSum = 0;
+		for (let i = 0; i < n; i++) weightedSum += (i + 1) * sorted[i];
+		return Math.max(0, 2 * weightedSum / (n * total) - (n + 1) / n);
+	}
+	/** 最近 limit 条凭证（拷贝，外部修改不影响账本） */
+	audit(limit = 50) {
+		return this.journal.slice(-limit).map((t) => ({ ...t }));
+	}
+	/** 守恒律校验：Σ(所有账户余额) === initialSupply + minted */
+	verifyConservation() {
+		let sum = 0;
+		for (const bal of this.balances.values()) sum += bal;
+		return Math.abs(sum - this.totalSupply()) < 1e-9;
+	}
+	/** 链完整性校验：重算全链哈希，任何历史篡改即刻暴露 */
+	verifyChain() {
+		let prev = this.chainAnchor;
+		for (const entry of this.journal) {
+			if (hashEntry(prev, entry) !== entry.hash) return false;
+			prev = entry.hash;
+		}
+		return true;
+	}
+	stats() {
+		return {
+			totalSupply: this.totalSupply(),
+			circulatingSupply: this.circulatingSupply(),
+			minted: this.mintedTotal,
+			burned: this.balance(INCINERATOR),
+			transfers: this.journal.length,
+			accounts: this.balances.size,
+			frozenAccounts: this.frozen.size,
+			gini: this.giniCoefficient(),
+			chainHead: this.chainHead,
+			chainIntact: this.verifyChain()
+		};
+	}
+	/** 导出快照（持久化 / 测试篡改注入用） */
+	snapshotState() {
+		return {
+			balances: [...this.balances.entries()],
+			frozen: [...this.frozen],
+			journal: this.journal.map((t) => ({ ...t })),
+			seqCounter: this.seqCounter,
+			minted: this.mintedTotal,
+			initialSupply: this.initialSupply,
+			chainAnchor: this.chainAnchor
+		};
+	}
+	/** 导入快照（原子整体替换） */
+	restoreState(snap) {
+		this.balances = new Map(snap.balances);
+		this.frozen = new Set(snap.frozen);
+		this.journal = snap.journal.map((t) => ({ ...t }));
+		this.seqCounter = snap.seqCounter;
+		this.mintedTotal = snap.minted;
+		this.chainAnchor = snap.chainAnchor ?? GENESIS_HASH;
+		this.chainHead = this.journal.length > 0 ? this.journal[this.journal.length - 1].hash : GENESIS_HASH;
+	}
+	appendEntry(from, to, amount, reason, refId) {
+		const entry = {
+			seq: ++this.seqCounter,
+			from,
+			to,
+			amount,
+			reason,
+			refId,
+			timestamp: Date.now(),
+			hash: ""
+		};
+		entry.hash = hashEntry(this.chainHead, entry);
+		this.chainHead = entry.hash;
+		this.journal.push(entry);
+		if (this.journal.length > this.journalLimit) {
+			const overflow = this.journal.length - this.journalLimit;
+			this.chainAnchor = this.journal[overflow - 1].hash;
+			this.journal.splice(0, overflow);
+		}
+		return entry;
+	}
+};
+function hashEntry(prevHash, entry) {
+	return createHash("sha256").update(`${prevHash}|${entry.seq}|${entry.from}|${entry.to}|${entry.amount}|${entry.reason}|${entry.refId ?? ""}|${entry.timestamp}`).digest("hex");
+}
+//#endregion
+//#region src/symbiosis/belief.ts
+/**
+* belief.ts — 信念市场（共生进化架构 Phase 2：市场即心智）
+*
+* 质变定位：Phase 1 让知识有了价格；本层让**信念**有了价格。
+*
+* 系统里所有"对未来的判断"（模型成功率、策略增益、知识有效性）原本是
+* 被动统计量——不可问责、不可聚合、不可对赌。本层把它们变成可交易的
+* 二元信念资产：
+*
+* - **LMSR 做市商**（对数市场评分规则，Hanson 2003）：
+*   成本函数 C(q) = b·ln(e^{q1/b} + e^{q2/b})，价格 = sigmoid((q1−q2)/b)。
+*   无需对手方即可成交；国库提供有界流动性补贴（最坏损失 b·ln2）；
+*   成本函数路径无关 → 买卖往返净成本恒为 0（无摩擦）。
+*
+* - **信息聚合**：持有私有信息的智能体（记忆层知道历史、进化器知道沙盒
+*   LCB）下注 → 价格移动到其估计 → 信息劣势者被套利。错的信念自动
+*   亏钱给对的信念——信念进化有了牙齿。
+*
+* - **结算即审计**：到期按实现结果结算（realized > threshold = YES），
+*   每份 YES/NO 份额支付 1 能量；赢家从流动性池领取，亏家血本无归。
+*
+* - **激励相容**：LMSR 本质是 proper scoring rule 的市场化——
+*   把价格推到自己真实估计是最优策略（谎报即送钱给套利者）。
+*
+* 能量流：买单成本 → belief-pool（流动性池）→ 结算赔付；
+* 池 shortfall 由国库有界补贴，盈余扫回国库。全程复式记账、守恒可审计。
+* 信念市场允许分数能量（连续价格机制的数学需要；账本不限制粒度）。
+*/
+/** 信念流动性池账户（收集买单成本、支付结算赔付） */
+const BELIEF_POOL = "belief-pool";
+function logSumExp(a, b) {
+	const m = Math.max(a, b);
+	return m + Math.log(Math.exp(a - m) + Math.exp(b - m));
+}
+/** 做市商成本函数 C(q1,q2) = b·ln(e^{q1/b} + e^{q2/b}) */
+function cost(q1, q2, b) {
+	return b * logSumExp(q1 / b, q2 / b);
+}
+function sigmoid(x) {
+	return x >= 0 ? 1 / (1 + Math.exp(-x)) : Math.exp(x) / (1 + Math.exp(x));
+}
+/** 隐含 YES 概率 = sigmoid((q1−q2)/b) */
+function impliedProbYes(q1, q2, b) {
+	return sigmoid((q1 - q2) / b);
+}
+let beliefCounter = 0;
+/**
+* 信念市场：LMSR 做市的二元断言交易场所。
+*
+* 权限模型：仅 SymbiosisRuntime 持有实例；智能体经感知视图（BeliefView）
+* 只读价格，经 bet-belief 提案由运行时代为成交。
+*/
+var BeliefMarket = class {
+	ledger;
+	assets = /* @__PURE__ */ new Map();
+	positions = /* @__PURE__ */ new Map();
+	defaultB;
+	constructor(ledger, config = {}) {
+		this.ledger = ledger;
+		this.defaultB = Math.max(.5, config.defaultB ?? 10);
+		if (!ledger.hasAccount("belief-pool")) ledger.openAccount(BELIEF_POOL);
+	}
+	/** 上市新信念（创建即开放交易；国库隐性承担做市补贴义务） */
+	create(input) {
+		if (!input.subject) return {
+			ok: false,
+			error: "missing-subject"
+		};
+		if (!Number.isFinite(input.threshold)) return {
+			ok: false,
+			error: "invalid-threshold"
+		};
+		if (!(input.settleAtTick > 0)) return {
+			ok: false,
+			error: "invalid-settle-tick"
+		};
+		beliefCounter += 1;
+		const asset = {
+			id: `belief-${beliefCounter}`,
+			claim: input.claim,
+			subject: input.subject,
+			threshold: input.threshold,
+			settleAtTick: input.settleAtTick,
+			creator: input.creator,
+			liquidityB: Math.max(.5, input.liquidityB ?? this.defaultB),
+			yesShares: 0,
+			noShares: 0,
+			status: "open",
+			volume: 0,
+			createdAt: Date.now()
+		};
+		this.assets.set(asset.id, asset);
+		return {
+			ok: true,
+			assetId: asset.id
+		};
+	}
+	/** 隐含 YES 概率（当前价格） */
+	price(assetId) {
+		const a = this.assets.get(assetId);
+		return a && a.status === "open" ? impliedProbYes(a.yesShares, a.noShares, a.liquidityB) : void 0;
+	}
+	view(assetId) {
+		const a = this.assets.get(assetId);
+		return a ? this.toView(a) : void 0;
+	}
+	views() {
+		return [...this.assets.values()].map((a) => this.toView(a));
+	}
+	/** 持仓查询（审计/测试用，拷贝） */
+	positionOf(agentId, assetId) {
+		const p = this.positions.get(`${assetId}|${agentId}`);
+		return p ? { ...p } : void 0;
+	}
+	/**
+	* 精确份额买入：成本 = C(q+Δ) − C(q)（LMSR 定价）。
+	* 能量 agent → belief-pool。
+	*/
+	buyShares(agentId, assetId, outcome, shares) {
+		const asset = this.assets.get(assetId);
+		if (!asset) return {
+			ok: false,
+			error: "unknown-asset"
+		};
+		if (asset.status !== "open") return {
+			ok: false,
+			error: "not-open"
+		};
+		if (!(shares > 0) || !Number.isFinite(shares)) return {
+			ok: false,
+			error: "non-positive-shares"
+		};
+		const b = asset.liquidityB;
+		const newYes = asset.yesShares + (outcome === "YES" ? shares : 0);
+		const newNo = asset.noShares + (outcome === "NO" ? shares : 0);
+		const price = cost(newYes, newNo, b) - cost(asset.yesShares, asset.noShares, b);
+		if (!(price > 0)) return {
+			ok: false,
+			error: "non-positive-cost"
+		};
+		if (this.ledger.balance(agentId) < price) return {
+			ok: false,
+			error: "insufficient-funds"
+		};
+		const receipt = this.ledger.transfer(agentId, BELIEF_POOL, price, "belief-buy", assetId);
+		if (!receipt.ok) return {
+			ok: false,
+			error: receipt.error
+		};
+		asset.yesShares = newYes;
+		asset.noShares = newNo;
+		asset.volume += price;
+		this.updatePosition(agentId, assetId, outcome, shares, price);
+		return {
+			ok: true,
+			cost: price,
+			shares,
+			priceAfter: impliedProbYes(newYes, newNo, b)
+		};
+	}
+	/**
+	* 卖回做市商（结算前平仓）：退款 = C(q) − C(q−Δ)。
+	* LMSR 成本函数路径无关 → 买卖往返净成本恒为 0（零摩擦）。
+	*/
+	sellShares(agentId, assetId, outcome, shares) {
+		const asset = this.assets.get(assetId);
+		if (!asset) return {
+			ok: false,
+			error: "unknown-asset"
+		};
+		if (asset.status !== "open") return {
+			ok: false,
+			error: "not-open"
+		};
+		const pos = this.positions.get(`${assetId}|${agentId}`);
+		const held = outcome === "YES" ? pos?.yesShares ?? 0 : pos?.noShares ?? 0;
+		if (!(shares > 0) || shares > held + 1e-9) return {
+			ok: false,
+			error: "insufficient-shares"
+		};
+		const b = asset.liquidityB;
+		const newYes = asset.yesShares - (outcome === "YES" ? shares : 0);
+		const newNo = asset.noShares - (outcome === "NO" ? shares : 0);
+		const refund = cost(asset.yesShares, asset.noShares, b) - cost(newYes, newNo, b);
+		if (!(refund > 0)) return {
+			ok: false,
+			error: "non-positive-refund"
+		};
+		const receipt = this.ledger.transfer(BELIEF_POOL, agentId, refund, "belief-sell", assetId);
+		if (!receipt.ok) return {
+			ok: false,
+			error: receipt.error
+		};
+		asset.yesShares = newYes;
+		asset.noShares = newNo;
+		asset.volume = Math.max(0, asset.volume - refund);
+		this.updatePosition(agentId, assetId, outcome, -shares, -refund);
+		return {
+			ok: true,
+			cost: -refund,
+			shares,
+			priceAfter: impliedProbYes(newYes, newNo, b)
+		};
+	}
+	/**
+	* 目标价格买入：把市场价格推到自己的真实估计（激励相容动作）。
+	* 份额 = 使 implied = target 所需；预算封顶（不足时二分收缩）。
+	* @param targetProb 该结果方向的估计概率 ∈ (0.01, 0.99)
+	*/
+	buyToPrice(agentId, assetId, outcome, targetProb, budget) {
+		const asset = this.assets.get(assetId);
+		if (!asset) return {
+			ok: false,
+			error: "unknown-asset"
+		};
+		if (asset.status !== "open") return {
+			ok: false,
+			error: "not-open"
+		};
+		if (!(targetProb > .01 && targetProb < .99)) return {
+			ok: false,
+			error: "invalid-target"
+		};
+		if (!(budget > 0)) return {
+			ok: false,
+			error: "non-positive-budget"
+		};
+		const b = asset.liquidityB;
+		const targetYes = outcome === "YES" ? targetProb : 1 - targetProb;
+		const logit = Math.log(targetYes / (1 - targetYes));
+		let shares;
+		if (outcome === "YES") shares = asset.noShares + b * logit - asset.yesShares;
+		else shares = asset.yesShares + b * Math.log((1 - targetYes) / targetYes) - asset.noShares;
+		if (shares <= 1e-9) return {
+			ok: false,
+			error: "no-impact-needed"
+		};
+		const costOf = (s) => {
+			return cost(asset.yesShares + (outcome === "YES" ? s : 0), asset.noShares + (outcome === "NO" ? s : 0), b) - cost(asset.yesShares, asset.noShares, b);
+		};
+		let actual = shares;
+		if (costOf(shares) > budget) {
+			let lo = 0;
+			let hi = shares;
+			for (let i = 0; i < 40; i += 1) {
+				const mid = (lo + hi) / 2;
+				if (costOf(mid) <= budget) lo = mid;
+				else hi = mid;
+			}
+			actual = lo;
+			if (actual < 1e-6) return {
+				ok: false,
+				error: "budget-too-small"
+			};
+		}
+		return this.buyShares(agentId, assetId, outcome, actual);
+	}
+	/**
+	* 结算：realized > threshold → YES 兑付。
+	* 每份命中份额支付 1 能量（scoring 结算）；池缺口国库有界补贴，盈余扫回。
+	*
+	* 浮点鲁棒性：补贴额加 1e-6 余量对冲 ulp 舍入差（「缺口恰好补齐」在
+	* 浮点回加后仍可能差 1e-7，导致赔付/清扫转账静默失败、赢家拿不到钱）；
+	* 赔付与清扫均钳制到池实际余额——共享池 + 舍入路径差异下永不透支。
+	*/
+	settle(assetId, realized) {
+		const asset = this.assets.get(assetId);
+		if (!asset || asset.status !== "open") return void 0;
+		const outcome = realized > asset.threshold;
+		const payouts = [];
+		for (const pos of this.positions.values()) {
+			if (pos.assetId !== assetId) continue;
+			const amount = outcome ? pos.yesShares : pos.noShares;
+			if (amount > 1e-9) payouts.push({
+				agentId: pos.agentId,
+				amount
+			});
+		}
+		const totalPayout = payouts.reduce((a, p) => a + p.amount, 0);
+		let subsidy = 0;
+		if (totalPayout > asset.volume + 1e-9) {
+			subsidy = totalPayout - asset.volume + 1e-6;
+			if (!this.ledger.transfer("treasury", "belief-pool", subsidy, "belief-subsidy", assetId).ok) subsidy = 0;
+		}
+		const ownReserve = asset.volume + subsidy;
+		const scale = totalPayout > ownReserve ? Math.max(0, ownReserve / totalPayout) : 1;
+		for (const p of payouts) {
+			p.amount = Math.min(p.amount * scale, this.ledger.balance(BELIEF_POOL));
+			if (p.amount > 1e-9) this.ledger.transfer(BELIEF_POOL, p.agentId, p.amount, "belief-payout", assetId);
+		}
+		const paidNow = payouts.reduce((a, p) => a + p.amount, 0);
+		const sweep = Math.max(0, Math.min(asset.volume + subsidy - paidNow, this.ledger.balance(BELIEF_POOL)));
+		if (sweep > 1e-9) this.ledger.transfer(BELIEF_POOL, TREASURY, sweep, "belief-sweep", assetId);
+		asset.status = "settled";
+		asset.outcome = outcome;
+		asset.realizedValue = realized;
+		return {
+			assetId,
+			outcome,
+			realized,
+			payouts,
+			subsidyFromTreasury: subsidy,
+			sweptToTreasury: sweep
+		};
+	}
+	/** 取消：全额退还净支出（不可结算的悬空信念，如信号永缺失） */
+	cancel(assetId) {
+		const asset = this.assets.get(assetId);
+		if (!asset || asset.status !== "open") return void 0;
+		const refunds = [];
+		const failedRefunds = [];
+		for (const pos of this.positions.values()) {
+			if (pos.assetId !== assetId || pos.netPaid <= 1e-9) continue;
+			if (this.ledger.transfer("belief-pool", pos.agentId, pos.netPaid, "belief-refund", assetId).ok) refunds.push({
+				agentId: pos.agentId,
+				amount: pos.netPaid
+			});
+			else failedRefunds.push({
+				agentId: pos.agentId,
+				requested: pos.netPaid
+			});
+		}
+		asset.status = "cancelled";
+		return failedRefunds.length > 0 ? {
+			assetId,
+			refunds,
+			failedRefunds
+		} : {
+			assetId,
+			refunds
+		};
+	}
+	/** 池余额（审计用；全部结算/取消后应回到 0） */
+	poolBalance() {
+		return this.ledger.balance(BELIEF_POOL);
+	}
+	snapshot() {
+		let settled = 0;
+		let cancelled = 0;
+		let volume = 0;
+		for (const a of this.assets.values()) if (a.status === "settled") settled += 1;
+		else if (a.status === "cancelled") cancelled += 1;
+		else volume += a.volume;
+		return {
+			open: this.assets.size - settled - cancelled,
+			settled,
+			cancelled,
+			volume,
+			poolBalance: this.poolBalance()
+		};
+	}
+	updatePosition(agentId, assetId, outcome, shares, paid) {
+		const key = `${assetId}|${agentId}`;
+		const pos = this.positions.get(key) ?? {
+			agentId,
+			assetId,
+			yesShares: 0,
+			noShares: 0,
+			netPaid: 0
+		};
+		if (outcome === "YES") pos.yesShares = Math.max(0, pos.yesShares + shares);
+		else pos.noShares = Math.max(0, pos.noShares + shares);
+		pos.netPaid = Math.max(0, pos.netPaid + paid);
+		this.positions.set(key, pos);
+	}
+	toView(a) {
+		return {
+			assetId: a.id,
+			claim: a.claim,
+			subject: a.subject,
+			threshold: a.threshold,
+			settleAtTick: a.settleAtTick,
+			impliedProbYes: a.status === "open" ? impliedProbYes(a.yesShares, a.noShares, a.liquidityB) : a.outcome ? 1 : 0,
+			yesShares: a.yesShares,
+			noShares: a.noShares,
+			volume: a.volume,
+			status: a.status
+		};
+	}
+};
+//#endregion
+//#region src/symbiosis/observability.ts
+/** 内部账户显示名 */
+const INTERNAL_LABELS = {
+	treasury: "央行国库",
+	burn: "燃烧池",
+	escrow: "行动托管",
+	"belief-pool": "信念资金池",
+	"(mint)": "铸币源"
+};
+/** 渠道元数据：标签 + 分组（着色） */
+const CHANNEL_META = {
+	"opening-grant": {
+		label: "开业注资",
+		group: "distribution"
+	},
+	relief: {
+		label: "休眠救济",
+		group: "distribution"
+	},
+	"task-dividend": {
+		label: "任务分红铸币",
+		group: "mint"
+	},
+	"listing-fee": {
+		label: "知识上架费",
+		group: "market"
+	},
+	"market-trade": {
+		label: "知识成交",
+		group: "market"
+	},
+	royalty: {
+		label: "知识版税",
+		group: "market"
+	},
+	"belief-buy": {
+		label: "信念下注",
+		group: "belief"
+	},
+	"belief-sell": {
+		label: "信念卖出",
+		group: "belief"
+	},
+	"belief-subsidy": {
+		label: "结算补贴",
+		group: "belief"
+	},
+	"belief-payout": {
+		label: "信念赔付",
+		group: "belief"
+	},
+	"belief-sweep": {
+		label: "盈余清扫",
+		group: "belief"
+	},
+	"belief-refund": {
+		label: "信念退款",
+		group: "belief"
+	},
+	"action-escrow": {
+		label: "行动预扣",
+		group: "action"
+	},
+	"action-cost": {
+		label: "成本燃烧",
+		group: "action"
+	},
+	"action-refund": {
+		label: "失败退还",
+		group: "action"
+	}
+};
+const CHANNEL_GROUPS = [
+	{
+		group: "distribution",
+		label: "能量分发",
+		color: "#8b5cf6"
+	},
+	{
+		group: "mint",
+		label: "价值铸币",
+		color: "#10b981"
+	},
+	{
+		group: "market",
+		label: "知识市场",
+		color: "#3b82f6"
+	},
+	{
+		group: "belief",
+		label: "信念市场",
+		color: "#f59e0b"
+	},
+	{
+		group: "action",
+		label: "行动经济",
+		color: "#ef4444"
+	},
+	{
+		group: "other",
+		label: "其他",
+		color: "#94a3b8"
+	}
+];
+/** 分层：铸币源 0 / 国库 1 / 智能体 2 / 池 3 / 燃烧池 4 */
+function layerOf(accountId) {
+	if (accountId === "(mint)") return 0;
+	if (accountId === "treasury") return 1;
+	if (accountId === "burn") return 4;
+	if (accountId === ESCROW_ID || accountId === "belief-pool") return 3;
+	return 2;
+}
+const ESCROW_ID = "escrow";
+/** 账户显示名（内部账户中文名 / 智能体带 kind 标注） */
+function labelOf(accountId, agents) {
+	const internal = INTERNAL_LABELS[accountId];
+	if (internal) return internal;
+	const meta = agents.get(accountId);
+	if (meta?.label) return meta.label;
+	if (meta?.kind) return `${accountId}（${meta.kind}）`;
+	return accountId;
+}
+/**
+* 构建能量 Sankey 数据模型。
+* @param ledger 只读账本（audit 拷贝聚合）
+* @param opts.agents 智能体元信息（kind/label 标注）
+* @param opts.sinceSeq 只聚合 seq > sinceSeq 的凭证（增量窗口；缺省全量）
+*/
+function buildEnergySankey(ledger, opts = {}) {
+	const agentMap = new Map((opts.agents ?? []).map((a) => [a.id, a]));
+	const stats = ledger.stats();
+	const journal = ledger.audit(stats.transfers).filter((t) => opts.sinceSeq === void 0 ? true : t.seq > opts.sinceSeq);
+	const linkAgg = /* @__PURE__ */ new Map();
+	for (const t of journal) {
+		const key = `${t.from}|${t.to}|${t.reason}`;
+		const cur = linkAgg.get(key) ?? {
+			source: t.from,
+			target: t.to,
+			channel: t.reason,
+			amount: 0,
+			count: 0
+		};
+		cur.amount += t.amount;
+		cur.count += 1;
+		linkAgg.set(key, cur);
+	}
+	const links = [...linkAgg.values()].map((l) => {
+		const meta = CHANNEL_META[l.channel];
+		return {
+			source: l.source,
+			target: l.target,
+			channel: l.channel,
+			channelLabel: meta?.label ?? l.channel,
+			group: meta?.group ?? "other",
+			amount: l.amount,
+			count: l.count
+		};
+	});
+	const accountIds = /* @__PURE__ */ new Set([
+		"treasury",
+		"burn",
+		"escrow",
+		BELIEF_POOL
+	]);
+	for (const l of links) {
+		accountIds.add(l.source);
+		accountIds.add(l.target);
+	}
+	const nodes = [...accountIds].map((id) => {
+		let inflow = 0;
+		let outflow = 0;
+		for (const l of links) {
+			if (l.target === id) inflow += l.amount;
+			if (l.source === id) outflow += l.amount;
+		}
+		return {
+			id,
+			label: labelOf(id, agentMap),
+			layer: layerOf(id),
+			kind: id === "(mint)" ? "source" : agentMap.get(id)?.kind ?? (INTERNAL_LABELS[id] ? "internal" : "agent"),
+			balance: id === "(mint)" ? stats.minted : ledger.balance(id),
+			inflow,
+			outflow
+		};
+	});
+	nodes.sort((a, b) => a.layer - b.layer || b.inflow + b.outflow - (a.inflow + a.outflow));
+	const channelAgg = /* @__PURE__ */ new Map();
+	for (const l of links) {
+		const cur = channelAgg.get(l.channel) ?? {
+			channel: l.channel,
+			label: l.channelLabel,
+			group: l.group,
+			amount: 0,
+			count: 0
+		};
+		cur.amount += l.amount;
+		cur.count += l.count;
+		channelAgg.set(l.channel, cur);
+	}
+	const channels = [...channelAgg.values()].sort((a, b) => b.amount - a.amount);
+	return {
+		generatedAt: Date.now(),
+		seqRange: journal.length > 0 ? {
+			from: journal[0].seq,
+			to: journal[journal.length - 1].seq
+		} : null,
+		nodes,
+		links,
+		channels,
+		totals: {
+			transfers: journal.length,
+			minted: stats.minted,
+			burned: stats.burned,
+			totalSupply: stats.totalSupply,
+			circulatingSupply: stats.circulatingSupply,
+			gini: stats.gini,
+			conservation: ledger.verifyConservation(),
+			chainIntact: ledger.verifyChain()
+		}
+	};
+}
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const fmt = (n) => Math.abs(n) >= 1e3 ? n.toFixed(0) : n.toFixed(1);
+/** 分层 Sankey 布局（手写 SVG：缎带宽度 ∝ 金额；回流链接下弯绕行） */
+function renderSvg(report) {
+	const W = 1280;
+	const H = 620;
+	const padX = 60;
+	const padY = 60;
+	const barW = 16;
+	const layers = [
+		0,
+		1,
+		2,
+		3,
+		4
+	];
+	const colorOf = new Map(CHANNEL_GROUPS.map((g) => [g.group, g.color]));
+	const layerNodes = /* @__PURE__ */ new Map();
+	for (const n of report.nodes) {
+		const arr = layerNodes.get(n.layer) ?? [];
+		arr.push(n);
+		layerNodes.set(n.layer, arr);
+	}
+	Math.max(1, ...report.nodes.map((n) => Math.max(n.inflow, n.outflow)));
+	const positions = /* @__PURE__ */ new Map();
+	for (const layer of layers) {
+		const ns = (layerNodes.get(layer) ?? []).slice().sort((a, b) => b.inflow + b.outflow - (a.inflow + a.outflow));
+		if (ns.length === 0) continue;
+		const slotH = 500 / ns.length;
+		const maxPerNode = Math.max(...ns.map((n) => Math.max(n.inflow, n.outflow)));
+		ns.forEach((n, i) => {
+			const h = Math.max(14, Math.max(n.inflow, n.outflow) / maxPerNode * Math.min(200, slotH * .62));
+			const x = padX + layer / (layers.length - 1) * 1144;
+			const y = padY + i * slotH + (slotH - h) / 2;
+			positions.set(n.id, {
+				x,
+				y,
+				h
+			});
+		});
+	}
+	const maxAmount = Math.max(1e-9, ...report.links.map((l) => l.amount));
+	return `
+  <svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="能量 Sankey 图">
+    <g>
+    ${report.links.slice().sort((a, b) => b.amount - a.amount).map((l) => {
+		const s = positions.get(l.source);
+		const t = positions.get(l.target);
+		if (!s || !t) return "";
+		const w = Math.max(1.5, l.amount / maxAmount * 34);
+		const x0 = s.x + barW;
+		const y0 = s.y + s.h / 2;
+		const x1 = t.x;
+		const y1 = t.y + t.h / 2;
+		const backward = t.x <= x0;
+		const dip = backward ? Math.max(y0, y1) + 90 + w * 2 : 0;
+		const c1x = (x0 + x1) / 2;
+		const d = backward ? `M ${x0} ${y0} C ${c1x} ${dip}, ${c1x} ${dip}, ${x1} ${y1}` : `M ${x0} ${y0} C ${c1x} ${y0}, ${c1x} ${y1}, ${x1} ${y1}`;
+		const color = colorOf.get(l.group) ?? "#94a3b8";
+		const tip = `${l.source} → ${l.target}｜${l.channelLabel}：${fmt(l.amount)} 能量（${l.count} 笔）`;
+		return `<path d="${d}" fill="none" stroke="${color}" stroke-width="${w.toFixed(1)}" stroke-opacity="0.38"><title>${esc(tip)}</title></path>`;
+	}).join("\n    ")}
+    </g>
+    <g>
+    ${report.nodes.map((n) => {
+		const p = positions.get(n.id);
+		if (!p) return "";
+		const tip = `${n.label}（${n.id}）｜余额 ${fmt(n.balance)}｜流入 ${fmt(n.inflow)} / 流出 ${fmt(n.outflow)}`;
+		const labelRight = n.layer <= 2;
+		const tx = labelRight ? p.x + barW + 6 : p.x - 6;
+		return `<rect x="${p.x.toFixed(1)}" y="${p.y.toFixed(1)}" width="${barW}" height="${p.h.toFixed(1)}" rx="3" fill="#1e293b"><title>${esc(tip)}</title></rect>
+      <text x="${tx.toFixed(1)}" y="${(p.y + p.h / 2 - 2).toFixed(1)}" text-anchor="${labelRight ? "start" : "end"}" font-size="12" fill="#334155" font-weight="600">${esc(n.label)}</text>
+      <text x="${tx.toFixed(1)}" y="${(p.y + p.h / 2 + 12).toFixed(1)}" text-anchor="${labelRight ? "start" : "end"}" font-size="10.5" fill="#94a3b8">余 ${fmt(n.balance)}｜流 ${fmt(n.inflow)}/${fmt(n.outflow)}</text>`;
+	}).join("\n    ")}
+    </g>
+  </svg>
+  <div class="legend">${CHANNEL_GROUPS.map((g) => `<span class="lg"><i style="background:${g.color}"></i>${esc(g.label)}</span>`).join("")}</div>`.trim();
+}
+/** 渠道明细表 */
+function renderChannelTable(report) {
+	return `<table><thead><tr><th>渠道</th><th>reason</th><th>能量</th><th>笔数</th></tr></thead><tbody>${report.channels.map((c) => `<tr><td>${esc(c.label)}</td><td><code>${esc(c.channel)}</code></td><td class="num">${fmt(c.amount)}</td><td class="num">${c.count}</td></tr>`).join("")}</tbody></table>`;
+}
+/** 账户余额表 */
+function renderBalanceTable(report) {
+	return `<table><thead><tr><th>账户</th><th>id</th><th>余额</th><th>流入</th><th>流出</th></tr></thead><tbody>${report.nodes.slice().sort((a, b) => b.balance - a.balance).map((n) => `<tr><td>${esc(n.label)}</td><td><code>${esc(n.id)}</code></td><td class="num">${fmt(n.balance)}</td><td class="num">${fmt(n.inflow)}</td><td class="num">${fmt(n.outflow)}</td></tr>`).join("")}</tbody></table>`;
+}
+/**
+* 渲染自包含 HTML 报告（零外部依赖，离线可开）。
+* @param report buildEnergySankey 产物
+* @param opts.title 报告标题（缺省「认知生态能量流 Sankey」）
+*/
+function renderSankeyHtml(report, opts = {}) {
+	const t = report.totals;
+	const windowText = report.seqRange ? `凭证 #${report.seqRange.from}–#${report.seqRange.to}` : "窗口内无流转";
+	const health = `<span class="badge ${t.conservation ? "ok" : "bad"}">守恒 ${t.conservation ? "✓" : "✗"}</span>
+    <span class="badge ${t.chainIntact ? "ok" : "bad"}">链哈希 ${t.chainIntact ? "✓" : "✗"}</span>`;
+	return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(opts.title ?? "认知生态能量流 Sankey")}</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 28px 20px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .meta { color: #64748b; font-size: 12.5px; margin-bottom: 14px; }
+  .kpis { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+  .kpi { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 14px; min-width: 118px; }
+  .kpi b { display: block; font-size: 17px; margin-top: 2px; }
+  .kpi span { font-size: 11.5px; color: #64748b; }
+  .badge { font-size: 11.5px; border-radius: 999px; padding: 3px 10px; border: 1px solid #e2e8f0; background: #fff; }
+  .badge.ok { color: #047857; border-color: #a7f3d0; }
+  .badge.bad { color: #b91c1c; border-color: #fecaca; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-top: 18px; overflow-x: auto; }
+  svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 10px 4px 0; font-size: 12px; color: #475569; }
+  .lg i { display: inline-block; width: 18px; height: 5px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #f1f5f9; }
+  th { color: #64748b; font-weight: 600; font-size: 12px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  code { background: #f1f5f9; border-radius: 4px; padding: 1px 5px; font-size: 11.5px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 980px) { .grid2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>${esc(opts.title ?? "认知生态能量流 Sankey")}</h1>
+  <div class="meta">生成于 ${new Date(report.generatedAt).toISOString()}｜${esc(windowText)}｜${report.totals.transfers} 笔流转聚合</div>
+  <div class="kpis">
+    <div class="kpi"><span>总供给</span><b>${fmt(t.totalSupply)}</b></div>
+    <div class="kpi"><span>流通量</span><b>${fmt(t.circulatingSupply)}</b></div>
+    <div class="kpi"><span>累计铸币</span><b>${fmt(t.minted)}</b></div>
+    <div class="kpi"><span>累计燃烧</span><b>${fmt(t.burned)}</b></div>
+    <div class="kpi"><span>基尼系数</span><b>${t.gini.toFixed(3)}</b></div>
+    <div class="kpi"><span>健康</span><b>${health}</b></div>
+  </div>
+  <div class="card">${renderSvg(report)}</div>
+  <div class="grid2">
+    <div class="card"><h2 style="font-size:15px;margin:0 0 10px">渠道明细</h2>${renderChannelTable(report)}</div>
+    <div class="card"><h2 style="font-size:15px;margin:0 0 10px">账户余额</h2>${renderBalanceTable(report)}</div>
+  </div>
+</div>
+</body>
+</html>`;
 }
 //#endregion
 //#region src/curiosity-engine.ts
@@ -18523,6 +21825,19 @@ var SafetyGovernor = class {
 		};
 		return { allowed: true };
 	}
+	/**
+	* 22.0：预算剩余快照（只读——不消耗限流配额、不记审计、不推进任何状态）。
+	* 供预算路由内核（Bandits with Knapsacks）在每次模型选型时读取剩余资源；
+	* tokenBudget 与 costBudget 均为 0（不限预算）时返回 undefined
+	* （无预算约束即无路由依据，调度器据此走原路径）。
+	*/
+	budgetSnapshot() {
+		if (this.config.tokenBudget <= 0 && this.config.costBudget <= 0) return void 0;
+		return {
+			tokensRemaining: Math.max(0, this.config.tokenBudget - this.totalTokensUsed),
+			costRemaining: Math.max(0, this.config.costBudget - this.totalCost)
+		};
+	}
 	/** 启用 Kill Switch */
 	engageKillSwitch() {
 		this.killSwitchEngaged = true;
@@ -18796,637 +22111,6 @@ function tierOf(view) {
 	if (view.effectiveSamples >= TIER_ELITE_MIN_SAMPLES && view.wilsonLower >= TIER_ELITE_MIN_WILSON) return "elite";
 	return "established";
 }
-//#endregion
-//#region src/symbiosis/ledger.ts
-/**
-* ledger.ts — 认知能量账本（共生进化架构第五阶段 1/4）
-*
-* 质变设计（相对"agent.energy 公开字段"草案的三重升级）：
-*
-* 1. 能量不可伪造：智能体没有 energy 字段，能量只存在于账本账户中，
-*    只能经 transfer/mint/burn 流转；每笔流转双方平衡（复式记账），
-*    全局守恒律恒成立：Σ(所有账户余额) === initialSupply + minted。
-*
-* 2. 链式哈希审计：每笔转账携带 sha256 链哈希（前序哈希 + 本笔内容），
-*    任何对历史凭证的篡改都会导致 verifyChain() 失败——能量流向可审计、
-*    可回放、不可抵赖。这是"玩具模拟"与"经济系统"的分水岭。
-*
-* 3. 生态健康可观测：giniCoefficient() 度量能量分布集中度——
-*    能量过度集中 = 垄断 = 认知生态死亡信号（单一智能体买断全部资源，
-*    多样性消失，进化停滞）。监管层可据此调节铸币与救济策略。
-*
-* 账户语义：
-* - treasury：央行国库（初始供给 + 任务成功铸币收入池），仅 runtime 持有账本引用
-* - burn（INCINERATOR）：燃烧池，burn 的能量退出流通但保留审计痕迹
-* - escrow：行动预扣托管（提案批准 → 预扣；执行完毕 → 燃烧/退还）
-*
-* 权限模型（Phase 1）：EnergyLedger 实例仅由 SymbiosisRuntime / CognitiveMarket
-* 持有；智能体只拿到只读快照（Perception.ownBalance），无法绕过市场直接转账。
-*/
-/** 央行国库：初始供给与铸币收入池 */
-const TREASURY = "treasury";
-/** 燃烧池：burn 的能量退出流通（余额保留供审计） */
-const INCINERATOR = "burn";
-/** 行动预扣托管账户 */
-const ESCROW = "escrow";
-const GENESIS_HASH = "0".repeat(64);
-var EnergyLedger = class {
-	balances = /* @__PURE__ */ new Map();
-	frozen = /* @__PURE__ */ new Set();
-	journal = [];
-	chainHead = GENESIS_HASH;
-	/** 链锚点：被裁剪的最后一条凭证哈希（verifyChain 由此起验） */
-	chainAnchor = GENESIS_HASH;
-	seqCounter = 0;
-	mintedTotal = 0;
-	initialSupply;
-	journalLimit;
-	constructor(config = {}) {
-		this.initialSupply = Math.max(0, config.initialSupply ?? 1e4);
-		this.journalLimit = Math.max(10, config.journalLimit ?? 2e3);
-		this.balances.set(TREASURY, this.initialSupply);
-		this.balances.set(INCINERATOR, 0);
-		this.balances.set(ESCROW, 0);
-	}
-	/** 开户（零余额；初始注资由调用方经 treasury transfer 完成） */
-	openAccount(id) {
-		if (this.balances.has(id)) return false;
-		this.balances.set(id, 0);
-		return true;
-	}
-	hasAccount(id) {
-		return this.balances.has(id);
-	}
-	balance(id) {
-		return this.balances.get(id) ?? 0;
-	}
-	isFrozen(id) {
-		return this.frozen.has(id);
-	}
-	freeze(id) {
-		if (this.balances.has(id)) this.frozen.add(id);
-	}
-	unfreeze(id) {
-		this.frozen.delete(id);
-	}
-	/** 原子转账：余额不足/冻结/非法金额全部拒绝，拒绝时状态零变更 */
-	transfer(from, to, amount, reason, refId) {
-		if (!(amount > 0) || !Number.isFinite(amount)) return {
-			ok: false,
-			error: "non-positive-amount"
-		};
-		if (from === to) return {
-			ok: false,
-			error: "self-transfer"
-		};
-		if (!this.balances.has(from) || !this.balances.has(to)) return {
-			ok: false,
-			error: "unknown-account"
-		};
-		if (this.frozen.has(from)) return {
-			ok: false,
-			error: "frozen-account"
-		};
-		if ((this.balances.get(from) ?? 0) < amount) return {
-			ok: false,
-			error: "insufficient-funds"
-		};
-		this.balances.set(from, (this.balances.get(from) ?? 0) - amount);
-		this.balances.set(to, (this.balances.get(to) ?? 0) + amount);
-		return {
-			ok: true,
-			transfer: this.appendEntry(from, to, amount, reason, refId)
-		};
-	}
-	/** 央行铸币：向 to 增发能量（对应真实价值注入：任务成功/知识生效）。
-	*  仅 runtime 持有账本引用时调用；破坏守恒律的唯一入口且被显式记账。 */
-	mint(to, amount, reason, refId) {
-		if (!(amount > 0) || !Number.isFinite(amount)) return {
-			ok: false,
-			error: "non-positive-amount"
-		};
-		if (!this.balances.has(to)) return {
-			ok: false,
-			error: "unknown-account"
-		};
-		this.balances.set(to, (this.balances.get(to) ?? 0) + amount);
-		this.mintedTotal += amount;
-		return {
-			ok: true,
-			transfer: this.appendEntry("(mint)", to, amount, reason, refId)
-		};
-	}
-	/** 燃烧：能量转入燃烧池退出流通（余额保留供审计与守恒校验） */
-	burn(from, amount, reason, refId) {
-		return this.transfer(from, INCINERATOR, amount, reason, refId);
-	}
-	/** 已燃烧总量 */
-	burned() {
-		return this.balance(INCINERATOR);
-	}
-	/** 央行铸币总量 */
-	minted() {
-		return this.mintedTotal;
-	}
-	/** 守恒总供给 = initialSupply + minted */
-	totalSupply() {
-		return this.initialSupply + this.mintedTotal;
-	}
-	/** 流通供给 = 总供给 - 燃烧池余额 - 托管余额 */
-	circulatingSupply() {
-		return this.totalSupply() - this.balance(INCINERATOR) - this.balance(ESCROW);
-	}
-	/**
-	* 基尼系数（0 完全平等 → 1 完全垄断）。
-	* 默认只统计智能体账户（排除 treasury/burn/escrow 内部账户）——
-	* 内部账户是基础设施而非生态成员，计入会稀释真实集中度信号。
-	* 零余额账户**保留**在统计内：这是基尼系数的标准口径（零收入人口
-	* 计入分母）——饿死归零 / 尚未入场的智能体都是生态成员，「很多
-	* 零余额者」本身就是分布的事实而非统计噪声，剔除会系统性低估
-	* 集中度（[100,0] 标准值 0.5，剔除后虚降为 0）
-	*/
-	giniCoefficient(includeInternal = false) {
-		const INTERNAL = /* @__PURE__ */ new Set([
-			TREASURY,
-			INCINERATOR,
-			ESCROW
-		]);
-		const values = [];
-		for (const [id, bal] of this.balances) {
-			if (!includeInternal && INTERNAL.has(id)) continue;
-			values.push(bal);
-		}
-		const n = values.length;
-		if (n === 0) return 0;
-		const total = values.reduce((a, b) => a + b, 0);
-		if (total <= 0) return 0;
-		const sorted = [...values].sort((a, b) => a - b);
-		let weightedSum = 0;
-		for (let i = 0; i < n; i++) weightedSum += (i + 1) * sorted[i];
-		return Math.max(0, 2 * weightedSum / (n * total) - (n + 1) / n);
-	}
-	/** 最近 limit 条凭证（拷贝，外部修改不影响账本） */
-	audit(limit = 50) {
-		return this.journal.slice(-limit).map((t) => ({ ...t }));
-	}
-	/** 守恒律校验：Σ(所有账户余额) === initialSupply + minted */
-	verifyConservation() {
-		let sum = 0;
-		for (const bal of this.balances.values()) sum += bal;
-		return Math.abs(sum - this.totalSupply()) < 1e-9;
-	}
-	/** 链完整性校验：重算全链哈希，任何历史篡改即刻暴露 */
-	verifyChain() {
-		let prev = this.chainAnchor;
-		for (const entry of this.journal) {
-			if (hashEntry(prev, entry) !== entry.hash) return false;
-			prev = entry.hash;
-		}
-		return true;
-	}
-	stats() {
-		return {
-			totalSupply: this.totalSupply(),
-			circulatingSupply: this.circulatingSupply(),
-			minted: this.mintedTotal,
-			burned: this.balance(INCINERATOR),
-			transfers: this.journal.length,
-			accounts: this.balances.size,
-			frozenAccounts: this.frozen.size,
-			gini: this.giniCoefficient(),
-			chainHead: this.chainHead,
-			chainIntact: this.verifyChain()
-		};
-	}
-	/** 导出快照（持久化 / 测试篡改注入用） */
-	snapshotState() {
-		return {
-			balances: [...this.balances.entries()],
-			frozen: [...this.frozen],
-			journal: this.journal.map((t) => ({ ...t })),
-			seqCounter: this.seqCounter,
-			minted: this.mintedTotal,
-			initialSupply: this.initialSupply,
-			chainAnchor: this.chainAnchor
-		};
-	}
-	/** 导入快照（原子整体替换） */
-	restoreState(snap) {
-		this.balances = new Map(snap.balances);
-		this.frozen = new Set(snap.frozen);
-		this.journal = snap.journal.map((t) => ({ ...t }));
-		this.seqCounter = snap.seqCounter;
-		this.mintedTotal = snap.minted;
-		this.chainAnchor = snap.chainAnchor ?? GENESIS_HASH;
-		this.chainHead = this.journal.length > 0 ? this.journal[this.journal.length - 1].hash : GENESIS_HASH;
-	}
-	appendEntry(from, to, amount, reason, refId) {
-		const entry = {
-			seq: ++this.seqCounter,
-			from,
-			to,
-			amount,
-			reason,
-			refId,
-			timestamp: Date.now(),
-			hash: ""
-		};
-		entry.hash = hashEntry(this.chainHead, entry);
-		this.chainHead = entry.hash;
-		this.journal.push(entry);
-		if (this.journal.length > this.journalLimit) {
-			const overflow = this.journal.length - this.journalLimit;
-			this.chainAnchor = this.journal[overflow - 1].hash;
-			this.journal.splice(0, overflow);
-		}
-		return entry;
-	}
-};
-function hashEntry(prevHash, entry) {
-	return createHash("sha256").update(`${prevHash}|${entry.seq}|${entry.from}|${entry.to}|${entry.amount}|${entry.reason}|${entry.refId ?? ""}|${entry.timestamp}`).digest("hex");
-}
-//#endregion
-//#region src/symbiosis/belief.ts
-/**
-* belief.ts — 信念市场（共生进化架构 Phase 2：市场即心智）
-*
-* 质变定位：Phase 1 让知识有了价格；本层让**信念**有了价格。
-*
-* 系统里所有"对未来的判断"（模型成功率、策略增益、知识有效性）原本是
-* 被动统计量——不可问责、不可聚合、不可对赌。本层把它们变成可交易的
-* 二元信念资产：
-*
-* - **LMSR 做市商**（对数市场评分规则，Hanson 2003）：
-*   成本函数 C(q) = b·ln(e^{q1/b} + e^{q2/b})，价格 = sigmoid((q1−q2)/b)。
-*   无需对手方即可成交；国库提供有界流动性补贴（最坏损失 b·ln2）；
-*   成本函数路径无关 → 买卖往返净成本恒为 0（无摩擦）。
-*
-* - **信息聚合**：持有私有信息的智能体（记忆层知道历史、进化器知道沙盒
-*   LCB）下注 → 价格移动到其估计 → 信息劣势者被套利。错的信念自动
-*   亏钱给对的信念——信念进化有了牙齿。
-*
-* - **结算即审计**：到期按实现结果结算（realized > threshold = YES），
-*   每份 YES/NO 份额支付 1 能量；赢家从流动性池领取，亏家血本无归。
-*
-* - **激励相容**：LMSR 本质是 proper scoring rule 的市场化——
-*   把价格推到自己真实估计是最优策略（谎报即送钱给套利者）。
-*
-* 能量流：买单成本 → belief-pool（流动性池）→ 结算赔付；
-* 池 shortfall 由国库有界补贴，盈余扫回国库。全程复式记账、守恒可审计。
-* 信念市场允许分数能量（连续价格机制的数学需要；账本不限制粒度）。
-*/
-/** 信念流动性池账户（收集买单成本、支付结算赔付） */
-const BELIEF_POOL = "belief-pool";
-function logSumExp(a, b) {
-	const m = Math.max(a, b);
-	return m + Math.log(Math.exp(a - m) + Math.exp(b - m));
-}
-/** 做市商成本函数 C(q1,q2) = b·ln(e^{q1/b} + e^{q2/b}) */
-function cost(q1, q2, b) {
-	return b * logSumExp(q1 / b, q2 / b);
-}
-function sigmoid(x) {
-	return x >= 0 ? 1 / (1 + Math.exp(-x)) : Math.exp(x) / (1 + Math.exp(x));
-}
-/** 隐含 YES 概率 = sigmoid((q1−q2)/b) */
-function impliedProbYes(q1, q2, b) {
-	return sigmoid((q1 - q2) / b);
-}
-let beliefCounter = 0;
-/**
-* 信念市场：LMSR 做市的二元断言交易场所。
-*
-* 权限模型：仅 SymbiosisRuntime 持有实例；智能体经感知视图（BeliefView）
-* 只读价格，经 bet-belief 提案由运行时代为成交。
-*/
-var BeliefMarket = class {
-	ledger;
-	assets = /* @__PURE__ */ new Map();
-	positions = /* @__PURE__ */ new Map();
-	defaultB;
-	constructor(ledger, config = {}) {
-		this.ledger = ledger;
-		this.defaultB = Math.max(.5, config.defaultB ?? 10);
-		if (!ledger.hasAccount("belief-pool")) ledger.openAccount(BELIEF_POOL);
-	}
-	/** 上市新信念（创建即开放交易；国库隐性承担做市补贴义务） */
-	create(input) {
-		if (!input.subject) return {
-			ok: false,
-			error: "missing-subject"
-		};
-		if (!Number.isFinite(input.threshold)) return {
-			ok: false,
-			error: "invalid-threshold"
-		};
-		if (!(input.settleAtTick > 0)) return {
-			ok: false,
-			error: "invalid-settle-tick"
-		};
-		beliefCounter += 1;
-		const asset = {
-			id: `belief-${beliefCounter}`,
-			claim: input.claim,
-			subject: input.subject,
-			threshold: input.threshold,
-			settleAtTick: input.settleAtTick,
-			creator: input.creator,
-			liquidityB: Math.max(.5, input.liquidityB ?? this.defaultB),
-			yesShares: 0,
-			noShares: 0,
-			status: "open",
-			volume: 0,
-			createdAt: Date.now()
-		};
-		this.assets.set(asset.id, asset);
-		return {
-			ok: true,
-			assetId: asset.id
-		};
-	}
-	/** 隐含 YES 概率（当前价格） */
-	price(assetId) {
-		const a = this.assets.get(assetId);
-		return a && a.status === "open" ? impliedProbYes(a.yesShares, a.noShares, a.liquidityB) : void 0;
-	}
-	view(assetId) {
-		const a = this.assets.get(assetId);
-		return a ? this.toView(a) : void 0;
-	}
-	views() {
-		return [...this.assets.values()].map((a) => this.toView(a));
-	}
-	/** 持仓查询（审计/测试用，拷贝） */
-	positionOf(agentId, assetId) {
-		const p = this.positions.get(`${assetId}|${agentId}`);
-		return p ? { ...p } : void 0;
-	}
-	/**
-	* 精确份额买入：成本 = C(q+Δ) − C(q)（LMSR 定价）。
-	* 能量 agent → belief-pool。
-	*/
-	buyShares(agentId, assetId, outcome, shares) {
-		const asset = this.assets.get(assetId);
-		if (!asset) return {
-			ok: false,
-			error: "unknown-asset"
-		};
-		if (asset.status !== "open") return {
-			ok: false,
-			error: "not-open"
-		};
-		if (!(shares > 0) || !Number.isFinite(shares)) return {
-			ok: false,
-			error: "non-positive-shares"
-		};
-		const b = asset.liquidityB;
-		const newYes = asset.yesShares + (outcome === "YES" ? shares : 0);
-		const newNo = asset.noShares + (outcome === "NO" ? shares : 0);
-		const price = cost(newYes, newNo, b) - cost(asset.yesShares, asset.noShares, b);
-		if (!(price > 0)) return {
-			ok: false,
-			error: "non-positive-cost"
-		};
-		if (this.ledger.balance(agentId) < price) return {
-			ok: false,
-			error: "insufficient-funds"
-		};
-		const receipt = this.ledger.transfer(agentId, BELIEF_POOL, price, "belief-buy", assetId);
-		if (!receipt.ok) return {
-			ok: false,
-			error: receipt.error
-		};
-		asset.yesShares = newYes;
-		asset.noShares = newNo;
-		asset.volume += price;
-		this.updatePosition(agentId, assetId, outcome, shares, price);
-		return {
-			ok: true,
-			cost: price,
-			shares,
-			priceAfter: impliedProbYes(newYes, newNo, b)
-		};
-	}
-	/**
-	* 卖回做市商（结算前平仓）：退款 = C(q) − C(q−Δ)。
-	* LMSR 成本函数路径无关 → 买卖往返净成本恒为 0（零摩擦）。
-	*/
-	sellShares(agentId, assetId, outcome, shares) {
-		const asset = this.assets.get(assetId);
-		if (!asset) return {
-			ok: false,
-			error: "unknown-asset"
-		};
-		if (asset.status !== "open") return {
-			ok: false,
-			error: "not-open"
-		};
-		const pos = this.positions.get(`${assetId}|${agentId}`);
-		const held = outcome === "YES" ? pos?.yesShares ?? 0 : pos?.noShares ?? 0;
-		if (!(shares > 0) || shares > held + 1e-9) return {
-			ok: false,
-			error: "insufficient-shares"
-		};
-		const b = asset.liquidityB;
-		const newYes = asset.yesShares - (outcome === "YES" ? shares : 0);
-		const newNo = asset.noShares - (outcome === "NO" ? shares : 0);
-		const refund = cost(asset.yesShares, asset.noShares, b) - cost(newYes, newNo, b);
-		if (!(refund > 0)) return {
-			ok: false,
-			error: "non-positive-refund"
-		};
-		const receipt = this.ledger.transfer(BELIEF_POOL, agentId, refund, "belief-sell", assetId);
-		if (!receipt.ok) return {
-			ok: false,
-			error: receipt.error
-		};
-		asset.yesShares = newYes;
-		asset.noShares = newNo;
-		asset.volume = Math.max(0, asset.volume - refund);
-		this.updatePosition(agentId, assetId, outcome, -shares, -refund);
-		return {
-			ok: true,
-			cost: -refund,
-			shares,
-			priceAfter: impliedProbYes(newYes, newNo, b)
-		};
-	}
-	/**
-	* 目标价格买入：把市场价格推到自己的真实估计（激励相容动作）。
-	* 份额 = 使 implied = target 所需；预算封顶（不足时二分收缩）。
-	* @param targetProb 该结果方向的估计概率 ∈ (0.01, 0.99)
-	*/
-	buyToPrice(agentId, assetId, outcome, targetProb, budget) {
-		const asset = this.assets.get(assetId);
-		if (!asset) return {
-			ok: false,
-			error: "unknown-asset"
-		};
-		if (asset.status !== "open") return {
-			ok: false,
-			error: "not-open"
-		};
-		if (!(targetProb > .01 && targetProb < .99)) return {
-			ok: false,
-			error: "invalid-target"
-		};
-		if (!(budget > 0)) return {
-			ok: false,
-			error: "non-positive-budget"
-		};
-		const b = asset.liquidityB;
-		const targetYes = outcome === "YES" ? targetProb : 1 - targetProb;
-		const logit = Math.log(targetYes / (1 - targetYes));
-		let shares;
-		if (outcome === "YES") shares = asset.noShares + b * logit - asset.yesShares;
-		else shares = asset.yesShares + b * Math.log((1 - targetYes) / targetYes) - asset.noShares;
-		if (shares <= 1e-9) return {
-			ok: false,
-			error: "no-impact-needed"
-		};
-		const costOf = (s) => {
-			return cost(asset.yesShares + (outcome === "YES" ? s : 0), asset.noShares + (outcome === "NO" ? s : 0), b) - cost(asset.yesShares, asset.noShares, b);
-		};
-		let actual = shares;
-		if (costOf(shares) > budget) {
-			let lo = 0;
-			let hi = shares;
-			for (let i = 0; i < 40; i += 1) {
-				const mid = (lo + hi) / 2;
-				if (costOf(mid) <= budget) lo = mid;
-				else hi = mid;
-			}
-			actual = lo;
-			if (actual < 1e-6) return {
-				ok: false,
-				error: "budget-too-small"
-			};
-		}
-		return this.buyShares(agentId, assetId, outcome, actual);
-	}
-	/**
-	* 结算：realized > threshold → YES 兑付。
-	* 每份命中份额支付 1 能量（scoring 结算）；池缺口国库有界补贴，盈余扫回。
-	*
-	* 浮点鲁棒性：补贴额加 1e-6 余量对冲 ulp 舍入差（「缺口恰好补齐」在
-	* 浮点回加后仍可能差 1e-7，导致赔付/清扫转账静默失败、赢家拿不到钱）；
-	* 赔付与清扫均钳制到池实际余额——共享池 + 舍入路径差异下永不透支。
-	*/
-	settle(assetId, realized) {
-		const asset = this.assets.get(assetId);
-		if (!asset || asset.status !== "open") return void 0;
-		const outcome = realized > asset.threshold;
-		const payouts = [];
-		for (const pos of this.positions.values()) {
-			if (pos.assetId !== assetId) continue;
-			const amount = outcome ? pos.yesShares : pos.noShares;
-			if (amount > 1e-9) payouts.push({
-				agentId: pos.agentId,
-				amount
-			});
-		}
-		const totalPayout = payouts.reduce((a, p) => a + p.amount, 0);
-		let subsidy = 0;
-		if (totalPayout > asset.volume + 1e-9) {
-			subsidy = totalPayout - asset.volume + 1e-6;
-			if (!this.ledger.transfer("treasury", "belief-pool", subsidy, "belief-subsidy", assetId).ok) subsidy = 0;
-		}
-		const ownReserve = asset.volume + subsidy;
-		const scale = totalPayout > ownReserve ? Math.max(0, ownReserve / totalPayout) : 1;
-		for (const p of payouts) {
-			p.amount = Math.min(p.amount * scale, this.ledger.balance(BELIEF_POOL));
-			if (p.amount > 1e-9) this.ledger.transfer(BELIEF_POOL, p.agentId, p.amount, "belief-payout", assetId);
-		}
-		const paidNow = payouts.reduce((a, p) => a + p.amount, 0);
-		const sweep = Math.max(0, Math.min(asset.volume + subsidy - paidNow, this.ledger.balance(BELIEF_POOL)));
-		if (sweep > 1e-9) this.ledger.transfer(BELIEF_POOL, TREASURY, sweep, "belief-sweep", assetId);
-		asset.status = "settled";
-		asset.outcome = outcome;
-		asset.realizedValue = realized;
-		return {
-			assetId,
-			outcome,
-			realized,
-			payouts,
-			subsidyFromTreasury: subsidy,
-			sweptToTreasury: sweep
-		};
-	}
-	/** 取消：全额退还净支出（不可结算的悬空信念，如信号永缺失） */
-	cancel(assetId) {
-		const asset = this.assets.get(assetId);
-		if (!asset || asset.status !== "open") return void 0;
-		const refunds = [];
-		const failedRefunds = [];
-		for (const pos of this.positions.values()) {
-			if (pos.assetId !== assetId || pos.netPaid <= 1e-9) continue;
-			if (this.ledger.transfer("belief-pool", pos.agentId, pos.netPaid, "belief-refund", assetId).ok) refunds.push({
-				agentId: pos.agentId,
-				amount: pos.netPaid
-			});
-			else failedRefunds.push({
-				agentId: pos.agentId,
-				requested: pos.netPaid
-			});
-		}
-		asset.status = "cancelled";
-		return failedRefunds.length > 0 ? {
-			assetId,
-			refunds,
-			failedRefunds
-		} : {
-			assetId,
-			refunds
-		};
-	}
-	/** 池余额（审计用；全部结算/取消后应回到 0） */
-	poolBalance() {
-		return this.ledger.balance(BELIEF_POOL);
-	}
-	snapshot() {
-		let settled = 0;
-		let cancelled = 0;
-		let volume = 0;
-		for (const a of this.assets.values()) if (a.status === "settled") settled += 1;
-		else if (a.status === "cancelled") cancelled += 1;
-		else volume += a.volume;
-		return {
-			open: this.assets.size - settled - cancelled,
-			settled,
-			cancelled,
-			volume,
-			poolBalance: this.poolBalance()
-		};
-	}
-	updatePosition(agentId, assetId, outcome, shares, paid) {
-		const key = `${assetId}|${agentId}`;
-		const pos = this.positions.get(key) ?? {
-			agentId,
-			assetId,
-			yesShares: 0,
-			noShares: 0,
-			netPaid: 0
-		};
-		if (outcome === "YES") pos.yesShares = Math.max(0, pos.yesShares + shares);
-		else pos.noShares = Math.max(0, pos.noShares + shares);
-		pos.netPaid = Math.max(0, pos.netPaid + paid);
-		this.positions.set(key, pos);
-	}
-	toView(a) {
-		return {
-			assetId: a.id,
-			claim: a.claim,
-			subject: a.subject,
-			threshold: a.threshold,
-			settleAtTick: a.settleAtTick,
-			impliedProbYes: a.status === "open" ? impliedProbYes(a.yesShares, a.noShares, a.liquidityB) : a.outcome ? 1 : 0,
-			yesShares: a.yesShares,
-			noShares: a.noShares,
-			volume: a.volume,
-			status: a.status
-		};
-	}
-};
 //#endregion
 //#region src/symbiosis/market.ts
 /**
@@ -20511,377 +23195,6 @@ var EvolverAgent = class extends AgentBase {
 /** 从感知快照提取挂单视图（便捷桥接，供自定义智能体复用） */
 function listingsOf(p) {
 	return p ? [...p.listings] : [];
-}
-//#endregion
-//#region src/symbiosis/observability.ts
-/** 内部账户显示名 */
-const INTERNAL_LABELS = {
-	treasury: "央行国库",
-	burn: "燃烧池",
-	escrow: "行动托管",
-	"belief-pool": "信念资金池",
-	"(mint)": "铸币源"
-};
-/** 渠道元数据：标签 + 分组（着色） */
-const CHANNEL_META = {
-	"opening-grant": {
-		label: "开业注资",
-		group: "distribution"
-	},
-	relief: {
-		label: "休眠救济",
-		group: "distribution"
-	},
-	"task-dividend": {
-		label: "任务分红铸币",
-		group: "mint"
-	},
-	"listing-fee": {
-		label: "知识上架费",
-		group: "market"
-	},
-	"market-trade": {
-		label: "知识成交",
-		group: "market"
-	},
-	royalty: {
-		label: "知识版税",
-		group: "market"
-	},
-	"belief-buy": {
-		label: "信念下注",
-		group: "belief"
-	},
-	"belief-sell": {
-		label: "信念卖出",
-		group: "belief"
-	},
-	"belief-subsidy": {
-		label: "结算补贴",
-		group: "belief"
-	},
-	"belief-payout": {
-		label: "信念赔付",
-		group: "belief"
-	},
-	"belief-sweep": {
-		label: "盈余清扫",
-		group: "belief"
-	},
-	"belief-refund": {
-		label: "信念退款",
-		group: "belief"
-	},
-	"action-escrow": {
-		label: "行动预扣",
-		group: "action"
-	},
-	"action-cost": {
-		label: "成本燃烧",
-		group: "action"
-	},
-	"action-refund": {
-		label: "失败退还",
-		group: "action"
-	}
-};
-const CHANNEL_GROUPS = [
-	{
-		group: "distribution",
-		label: "能量分发",
-		color: "#8b5cf6"
-	},
-	{
-		group: "mint",
-		label: "价值铸币",
-		color: "#10b981"
-	},
-	{
-		group: "market",
-		label: "知识市场",
-		color: "#3b82f6"
-	},
-	{
-		group: "belief",
-		label: "信念市场",
-		color: "#f59e0b"
-	},
-	{
-		group: "action",
-		label: "行动经济",
-		color: "#ef4444"
-	},
-	{
-		group: "other",
-		label: "其他",
-		color: "#94a3b8"
-	}
-];
-/** 分层：铸币源 0 / 国库 1 / 智能体 2 / 池 3 / 燃烧池 4 */
-function layerOf(accountId) {
-	if (accountId === "(mint)") return 0;
-	if (accountId === "treasury") return 1;
-	if (accountId === "burn") return 4;
-	if (accountId === ESCROW_ID || accountId === "belief-pool") return 3;
-	return 2;
-}
-const ESCROW_ID = "escrow";
-/** 账户显示名（内部账户中文名 / 智能体带 kind 标注） */
-function labelOf(accountId, agents) {
-	const internal = INTERNAL_LABELS[accountId];
-	if (internal) return internal;
-	const meta = agents.get(accountId);
-	if (meta?.label) return meta.label;
-	if (meta?.kind) return `${accountId}（${meta.kind}）`;
-	return accountId;
-}
-/**
-* 构建能量 Sankey 数据模型。
-* @param ledger 只读账本（audit 拷贝聚合）
-* @param opts.agents 智能体元信息（kind/label 标注）
-* @param opts.sinceSeq 只聚合 seq > sinceSeq 的凭证（增量窗口；缺省全量）
-*/
-function buildEnergySankey(ledger, opts = {}) {
-	const agentMap = new Map((opts.agents ?? []).map((a) => [a.id, a]));
-	const stats = ledger.stats();
-	const journal = ledger.audit(stats.transfers).filter((t) => opts.sinceSeq === void 0 ? true : t.seq > opts.sinceSeq);
-	const linkAgg = /* @__PURE__ */ new Map();
-	for (const t of journal) {
-		const key = `${t.from}|${t.to}|${t.reason}`;
-		const cur = linkAgg.get(key) ?? {
-			source: t.from,
-			target: t.to,
-			channel: t.reason,
-			amount: 0,
-			count: 0
-		};
-		cur.amount += t.amount;
-		cur.count += 1;
-		linkAgg.set(key, cur);
-	}
-	const links = [...linkAgg.values()].map((l) => {
-		const meta = CHANNEL_META[l.channel];
-		return {
-			source: l.source,
-			target: l.target,
-			channel: l.channel,
-			channelLabel: meta?.label ?? l.channel,
-			group: meta?.group ?? "other",
-			amount: l.amount,
-			count: l.count
-		};
-	});
-	const accountIds = /* @__PURE__ */ new Set([
-		"treasury",
-		"burn",
-		"escrow",
-		BELIEF_POOL
-	]);
-	for (const l of links) {
-		accountIds.add(l.source);
-		accountIds.add(l.target);
-	}
-	const nodes = [...accountIds].map((id) => {
-		let inflow = 0;
-		let outflow = 0;
-		for (const l of links) {
-			if (l.target === id) inflow += l.amount;
-			if (l.source === id) outflow += l.amount;
-		}
-		return {
-			id,
-			label: labelOf(id, agentMap),
-			layer: layerOf(id),
-			kind: id === "(mint)" ? "source" : agentMap.get(id)?.kind ?? (INTERNAL_LABELS[id] ? "internal" : "agent"),
-			balance: id === "(mint)" ? stats.minted : ledger.balance(id),
-			inflow,
-			outflow
-		};
-	});
-	nodes.sort((a, b) => a.layer - b.layer || b.inflow + b.outflow - (a.inflow + a.outflow));
-	const channelAgg = /* @__PURE__ */ new Map();
-	for (const l of links) {
-		const cur = channelAgg.get(l.channel) ?? {
-			channel: l.channel,
-			label: l.channelLabel,
-			group: l.group,
-			amount: 0,
-			count: 0
-		};
-		cur.amount += l.amount;
-		cur.count += l.count;
-		channelAgg.set(l.channel, cur);
-	}
-	const channels = [...channelAgg.values()].sort((a, b) => b.amount - a.amount);
-	return {
-		generatedAt: Date.now(),
-		seqRange: journal.length > 0 ? {
-			from: journal[0].seq,
-			to: journal[journal.length - 1].seq
-		} : null,
-		nodes,
-		links,
-		channels,
-		totals: {
-			transfers: journal.length,
-			minted: stats.minted,
-			burned: stats.burned,
-			totalSupply: stats.totalSupply,
-			circulatingSupply: stats.circulatingSupply,
-			gini: stats.gini,
-			conservation: ledger.verifyConservation(),
-			chainIntact: ledger.verifyChain()
-		}
-	};
-}
-const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-const fmt = (n) => Math.abs(n) >= 1e3 ? n.toFixed(0) : n.toFixed(1);
-/** 分层 Sankey 布局（手写 SVG：缎带宽度 ∝ 金额；回流链接下弯绕行） */
-function renderSvg(report) {
-	const W = 1280;
-	const H = 620;
-	const padX = 60;
-	const padY = 60;
-	const barW = 16;
-	const layers = [
-		0,
-		1,
-		2,
-		3,
-		4
-	];
-	const colorOf = new Map(CHANNEL_GROUPS.map((g) => [g.group, g.color]));
-	const layerNodes = /* @__PURE__ */ new Map();
-	for (const n of report.nodes) {
-		const arr = layerNodes.get(n.layer) ?? [];
-		arr.push(n);
-		layerNodes.set(n.layer, arr);
-	}
-	Math.max(1, ...report.nodes.map((n) => Math.max(n.inflow, n.outflow)));
-	const positions = /* @__PURE__ */ new Map();
-	for (const layer of layers) {
-		const ns = (layerNodes.get(layer) ?? []).slice().sort((a, b) => b.inflow + b.outflow - (a.inflow + a.outflow));
-		if (ns.length === 0) continue;
-		const slotH = 500 / ns.length;
-		const maxPerNode = Math.max(...ns.map((n) => Math.max(n.inflow, n.outflow)));
-		ns.forEach((n, i) => {
-			const h = Math.max(14, Math.max(n.inflow, n.outflow) / maxPerNode * Math.min(200, slotH * .62));
-			const x = padX + layer / (layers.length - 1) * 1144;
-			const y = padY + i * slotH + (slotH - h) / 2;
-			positions.set(n.id, {
-				x,
-				y,
-				h
-			});
-		});
-	}
-	const maxAmount = Math.max(1e-9, ...report.links.map((l) => l.amount));
-	return `
-  <svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="能量 Sankey 图">
-    <g>
-    ${report.links.slice().sort((a, b) => b.amount - a.amount).map((l) => {
-		const s = positions.get(l.source);
-		const t = positions.get(l.target);
-		if (!s || !t) return "";
-		const w = Math.max(1.5, l.amount / maxAmount * 34);
-		const x0 = s.x + barW;
-		const y0 = s.y + s.h / 2;
-		const x1 = t.x;
-		const y1 = t.y + t.h / 2;
-		const backward = t.x <= x0;
-		const dip = backward ? Math.max(y0, y1) + 90 + w * 2 : 0;
-		const c1x = (x0 + x1) / 2;
-		const d = backward ? `M ${x0} ${y0} C ${c1x} ${dip}, ${c1x} ${dip}, ${x1} ${y1}` : `M ${x0} ${y0} C ${c1x} ${y0}, ${c1x} ${y1}, ${x1} ${y1}`;
-		const color = colorOf.get(l.group) ?? "#94a3b8";
-		const tip = `${l.source} → ${l.target}｜${l.channelLabel}：${fmt(l.amount)} 能量（${l.count} 笔）`;
-		return `<path d="${d}" fill="none" stroke="${color}" stroke-width="${w.toFixed(1)}" stroke-opacity="0.38"><title>${esc(tip)}</title></path>`;
-	}).join("\n    ")}
-    </g>
-    <g>
-    ${report.nodes.map((n) => {
-		const p = positions.get(n.id);
-		if (!p) return "";
-		const tip = `${n.label}（${n.id}）｜余额 ${fmt(n.balance)}｜流入 ${fmt(n.inflow)} / 流出 ${fmt(n.outflow)}`;
-		const labelRight = n.layer <= 2;
-		const tx = labelRight ? p.x + barW + 6 : p.x - 6;
-		return `<rect x="${p.x.toFixed(1)}" y="${p.y.toFixed(1)}" width="${barW}" height="${p.h.toFixed(1)}" rx="3" fill="#1e293b"><title>${esc(tip)}</title></rect>
-      <text x="${tx.toFixed(1)}" y="${(p.y + p.h / 2 - 2).toFixed(1)}" text-anchor="${labelRight ? "start" : "end"}" font-size="12" fill="#334155" font-weight="600">${esc(n.label)}</text>
-      <text x="${tx.toFixed(1)}" y="${(p.y + p.h / 2 + 12).toFixed(1)}" text-anchor="${labelRight ? "start" : "end"}" font-size="10.5" fill="#94a3b8">余 ${fmt(n.balance)}｜流 ${fmt(n.inflow)}/${fmt(n.outflow)}</text>`;
-	}).join("\n    ")}
-    </g>
-  </svg>
-  <div class="legend">${CHANNEL_GROUPS.map((g) => `<span class="lg"><i style="background:${g.color}"></i>${esc(g.label)}</span>`).join("")}</div>`.trim();
-}
-/** 渠道明细表 */
-function renderChannelTable(report) {
-	return `<table><thead><tr><th>渠道</th><th>reason</th><th>能量</th><th>笔数</th></tr></thead><tbody>${report.channels.map((c) => `<tr><td>${esc(c.label)}</td><td><code>${esc(c.channel)}</code></td><td class="num">${fmt(c.amount)}</td><td class="num">${c.count}</td></tr>`).join("")}</tbody></table>`;
-}
-/** 账户余额表 */
-function renderBalanceTable(report) {
-	return `<table><thead><tr><th>账户</th><th>id</th><th>余额</th><th>流入</th><th>流出</th></tr></thead><tbody>${report.nodes.slice().sort((a, b) => b.balance - a.balance).map((n) => `<tr><td>${esc(n.label)}</td><td><code>${esc(n.id)}</code></td><td class="num">${fmt(n.balance)}</td><td class="num">${fmt(n.inflow)}</td><td class="num">${fmt(n.outflow)}</td></tr>`).join("")}</tbody></table>`;
-}
-/**
-* 渲染自包含 HTML 报告（零外部依赖，离线可开）。
-* @param report buildEnergySankey 产物
-* @param opts.title 报告标题（缺省「认知生态能量流 Sankey」）
-*/
-function renderSankeyHtml(report, opts = {}) {
-	const t = report.totals;
-	const windowText = report.seqRange ? `凭证 #${report.seqRange.from}–#${report.seqRange.to}` : "窗口内无流转";
-	const health = `<span class="badge ${t.conservation ? "ok" : "bad"}">守恒 ${t.conservation ? "✓" : "✗"}</span>
-    <span class="badge ${t.chainIntact ? "ok" : "bad"}">链哈希 ${t.chainIntact ? "✓" : "✗"}</span>`;
-	return `<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(opts.title ?? "认知生态能量流 Sankey")}</title>
-<style>
-  :root { color-scheme: light; }
-  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }
-  .wrap { max-width: 1320px; margin: 0 auto; padding: 28px 20px 48px; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .meta { color: #64748b; font-size: 12.5px; margin-bottom: 14px; }
-  .kpis { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
-  .kpi { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 14px; min-width: 118px; }
-  .kpi b { display: block; font-size: 17px; margin-top: 2px; }
-  .kpi span { font-size: 11.5px; color: #64748b; }
-  .badge { font-size: 11.5px; border-radius: 999px; padding: 3px 10px; border: 1px solid #e2e8f0; background: #fff; }
-  .badge.ok { color: #047857; border-color: #a7f3d0; }
-  .badge.bad { color: #b91c1c; border-color: #fecaca; }
-  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-top: 18px; overflow-x: auto; }
-  svg { width: 100%; height: auto; display: block; }
-  .legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 10px 4px 0; font-size: 12px; color: #475569; }
-  .lg i { display: inline-block; width: 18px; height: 5px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #f1f5f9; }
-  th { color: #64748b; font-weight: 600; font-size: 12px; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  code { background: #f1f5f9; border-radius: 4px; padding: 1px 5px; font-size: 11.5px; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-  @media (max-width: 980px) { .grid2 { grid-template-columns: 1fr; } }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>${esc(opts.title ?? "认知生态能量流 Sankey")}</h1>
-  <div class="meta">生成于 ${new Date(report.generatedAt).toISOString()}｜${esc(windowText)}｜${report.totals.transfers} 笔流转聚合</div>
-  <div class="kpis">
-    <div class="kpi"><span>总供给</span><b>${fmt(t.totalSupply)}</b></div>
-    <div class="kpi"><span>流通量</span><b>${fmt(t.circulatingSupply)}</b></div>
-    <div class="kpi"><span>累计铸币</span><b>${fmt(t.minted)}</b></div>
-    <div class="kpi"><span>累计燃烧</span><b>${fmt(t.burned)}</b></div>
-    <div class="kpi"><span>基尼系数</span><b>${t.gini.toFixed(3)}</b></div>
-    <div class="kpi"><span>健康</span><b>${health}</b></div>
-  </div>
-  <div class="card">${renderSvg(report)}</div>
-  <div class="grid2">
-    <div class="card"><h2 style="font-size:15px;margin:0 0 10px">渠道明细</h2>${renderChannelTable(report)}</div>
-    <div class="card"><h2 style="font-size:15px;margin:0 0 10px">账户余额</h2>${renderBalanceTable(report)}</div>
-  </div>
-</div>
-</body>
-</html>`;
 }
 //#endregion
 //#region src/symbiosis/bridge.ts
@@ -22322,7 +24635,8 @@ function apply(ctx, config) {
 		fetchImpl: cfg.llm?.fetchImpl,
 		headerProvider,
 		onKeyOutcome: (modelId, keyAttempt, success, status) => keyHealth.recordOutcome(modelId, keyAttempt, success, status),
-		externalChat: hostChat
+		externalChat: hostChat,
+		...cfg.autonomy?.robustStatistics?.enabled === true ? { robustLatency: { alpha: cfg.autonomy.robustStatistics.alpha } } : {}
 	});
 	for (const model of mergedModels) llm.registerModel(model);
 	if (cfg.strategistModel && !llm.getModel(cfg.strategistModel.id)) llm.registerModel({
@@ -22337,6 +24651,11 @@ function apply(ctx, config) {
 		const sources = describeKeySources(model.id);
 		if (sources.length > 0) logger.info("模型 %s 密钥来源: %s", model.id, sources.join(", "));
 	}
+	const privacyAccountant = cfg.autonomy?.privacy?.enabled === true ? new PrivacyAccountant({
+		epsilon: cfg.autonomy.privacy.epsilon,
+		delta: cfg.autonomy.privacy.delta
+	}) : void 0;
+	if (privacyAccountant) logger.info("24.0 差分隐私内核已启用：遥测数值发布经 Laplace 扰动（ε=%s, δ=%s）", cfg.autonomy?.privacy?.epsilon ?? 3, cfg.autonomy?.privacy?.delta ?? 1e-6);
 	const tenantManager = new TenantManager(path.join(dataDir, "tenants"), cryptoEngine ?? void 0);
 	const benchmark = new BenchmarkEngine(path.join(dataDir, "benchmarks"));
 	const migrationTool = new MigrationTool(cfg.sync?.localNodeId ?? "node-dev-01");
@@ -22715,6 +25034,7 @@ function apply(ctx, config) {
 	});
 	const metaCognition = new MetaCognitionEngine({
 		...cfg.autonomy?.metaCognition,
+		getQualityThreshold: () => reflectionEngine.getCurrentThreshold() ?? cfg.qualityThreshold,
 		applier: (action) => {
 			if (action.parameter === "qualityThreshold") {
 				reflectionEngine.setQualityThreshold(action.to);
@@ -22841,6 +25161,38 @@ function apply(ctx, config) {
 		const verifier = governor.attachRuntimeVerifier();
 		for (const spec of cfg.autonomy.runtimeVerification.specs ?? []) verifier.register(spec);
 	}
+	if (cfg.autonomy?.indexScheduling?.enabled === true) {
+		const indexScheduler = new IndexScheduler(new GittinsIndexTable({
+			discount: cfg.autonomy.indexScheduling.discount,
+			maxCount: cfg.autonomy.indexScheduling.maxCount
+		}));
+		modelScheduler.attachIndexScheduler(indexScheduler);
+		logger.info("21.0 最优索引调度内核已挂载：Gittins 指数精确计算（discount=%s, maxCount=%s）", cfg.autonomy.indexScheduling.discount ?? .95, cfg.autonomy.indexScheduling.maxCount ?? 48);
+	}
+	if (cfg.autonomy?.banditKnapsack?.enabled === true) {
+		const bwKRouter = new BwKRouter({
+			ucbAlpha: cfg.autonomy.banditKnapsack.ucbAlpha,
+			feasibilitySlack: cfg.autonomy.banditKnapsack.feasibilitySlack,
+			horizonDefault: cfg.autonomy.banditKnapsack.horizonDefault
+		});
+		modelScheduler.attachBwKRouter(bwKRouter, () => governor.budgetSnapshot());
+		logger.info("22.0 预算最优路由内核已挂载：Bandits with Knapsacks（ucbAlpha=%s, feasibilitySlack=%s, horizonDefault=%s）", cfg.autonomy.banditKnapsack.ucbAlpha ?? .05, cfg.autonomy.banditKnapsack.feasibilitySlack ?? .25, cfg.autonomy.banditKnapsack.horizonDefault ?? 100);
+	}
+	if (cfg.autonomy?.optimalTransport?.enabled === true) metaCognition.attachTransportDrift({
+		kpis: cfg.autonomy.optimalTransport.kpis,
+		windowSize: cfg.autonomy.optimalTransport.windowSize,
+		referenceSize: cfg.autonomy.optimalTransport.referenceSize,
+		thresholdQuantile: cfg.autonomy.optimalTransport.thresholdQuantile,
+		minSamples: cfg.autonomy.optimalTransport.minSamples
+	});
+	if (cfg.autonomy?.informationGeometry?.enabled === true) strategyEvolution.attachInformationGeometry({
+		klBudget: cfg.autonomy.informationGeometry.klBudget,
+		stepScale: cfg.autonomy.informationGeometry.stepScale
+	});
+	if (cfg.autonomy?.optimalStopping?.enabled === true) decisionEngine.attachOptimalStopper({
+		horizon: cfg.autonomy.optimalStopping.horizon,
+		minSamples: cfg.autonomy.optimalStopping.minSamples
+	});
 	/** KPI 采集器：从真实引擎状态聚合 KPI 快照 */
 	const collectKpi = () => {
 		const modelStatuses = llm.getModelStatuses();
@@ -23021,6 +25373,55 @@ function apply(ctx, config) {
 		});
 		return signal.id;
 	};
+	const capacityPlanner = cfg.autonomy?.capacityPlanning?.enabled === true ? new CapacityPlanner({
+		targetWaitMs: cfg.autonomy.capacityPlanning.targetWaitMs,
+		defaultScv: cfg.autonomy.capacityPlanning.defaultScv
+	}) : void 0;
+	/** 最近一次容量规划产物（introspect 审计口径；未启用/未产出时恒 undefined） */
+	let lastCapacityPlan;
+	const runCapacityPlanning = () => {
+		if (!capacityPlanner) return [];
+		const predictions = worldModel.predictArrivals(6e4);
+		if (predictions.length === 0) return [];
+		const totalArrivals = predictions.reduce((sum, p) => sum + (Number.isFinite(p.expectedCount) ? p.expectedCount : 0), 0);
+		if (totalArrivals <= 0) return [];
+		const predictedArrivalPerSec = totalArrivals / 60;
+		const statuses = llm.getModelStatuses();
+		let latencyWeightedSum = 0;
+		let weightSum = 0;
+		let unweightedSum = 0;
+		let unweightedCount = 0;
+		for (const status of statuses) {
+			const latency = status.robustAvgLatencyMs ?? status.avgLatency;
+			if (!Number.isFinite(latency) || latency <= 0) continue;
+			if (status.totalCalls > 0) {
+				latencyWeightedSum += latency * status.totalCalls;
+				weightSum += status.totalCalls;
+			} else {
+				unweightedSum += latency;
+				unweightedCount += 1;
+			}
+		}
+		const serviceMeanMs = weightSum > 0 ? latencyWeightedSum / weightSum : unweightedCount > 0 ? unweightedSum / unweightedCount : void 0;
+		if (serviceMeanMs === void 0) return [];
+		const currentConcurrency = statuses.reduce((sum, s) => sum + (s.maxConcurrency > 0 ? s.maxConcurrency : 0), 0) || 4;
+		const plan = capacityPlanner.plan({
+			predictedArrivalPerSec,
+			serviceMeanMs,
+			currentConcurrency
+		});
+		lastCapacityPlan = plan;
+		if (plan.feasible && plan.headroom <= 1.2) return [];
+		return [{
+			source: "meta-cognition",
+			category: "capacity-warning",
+			taskType: void 0,
+			severity: !plan.feasible ? .9 : Math.min(.85, .5 + (plan.headroom - 1.2)),
+			message: `容量规划：预测到达率 ${predictedArrivalPerSec.toFixed(3)}/s × 平均服务 ${Math.round(serviceMeanMs)}ms，当前并发 ${plan.currentConcurrency}（利用率 ρ=${plan.rho}）；反解建议并发 ${plan.recommendedConcurrency}，预计平均等待 ${plan.feasible ? `${plan.expectedWaitMs}ms` : `超出目标 ${plan.targetWaitMs}ms（不可达）`}`,
+			suggestion: !plan.feasible ? "并发上限内无法满足目标等待：立即扩容模型并发上限或对低价值信号降载，防止队列排队失控" : `建议把模型并发上限扩至 ${plan.recommendedConcurrency}（当前 ${plan.currentConcurrency}），或对低价值信号降载以守住 ${plan.targetWaitMs}ms 等待目标`
+		}];
+	};
+	if (capacityPlanner) logger.info("25.0 容量规划内核已启用：心跳 2.5 段反解最小并发（targetWaitMs=%s, defaultScv=%s）", cfg.autonomy?.capacityPlanning?.targetWaitMs ?? 5e3, cfg.autonomy?.capacityPlanning?.defaultScv ?? 2);
 	const autonomyLoop = new AutonomyLoop({
 		config: {
 			...cfg.autonomy?.loop,
@@ -23055,6 +25456,7 @@ function apply(ctx, config) {
 		curiosity,
 		governor,
 		dispatchExploration,
+		capacityAdvisor: capacityPlanner ? runCapacityPlanning : void 0,
 		policyEvolution: policyEvolutionEnabled && !futarchyEnabled ? { runEvolutionCycle: runPolicyEvolutionCycle } : void 0,
 		metaCognitionBridge: metaLayerEnabled ? { runMetaCycle: async () => {
 			const adjustment = await metaController.evaluateAndAdjust();
@@ -23076,7 +25478,9 @@ function apply(ctx, config) {
 			}
 			symbiosisTickCount += 1;
 			if (sankeyPath && symbiosisTickCount % sankeyEveryNTicks === 0) try {
-				fs.writeFileSync(sankeyPath, symbiosisBridge.sankeyHtml());
+				const sankeyReport = symbiosisBridge.sankey();
+				const safeReport = privacyAccountant ? perturbNumbers(sankeyReport, privacyAccountant) : sankeyReport;
+				fs.writeFileSync(sankeyPath, renderSankeyHtml(safeReport));
 				broadcast({
 					type: "sankey-updated",
 					path: sankeyPath,
@@ -23684,9 +26088,11 @@ function apply(ctx, config) {
 			}
 		},
 		handler: async (args) => {
+			const privacyView = (view) => privacyAccountant ? perturbNumbers(view, privacyAccountant) : view;
 			switch (args.action) {
 				case "generate": {
 					const report = await selfModel.generateMentalReport();
+					const safeReport = privacyView(report);
 					broadcast({
 						type: "mental-report",
 						reportIndex: report.reportIndex,
@@ -23694,16 +26100,16 @@ function apply(ctx, config) {
 						stabilityScore: report.systemStability.stabilityScore
 					});
 					return {
-						report,
-						formatted: selfModel.formatReport(report)
+						report: safeReport,
+						formatted: selfModel.formatReport(safeReport)
 					};
 				}
 				case "latest": {
 					const report = selfModel.getLatestReport();
 					if (!report) throw new ToolError("暂无心智报告，先执行 action=generate");
-					return { report };
+					return { report: privacyView(report) };
 				}
-				case "history": return { history: selfModel.getReportHistory().slice(-Math.max(1, args.limit ?? 10)) };
+				case "history": return { history: privacyView(selfModel.getReportHistory().slice(-Math.max(1, args.limit ?? 10))) };
 				case "trend": return { trend: selfModel.getTrendSeries() };
 				case "formatted": {
 					const report = selfModel.getLatestReport();
@@ -24263,7 +26669,16 @@ function apply(ctx, config) {
 				case "reset-circuit":
 					governor.resetCircuit();
 					return { circuitState: governor.getCircuitState() };
-				case "introspect": return { introspection: autonomyLoop.introspect() };
+				case "introspect": {
+					const kernelDiagnostics = modelScheduler.getAttachedDiagnostics();
+					return {
+						introspection: autonomyLoop.introspect(),
+						...kernelDiagnostics.indexScheduling ? { indexScheduling: kernelDiagnostics.indexScheduling } : {},
+						...kernelDiagnostics.lastBwK ? { banditKnapsack: kernelDiagnostics.lastBwK } : {},
+						...privacyAccountant ? { privacy: privacyAccountant.status() } : {},
+						...lastCapacityPlan ? { capacity: lastCapacityPlan } : {}
+					};
+				}
 				default: throw new ToolError(`未知 action: ${args.action}`);
 			}
 		}
@@ -24306,6 +26721,56 @@ function apply(ctx, config) {
 					};
 				default: throw new ToolError(`未知 action: ${args.action}`);
 			}
+		}
+	});
+	if (cfg.autonomy?.sheafConsensus?.enabled === true) tools.register({
+		name: "sheaf_consensus",
+		description: "层论共识：把多源信念（模型估计 / 市场价 / 直接观测）按「谁与谁、在哪些声明上应该一致」的结构调和为全局共识——平均化会编造共识（0.9 与 0.1 平均成 0.5，无人真的这么认为），本工具在结构性分歧时明确说「无解」并指出最大翻供者",
+		parameters: {
+			vertices: {
+				type: "array",
+				description: "顶点声明：[{id, dim}]（dim = 该源的信念向量维度，标量源 dim=1）",
+				required: true
+			},
+			edges: {
+				type: "array",
+				description: "一致性约束边：[{a, b, sharedA?, sharedB?}]——a/b 为顶点 id；sharedA/sharedB 为两侧参与共享的坐标下标表（长度相等；省略 = 同序全维度等值约束）"
+			},
+			observations: {
+				type: "array",
+				description: "观测锚点：[{id, values, weight?}]（values 长度 = 顶点 dim；weight = 置信权重，缺省 1）",
+				required: true
+			}
+		},
+		handler: (args) => {
+			const vertices = Array.isArray(args.vertices) ? args.vertices : [];
+			const edges = Array.isArray(args.edges) ? args.edges : [];
+			const observations = Array.isArray(args.observations) ? args.observations : [];
+			if (vertices.length === 0 || observations.length === 0) throw new ToolError("sheaf_consensus 需要 vertices 与 observations（至少各 1 项）");
+			const sheaf = new CellularSheaf();
+			for (const v of vertices) {
+				if (typeof v?.id !== "string" || typeof v?.dim !== "number") throw new ToolError("顶点格式：{id: string, dim: number}");
+				sheaf.addVertex(v.id, v.dim);
+			}
+			for (const e of edges) {
+				if (typeof e?.a !== "string" || typeof e?.b !== "string") throw new ToolError("边格式：{a, b, sharedA?, sharedB?}");
+				try {
+					sheaf.addEdge({
+						a: e.a,
+						b: e.b,
+						sharedA: Array.isArray(e.sharedA) ? e.sharedA.map(Number) : void 0,
+						sharedB: Array.isArray(e.sharedB) ? e.sharedB.map(Number) : void 0
+					});
+				} catch (err) {
+					throw new ToolError(`边 ${e.a}↔${e.b} 无效: ${err.message}`);
+				}
+			}
+			const anchors = observations.filter((o) => typeof o?.id === "string" && Array.isArray(o.values)).map((o) => ({
+				id: o.id,
+				values: o.values.map(Number),
+				weight: typeof o.weight === "number" ? o.weight : 1
+			}));
+			return sheaf.harmonize(anchors, { misfitTolerance: cfg.autonomy?.sheafConsensus?.misfitTolerance });
 		}
 	});
 	const hostToolRegistry = ctx.get?.("tools");
@@ -24424,4 +26889,4 @@ Object.defineProperty(pluginEntry, "name", { value: name });
 pluginEntry.Config = Config;
 pluginEntry.provide = ["scheduler", "schedulerTools"];
 //#endregion
-export { AbstractionEngine, AgentBase, AliasMap, AnytimeEvidenceRegistry, AnytimeEvidenceStream, AppError, AutonomyLoop, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, BeliefMarket, BenchmarkEngine, CHANNEL_GROUPS, CausalKernel, CircuitBreaker, CircuitBreakerRegistry, CognitiveMarket, Config, ConfigError, ConformalIntervalEngine, CoverageDriftMonitor, CryptoEngine, CryptoError, CuriosityEngine, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, DecisionEngine, DeliberationEngine, DistributedSync, EProcess, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EnergyLedger, EvolverAgent, ExecutionError, FreeEnergyEngine, GoalEngine, HotReloadEngine, INCINERATOR, JsonMemoryBackend, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMError, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, MapElitesArchive, MemoryAgent, MemoryError, MemoryGraph, MetaCognitionEngine, MetaCognitiveController, MigrationTool, ModelAgent, ModelScheduler, NetworkError, Optimizer, OptimizerAgent, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PolicyEvolver, PolicySimulator, ProgressBroadcaster, RaftEngine, RationalMetareasoner, ReflectionEngine, Reflector, RuntimeVerifier, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafetyGovernor, SafetyMonitor, Sandbox, ScientistMind, SelfModel, Sentinel, ShapleyAttributionEngine, SqliteMemoryBackend, StrategyEvolutionEngine, SymbiosisBridge, SymbiosisRuntime, TREASURY, TaskExecutor, TenantManager, TheoristEngine, TimeoutError, ToolError, ToolRegistry, WorldModel, abortableSleep, apply, attachDashboard, backoffDelayMs, bernoulliKL, betaEntropy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, classifyError, coalitionValue, computeHomeostasis, conformalQuantile, cosineSimilarity, createBaselinePolicy, createMemoryBackend, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, eBenjaminiHochberg, emptyMemoryStore, evaluateMemoryCondition, evidenceRankScore, extractReplayTasks, fixedSampleUpperBound, generateAdversarialTasks, initEvidence, isTradeListener, lessonsToInsights, listingsOf, lnGamma, matchesMemoryConditions, modelAgentId, modelSignalKey, name, normalizePolicyParams, observeEvidence, parseJSONLoose, policyParamsWithinBounds, policyRuleMatches, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, sanitizeMemoryStore, scoreModelWithPolicy, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, toSparseVector, tokenizeChinese, wilsonLowerBound };
+export { AbstractionEngine, AgentBase, AliasMap, AnytimeEvidenceRegistry, AnytimeEvidenceStream, AppError, AutonomyLoop, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, BeliefMarket, BenchmarkEngine, BwKRouter, CHANNEL_GROUPS, CapacityPlanner, CausalKernel, CellularSheaf, CircuitBreaker, CircuitBreakerRegistry, CognitiveMarket, Config, ConfigError, ConformalIntervalEngine, CoverageDriftMonitor, CryptoEngine, CryptoError, CuriosityEngine, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, DecisionEngine, DeliberationEngine, DistributedSync, EProcess, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EnergyLedger, EvolverAgent, ExecutionError, FisherGeometryEngine, FreeEnergyEngine, GittinsIndexTable, GoalEngine, HotReloadEngine, INCINERATOR, IndexScheduler, JsonMemoryBackend, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMError, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, MapElitesArchive, MemoryAgent, MemoryError, MemoryGraph, MetaCognitionEngine, MetaCognitiveController, MigrationTool, ModelAgent, ModelScheduler, NetworkError, OpportunityStopper, Optimizer, OptimizerAgent, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PolicyEvolver, PolicySimulator, PrivacyAccountant, ProgressBroadcaster, RDP_ORDER, RaftEngine, RationalMetareasoner, ReflectionEngine, Reflector, RobustStream, RuntimeVerifier, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafetyGovernor, SafetyMonitor, Sandbox, ScientistMind, SelfModel, Sentinel, ShapleyAttributionEngine, SqliteMemoryBackend, StrategyEvolutionEngine, SymbiosisBridge, SymbiosisRuntime, TREASURY, TaskExecutor, TenantManager, TheoristEngine, TimeoutError, ToolError, ToolRegistry, TransportDriftMonitor, WorldModel, abortableSleep, apply, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, brussOddsIndex, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, catoniMean, cholesky, classifyError, coalitionValue, computeHomeostasis, conditionNumber, conformalQuantile, cosineSimilarity, createBaselinePolicy, createMemoryBackend, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, dpHistogram, dpMeanClamped, dpValue, eBenjaminiHochberg, emptyMemoryStore, erlangC, evaluateMemoryCondition, evidenceRankScore, extractReplayTasks, fixedSampleUpperBound, gaussianNoise, generateAdversarialTasks, initEvidence, isTradeListener, kingmanWq, laplaceNoise, lessonsToInsights, listingsOf, littleCheck, lnGamma, madSigma, matchesMemoryConditions, medianOfMeans, modelAgentId, modelSignalKey, name, normalizePolicyParams, observeEvidence, overlapSheaf, parseJSONLoose, participationRatio, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, prophetValue, quantileSorted, rdpToEpsilon, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, shrinkageCovariance, sinkhorn, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, toSparseVector, tokenizeChinese, wasserstein1D, wassersteinBarycenter1D, wilsonLowerBound };

@@ -202,6 +202,7 @@ ${allModels.join('\n')}
           watchErrors: true
           watchPerformance: true
           aggregationWindow: 5
+          signalSources: []
         qualityThreshold: 0.7
         maxRetries: 2
         globalTimeout: 300000
@@ -232,16 +233,117 @@ ${allModels.join('\n')}
           buildCommand: pnpm build
           autoRollback: true
         tenants: []
+        # ── 以下键完整列出 schema/运行时默认值：用户层按 id 覆盖是整行替换（非深度合并），
+        #    bundle 层全部显式给出，照抄即得完整行，不会漏键回退到隐式默认。
+        # 数据目录（心智报告 / 审计日志 / 租户库 / raft 日志落盘处）
+        dataDir: '.scheduler'
+        # 模式置信度 ≥ 此阈值走记忆快路径（运行时缺省 0.9）
+        memoryFastPathThreshold: 0.9
+        # 自主心跳外环：设 { enabled: false } 可完全关闭自主循环
+        autonomy:
+          enabled: true
+          heartbeatMs: 30000
+          # 12.0 任意时刻证据：进化适应度置信序列下界 + e-BH FDR 淘汰 +
+          # 元认知 KPI 保证层（退化判定偷看免疫）。缺省关闭（零漂移）
+          anytimeEvidence:
+            enabled: false
+            alpha: 0.05
+            reference: 0.5
+          # 13.0 保形校准：预测区间精确覆盖保证 + 反思阈值风险受控选择。
+          # 缺省关闭（回退既有泊松近似/步进校准口径）
+          conformal:
+            enabled: false
+            alpha: 0.1
+            maxCalibration: 200
+            thresholdTargetRisk: 0.1
+            thresholdConfidence: 0.95
+          # 14.0 质量-多样性进化：MAP-Elites 前沿 niche 均匀采样探索
+          # （敢为/节俭/警觉流派等量预算，多样性坍缩被阻断）。缺省关闭
+          qualityDiversity:
+            enabled: false
+            exploreRate: 0.25
+          # 15.0 运行时验证：治理迁移事件流喂入 LTLf 规约监视器；
+          # critical 违规自动触发 Kill Switch。缺省关闭（不挂载即不监视）
+          runtimeVerification:
+            enabled: false
+            specs: []
+          # 17.0 最优传输：元认知挂载 Wasserstein-1 形状漂移监视
+          # （均值不变而形状巨变的「换了世界」可见）。缺省关闭
+          optimalTransport:
+            enabled: false
+            kpis: [avgQuality, avgLatency]
+            windowSize: 50
+            referenceSize: 200
+            thresholdQuantile: 0.95
+            minSamples: 20
+          # 18.0 信息几何：策略变异升级为 Fisher 流形自然变异
+          # （协方差主轴联合步 + KL 信任域，步长以 nat 计价）。缺省关闭
+          informationGeometry:
+            enabled: false
+            klBudget: 1.2
+            stepScale: 0.5
+          # 19.0 最优停止：规则 C 成本闸门从魔数 defer 升级为
+          # 继续价值裁决（向后归纳精确阈值 + 先知不等式审计）。缺省关闭
+          optimalStopping:
+            enabled: false
+            horizon: 3
+            minSamples: 8
+          # 20.0 层论共识：注册 sheaf_consensus Tool（多源信念结构化
+          # 融合 + 结构性分歧检测）。缺省关闭（不注册即零漂移）
+          sheafConsensus:
+            enabled: false
+            misfitTolerance: 0.0025
+          # 21.0 最优索引调度：候选排序升级为 Gittins 指数口径（可证明
+          # 最优；学习溢价随证据积累自动归零）。缺省关闭（零漂移）
+          indexScheduling:
+            enabled: false
+            discount: 0.95
+            maxCount: 48
+          # 22.0 预算最优路由：Bandits with Knapsacks（影子价格从预算
+          # 稀缺性内生涌现；治理器未配置预算时挂载不生效）。缺省关闭
+          banditKnapsack:
+            enabled: false
+            ucbAlpha: 0.05
+            feasibilitySlack: 0.25
+            horizonDefault: 100
+          # 稳健统计（预留配置位：运行时接线随后续版本进入）。缺省关闭
+          robustStatistics:
+            enabled: false
+            alpha: 0.05
+          # 差分隐私（预留配置位：运行时接线随后续版本进入）。缺省关闭
+          privacy:
+            enabled: false
+            epsilon: 3.0
+            delta: 0.000001
+          # 容量规划（预留配置位：运行时接线随后续版本进入）。缺省关闭
+          capacityPlanning:
+            enabled: false
+            targetWaitMs: 5000
+            defaultScv: 2.0
+        # 宿主融合层：全宿主工具可观测 + 安全治理；关闭后 isActive()=false
+        hostFusion:
+          enabled: true
+          observeToolResults: true
+          governToolCalls: true
+          failureEscalationThreshold: 3
 `;
+}
+
+/**
+ * 落盘 YML：与仓库既有生成物对齐 CRLF 行尾（模板统一以 \n 书写，
+ * 写入时整档转换），保证重新生成后与已提交文件的 diff 只有预期变更。
+ */
+function writeYml(file, content) {
+  fs.writeFileSync(file, content.replace(/\n/g, '\r\n'));
 }
 
 fs.mkdirSync(outDir, { recursive: true });
 let count = 0;
 for (const vendor of VENDORS) {
-  fs.writeFileSync(path.join(outDir, `${vendor.id}.yml`), renderVendorPatch(vendor));
+  writeYml(path.join(outDir, `${vendor.id}.yml`), renderVendorPatch(vendor));
   count += 1;
 }
-fs.writeFileSync(path.join(outDir, 'all-domestic.yml'), renderAllPatch());
+writeYml(path.join(outDir, 'all-domestic.yml'), renderAllPatch());
 // 根目录 cordis.patch.yml 同步升级为封装全部国产模型的 patch YML（零密钥、开箱即用）
-fs.writeFileSync(path.resolve(__dirname, '../cordis.patch.yml'), renderRootPatch());
+writeYml(path.resolve(__dirname, '../cordis.patch.yml'), renderRootPatch());
 console.log(`已生成 ${count} 个厂商 patch + all-domestic.yml → ${outDir}，并升级根目录 cordis.patch.yml`);

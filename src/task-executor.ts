@@ -347,7 +347,7 @@ export class TaskExecutor {
       }
 
       try {
-        const { output, quality, tokensUsed } = await this.runWithTimeout(node, modelId, context, signal, attempt);
+        const { output, quality, tokensUsed } = await this.runWithTimeout(node, modelId, context, signal, attempt, abortSignal);
 
         // 质量反思（深度优化：反思引擎动态阈值 + LLM-as-judge + 重试建议）
         const threshold = this.reflection?.getCurrentThreshold() ?? this.config.qualityThreshold;
@@ -462,6 +462,7 @@ export class TaskExecutor {
     context: Record<string, string>,
     signal: Signal,
     attempt: number,
+    abortSignal?: AbortSignal,
   ): Promise<{ output: string; quality: number; tokensUsed?: number }> {
     const timeout = node.timeout ?? this.config.nodeTimeout;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -469,8 +470,12 @@ export class TaskExecutor {
       timer = setTimeout(() => reject(new TimeoutError(`节点 ${node.id} 执行超时（${timeout}ms）`, { nodeId: node.id })), timeout);
       timer.unref?.();
     });
+    const exec = this.nodeRunner({ node, modelId, context, signal, attempt, abortSignal });
+    // 旁路 handler：超时先决出胜者后，执行 Promise 后续 reject 在此被吞掉，
+    // 避免 unhandled rejection；race 自身仍完整感知两者的第一落点
+    exec.then(() => {}, () => {});
     try {
-      return await Promise.race([this.nodeRunner({ node, modelId, context, signal, attempt }), timeoutPromise]);
+      return await Promise.race([exec, timeoutPromise]);
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -482,6 +487,7 @@ export class TaskExecutor {
     modelId: string;
     context: Record<string, string>;
     signal: Signal;
+    abortSignal?: AbortSignal;
     attempt: number;
   }): Promise<{ output: string; quality: number; tokensUsed?: number }> {
     const { node, modelId, context, signal } = params;
@@ -502,7 +508,7 @@ export class TaskExecutor {
           .filter(Boolean)
           .join('\n'),
       },
-    ]);
+    ], { signal: params.abortSignal });
 
     return {
       output: response.content,

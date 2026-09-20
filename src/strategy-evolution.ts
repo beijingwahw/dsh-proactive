@@ -28,6 +28,7 @@ import type { DecisionEngineConfig } from './decision-engine.js';
 import { initEvidence, observeWeightedEvidence, wilsonLowerBound, type MemoryEvidence } from './core/evidence.js';
 import { AnytimeEvidenceRegistry, type AnytimeEvidenceRegistryReport, type AnytimeEvidenceView } from './core/anytime-evidence.js';
 import { MapElitesArchive, STRATEGY_BEHAVIOR_SPACE, strategyBehaviorDescriptor, type QualityDiversityMetrics } from './core/quality-diversity.js';
+import { FisherGeometryEngine, type InformationGeometryReport } from './core/information-geometry.js';
 
 /** 基因组基因（决策引擎可调超参数子集） */
 export interface StrategyGenes {
@@ -135,6 +136,8 @@ export interface EvolutionStatusReport {
   qd?: QualityDiversityMetrics;
   /** 12.0：任意时刻证据报告（attachAnytimeEvidence 后输出） */
   anytime?: AnytimeEvidenceRegistryReport;
+  /** 18.0：搜索几何报告（attachInformationGeometry 后输出） */
+  geometry?: InformationGeometryReport;
 }
 
 /**
@@ -169,6 +172,8 @@ export class StrategyEvolutionEngine {
   private qdArchive?: MapElitesArchive<StrategyGenome>;
   /** 14.0：前沿 niche 采样概率（探索预算占比） */
   private qdExploreRate = 0.25;
+  /** 18.0：Fisher 几何引擎（attach 后变异沿搜索流形测地方向） */
+  private geometry?: FisherGeometryEngine;
 
   constructor(config?: Partial<StrategyEvolutionConfig>) {
     this.config = { ...DEFAULT_STRATEGY_EVOLUTION_CONFIG, ...config };
@@ -200,6 +205,36 @@ export class StrategyEvolutionEngine {
       tieTolerance: 1e-9,
     });
     for (const genome of this.population) this.qdArchive.place(genome);
+  }
+
+  /**
+   * 18.0：挂载信息几何内核（幂等；挂载后变异从坐标轴加噪升级为
+   * Fisher 流形上的自然变异）。
+   *
+   * 变异路径变化：种群归一化协方差（Ledoit–Wolf 收缩）→ Cholesky
+   * 主轴展开的**联合相关**变异（显性基因组合完整传递；各向同性
+   * 加噪被结构性替代）→ KL 信任域（Mahalanobis 半径）封顶单步
+   * 信息量——步长以 nat 计价，仿射重参数化下严格不变。
+   * 几何每代进化前从当前种群重估。不 attach 即零漂移（原高斯路径）。
+   */
+  attachInformationGeometry(options?: { klBudget?: number; stepScale?: number; rng?: () => number }): void {
+    this.geometry = new FisherGeometryEngine({
+      klBudget: options?.klBudget,
+      stepScale: options?.stepScale,
+      rng: options?.rng ?? this.rng,
+    });
+    this.estimateGeometry();
+  }
+
+  /** 18.0：从当前种群重估搜索几何（归一化 [0,1]^d 参数空间） */
+  private estimateGeometry(): void {
+    if (!this.geometry) return;
+    this.geometry.estimate(this.population.map((g) => normalizeGenes(g.genes)));
+  }
+
+  /** 18.0：几何诊断报告（未挂载返回 undefined） */
+  geometryReport(): InformationGeometryReport | undefined {
+    return this.geometry?.report();
   }
 
   /**
@@ -263,6 +298,8 @@ export class StrategyEvolutionEngine {
     if (!force && this.applicationsSinceEvolution < this.config.minApplicationsBetweenEvolutions) return null;
 
     this.generation += 1;
+    // 18.0：进化前重估搜索几何（新一代种群 → 新协方差主轴）
+    this.estimateGeometry();
     const ranked = [...this.population].sort((a, b) => this.fitness(b) - this.fitness(a));
 
     // 精英保留（需满足最小应用次数，防止小样本侥幸）
@@ -341,6 +378,7 @@ export class StrategyEvolutionEngine {
       recentEvolutions: this.evolutionHistory.slice(-5),
       qd: this.qdArchive?.metrics(),
       anytime: this.anytime?.report(),
+      geometry: this.geometry?.report(),
     };
   }
 
@@ -472,8 +510,18 @@ export class StrategyEvolutionEngine {
     return winner;
   }
 
-  /** 高斯变异：按变异概率逐基因扰动 */
+  /**
+   * 变异产生后代
+   *
+   * 18.0 挂载后：Fisher 流形上的自然变异（种群协方差主轴展开的
+   * 联合相关步 + KL 信任域封顶——步长以 nat 计价，坐标不变）；
+   * 未挂载：原各基因独立近似高斯变异（坐标空间，零漂移回退）。
+   */
   private mutate(parent: StrategyGenome): StrategyGenome {
+    if (this.geometry) {
+      const { child } = this.geometry.naturalMutate(normalizeGenes(parent.genes), this.config.mutationStrength);
+      return this.createGenome(denormalizeGenes(child), this.generation);
+    }
     const genes = { ...parent.genes };
     for (const key of Object.keys(GENE_BOUNDS) as Array<keyof StrategyGenes>) {
       if (this.rng() > this.config.mutationRate) continue;
@@ -494,4 +542,25 @@ export class StrategyEvolutionEngine {
     if (applied.length === 0) return 0;
     return applied.reduce((sum, g) => sum + g.meanReward, 0) / applied.length;
   }
+}
+
+// ─────────────────────────── 18.0 归一化工具 ───────────────────────────
+
+/** 基因 → 归一化参数点 [0,1]^d（18.0：几何运算都在归一化空间，坐标不变量） */
+function normalizeGenes(genes: StrategyGenes): number[] {
+  return (Object.keys(GENE_BOUNDS) as Array<keyof StrategyGenes>).map((key) => {
+    const bounds = GENE_BOUNDS[key];
+    return Math.max(0, Math.min(1, (genes[key] - bounds.min) / (bounds.max - bounds.min)));
+  });
+}
+
+/** 归一化参数点 → 基因（反弹边界 + 整数基因圆整） */
+function denormalizeGenes(point: readonly number[]): StrategyGenes {
+  const genes = {} as StrategyGenes;
+  (Object.keys(GENE_BOUNDS) as Array<keyof StrategyGenes>).forEach((key, i) => {
+    const bounds = GENE_BOUNDS[key];
+    const value = bounds.min + Math.max(0, Math.min(1, point[i] ?? 0.5)) * (bounds.max - bounds.min);
+    genes[key] = bounds.integer ? Math.round(value) : Number(value.toFixed(3));
+  });
+  return genes;
 }

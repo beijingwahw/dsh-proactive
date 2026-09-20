@@ -716,16 +716,28 @@ export function coalitionValue(members: ContributorProb[]): number {
 }
 
 /**
- * 精确 Shapley 值（子集枚举，n ≤ 16 时精确；更大时按权重截断）。
+ * Shapley 值（n ≤ 12 子集枚举精确；n > 12 确定性置换采样估计）。
  *
- * φ_i = Σ_{S ⊆ N∖{i}} [|S|! (n−|S|−1)! / n!] · [v(S ∪ {i}) − v(S)]
+ * 精确路径：φ_i = Σ_{S ⊆ N∖{i}} [|S|! (n−|S|−1)! / n!] · [v(S ∪ {i}) − v(S)]
+ *
+ * 采样路径（n > 12）：固定 512 个随机排列（缺省 mulberry32 种子
+ * 0xC0FFEE，确定性可复现；可注入自定义 rng），每个排列沿前缀逐步
+ * 计算各贡献者的边际贡献，取全体排列的平均 —— 无偏估计，
+ * 复杂度 O(512·n)。分界理由：n > 12 时 2^n 联盟枚举超过 4096 次
+ * 联盟估值（n·2^(n−1) 次边际差），精确解成本指数膨胀而采样方差
+ * 可控；且位掩码枚举在 n ≥ 33 时 `1 << others` 溢出 32 位整数
+ * （死循环/错值），采样路径不依赖位掩码，任意 n 安全。
  *
  * 质变点：分红不再按「表现分的线性份额」（搭便车者只要有正分就
  * 永远分钱），而按「边际反事实贡献」——拔掉你，任务成功率掉多少，
  * 你就分多少。两个都干了活的智能体平分；只挂名不出力的边际贡献
  * ≈ 0，自然饿死（能量经济的真公平）。
+ *
+ * @param contributors 贡献者及其个体成功概率
+ * @param rng 可选随机源注入（缺省 mulberry32(0xC0FFEE)，确定性采样）
+ * @returns agentId → Shapley 值（采样路径下为边际贡献均值）
  */
-export function shapleyValues(contributors: ContributorProb[]): Map<string, number> {
+export function shapleyValues(contributors: ContributorProb[], rng?: () => number): Map<string, number> {
   const n = contributors.length;
   const result = new Map<string, number>();
   if (n === 0) return result;
@@ -733,6 +745,7 @@ export function shapleyValues(contributors: ContributorProb[]): Map<string, numb
     result.set(contributors[0]!.agentId, coalitionValue(contributors));
     return result;
   }
+  if (n > 12) return shapleyByPermutationSampling(contributors, rng);
   // 子集价值缓存（位掩码）
   const cache = new Map<number, number>();
   const valueOf = (mask: number): number => {
@@ -767,6 +780,63 @@ export function shapleyValues(contributors: ContributorProb[]): Map<string, numb
     result.set(contributors[i]!.agentId, phi);
   }
   return result;
+}
+
+/** 置换采样数（n > 12 时的 Shapley 估计样本量；方差随样本数 1/m 收敛） */
+const SHAPLEY_PERMUTATION_SAMPLES = 512;
+
+/**
+ * 置换采样 Shapley 估计（n > 12 路径）。
+ *
+ * 每个随机排列 π 下，沿前缀依次加入成员，第 j 位成员的边际贡献 =
+ * v(π₁..πⱼ) − v(π₁..πⱼ₋₁)；对所有排列取平均即为 Shapley 值的无偏估计。
+ * noisy-OR 联盟价值可增量维护（v(S) = 1 − Π_{i∈S}(1−p_i)），
+ * 故单排列 O(n)、总复杂度 O(512·n)，不依赖位掩码（无 n ≥ 33 溢出）。
+ */
+function shapleyByPermutationSampling(contributors: ContributorProb[], rng?: () => number): Map<string, number> {
+  const n = contributors.length;
+  const rand = rng ?? mulberry32(0xC0FFEE);
+  // 每位贡献者的边际贡献累加器（最终除以采样数 = 均值）
+  const sums = new Array<number>(n).fill(0);
+  // 个体失败概率 q_i = max(0, 1−p_i)（与 coalitionValue 同一口径）
+  const failProbs = contributors.map((c) => Math.max(0, 1 - c.prob));
+  for (let s = 0; s < SHAPLEY_PERMUTATION_SAMPLES; s += 1) {
+    // Fisher–Yates 均匀随机排列
+    const order = contributors.map((_, i) => i);
+    for (let i = n - 1; i > 0; i -= 1) {
+      const j = Math.floor(rand() * (i + 1));
+      const tmp = order[i]!;
+      order[i] = order[j]!;
+      order[j] = tmp;
+    }
+    // 沿前缀走：failAll = Π(1−p_i)，前缀价值 = 1 − failAll
+    let failAll = 1;
+    let v = 0;
+    for (const idx of order) {
+      failAll *= failProbs[idx]!;
+      const nv = 1 - failAll;
+      sums[idx] += nv - v;
+      v = nv;
+    }
+  }
+  const result = new Map<string, number>();
+  for (let i = 0; i < n; i += 1) result.set(contributors[i]!.agentId, sums[i]! / SHAPLEY_PERMUTATION_SAMPLES);
+  return result;
+}
+
+/**
+ * mulberry32：32 位确定性伪随机源（种子固定时序列完全可复现）。
+ * 供 Shapley 置换采样在无外部 rng 注入时使用。
+ */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 function popcount(x: number): number {

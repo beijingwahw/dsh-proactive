@@ -85,6 +85,16 @@ export interface SymbiosisBridgeHook {
   runSymbiosisTick(snapshot: KpiSnapshot): Promise<Insight[]>;
 }
 
+/**
+ * 25.0 容量规划顾问（由 index.ts 桥接到 CapacityPlanner）。
+ *
+ * 心跳 2.5 段调用：λ̂（世界模型预测到达率）× 服务统计（稳健平均延迟）
+ * 反解最小可行并发，不可行（ρ≥1）或建议并发超出当前 1.2 倍时返回
+ * capacity-warning 洞察（扩容/降载）；无数据或未启用时返回空数组。
+ * 失败由调用侧静默隔离，不阻断主链路。
+ */
+export type CapacityAdvisor = () => Insight[] | void;
+
 /** 自主心跳配置 */
 export interface AutonomyLoopConfig {
   /** 心跳间隔（毫秒） */
@@ -157,6 +167,8 @@ export class AutonomyLoop {
   private metaCognitionBridge?: MetaCognitionBridge;
   /** 第五阶段 Phase 2.5：共生进化桥接（可选注入，缺省不启用） */
   private symbiosis?: SymbiosisBridgeHook;
+  /** 25.0：容量规划顾问（可选注入；心跳 2.5 段消费，缺省零改动） */
+  private capacityAdvisor?: CapacityAdvisor;
   // 可选自主组件（向后兼容）
   private worldModel?: WorldModel;
   private curiosity?: CuriosityEngine;
@@ -188,6 +200,8 @@ export class AutonomyLoop {
     metaCognitionBridge?: MetaCognitionBridge;
     /** 第五阶段 Phase 2.5：共生进化桥接（可选，缺省不启用） */
     symbiosis?: SymbiosisBridgeHook;
+    /** 25.0：容量规划顾问（可选，缺省不启用） */
+    capacityAdvisor?: CapacityAdvisor;
     worldModel?: WorldModel;
     curiosity?: CuriosityEngine;
     governor?: SafetyGovernor;
@@ -205,6 +219,7 @@ export class AutonomyLoop {
     this.policyEvolution = params.policyEvolution;
     this.metaCognitionBridge = params.metaCognitionBridge;
     this.symbiosis = params.symbiosis;
+    this.capacityAdvisor = params.capacityAdvisor;
     this.worldModel = params.worldModel;
     this.curiosity = params.curiosity;
     this.governor = params.governor;
@@ -327,6 +342,22 @@ export class AutonomyLoop {
       }
     } catch {
       /* 预见失败不阻断 */
+    }
+
+    // ── 2.5 容量规划（25.0）：λ̂ × 服务统计 → 反解最小并发 ──
+    // 世界模型预测到达率 + 稳健延迟估计喂入排队论规划器（Erlang-C /
+    // Kingman 反解），不可行（ρ≥1）或建议并发超出当前 1.2 倍时产出
+    // capacity-warning 洞察回流目标引擎。未注入顾问时零改动；
+    // 失败静默（容量规划不阻断主链路）。
+    try {
+      if (this.capacityAdvisor) {
+        const capacityInsights = this.capacityAdvisor();
+        if (capacityInsights && capacityInsights.length > 0) {
+          insights.push(...capacityInsights);
+        }
+      }
+    } catch {
+      /* 容量规划失败不阻断 */
     }
 
     // ── 3. 汇总反思教训洞察（去重已消化的教训） ──

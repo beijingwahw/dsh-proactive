@@ -48,7 +48,7 @@ import { Reflector } from './reflector.js';
 import { attachDashboard } from './dashboard/index.js';
 import { DecisionEngine, type Decision, type SignalHistoryStats } from './decision-engine.js';
 import { ReflectionEngine } from './reflection-engine.js';
-import { GoalEngine, type Goal, type GoalSubtask } from './goal-engine.js';
+import { GoalEngine, type Goal, type GoalSubtask, type Insight } from './goal-engine.js';
 import { MetaCognitionEngine, type TuningAction } from './meta-cognition.js';
 import { StrategyEvolutionEngine } from './strategy-evolution.js';
 import { AutonomyLoop } from './autonomy-loop.js';
@@ -66,6 +66,12 @@ import { AbstractionEngine } from './core/abstraction.js';
 import { ScientistMind } from './core/scientist.js';
 import { TheoristEngine } from './core/theorist.js';
 import { ConformalIntervalEngine } from './core/conformal.js';
+import { CellularSheaf } from './core/sheaf-consensus.js';
+import { GittinsIndexTable, IndexScheduler } from './core/index-scheduling.js';
+import { BwKRouter } from './core/bandit-knapsack.js';
+import { PrivacyAccountant, perturbNumbers } from './core/differential-privacy.js';
+import { CapacityPlanner, type CapacityPlan } from './core/capacity-planning.js';
+import { renderSankeyHtml } from './symbiosis/observability.js';
 import { CuriosityEngine, type ExplorationProposal } from './curiosity-engine.js';
 import { SafetyGovernor } from './safety-governor.js';
 import { SymbiosisBridge } from './symbiosis/bridge.js';
@@ -403,6 +409,117 @@ export interface SchedulerConfig {
       /** 附加安全规约（在缺省规约集之上注册，id 幂等） */
       specs?: import('./core/runtime-verification.js').SafetySpec[];
     };
+    /**
+     * 17.0：最优传输配置（漂移检测看见分布的形状）。
+     * enabled 时元认知挂载形状感知传输漂移监视（滑动窗 vs 基准窗的
+     * Wasserstein-1 + 自适应阈值）——均值不变而形状巨变的「换了世界」
+     * 第一次可见（12.0 水位检测的盲区补位，13.0 保形区间的绊线）。
+     * 缺省关闭（零漂移）。
+     */
+    optimalTransport?: {
+      enabled?: boolean;
+      /** 监测的 KPI 列表（缺省 avgQuality + avgLatency） */
+      kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+      /** 滑动窗容量（缺省 50） */
+      windowSize?: number;
+      /** 基准窗容量（缺省 200） */
+      referenceSize?: number;
+      /** 漂移阈值的经验分位数（缺省 0.95） */
+      thresholdQuantile?: number;
+      /** 最小样本量（缺省 20） */
+      minSamples?: number;
+    };
+    /**
+     * 18.0：信息几何配置（进化在流形上行走）。
+     * enabled 时策略变异从坐标轴独立加噪升级为 Fisher 流形上的
+     * 自然变异：种群协方差主轴联合相关步 + KL 信任域封顶——
+     * 步长以 nat 计价，仿射重参数化下严格不变。缺省关闭（零漂移）。
+     */
+    informationGeometry?: {
+      enabled?: boolean;
+      /** KL 信任域半径 δ_max（Mahalanobis 上限；缺省 1.2） */
+      klBudget?: number;
+      /** 基础变异尺度 σ（缺省 0.5） */
+      stepScale?: number;
+    };
+    /**
+     * 19.0：最优停止配置（等待有了数学价格）。
+     * enabled 时决策引擎规则 C 的成本闸门从「urgency < 0.3 → defer」
+     * 魔数升级为继续价值裁决：紧急度流经验分布 + 向后归纳精确阈值
+     * （现值 ≥ V_{horizon} 即执行——占坑数学最优，否则等待有价）。
+     * 缺省关闭（零漂移——原魔数规则）。
+     */
+    optimalStopping?: {
+      enabled?: boolean;
+      /** defer 窗口内预计剩余机会数（继续价值口径；缺省 3） */
+      horizon?: number;
+      /** 开始裁决的最小经验样本（缺省 8） */
+      minSamples?: number;
+    };
+    /**
+     * 20.0：层论共识配置（分歧的形状可见）。
+     * enabled 时注册 sheaf_consensus Tool：多源信念融合从平均/投票
+     * 升级为胞腔层调和共识——「谁与谁、在哪些声明上应该一致」成为
+     * 一等数学对象，结构性分歧（无解的循环异议）第一次可检测。
+     * 缺省关闭（不注册即零漂移）。
+     */
+    sheafConsensus?: {
+      enabled?: boolean;
+      /** 障碍判定的加权失配容差（均方差口径；缺省 0.0025 ≈ 5% 标准差） */
+      misfitTolerance?: number;
+    };
+    /**
+     * 21.0：最优索引调度配置（可证明最优的模型调度）。
+     * enabled 时调度器动态选型升级为 Gittins 索引口径：对每个候选的
+     * Beta 后验精确计算折扣 bandit 最优指数（退休 MDP 三角形反向归纳，
+     * 无需不动点迭代），学习溢价随证据积累自动归零（探索自我终结）。
+     * preferred 短路与 avoidModels 语义不变。缺省关闭（零漂移）。
+     */
+    indexScheduling?: {
+      enabled: boolean;
+      /** 贴现因子 γ ∈ (0,1)（缺省 0.95） */
+      discount?: number;
+      /** 后验计数网格上限 α+β ≤ N（缺省 48） */
+      maxCount?: number;
+    };
+    /**
+     * 22.0：预算最优路由配置（Bandits with Knapsacks）。
+     * enabled 时治理器预算成为调度的一等约束：乐观可行性 + 预算感知
+     * 贪心选臂，影子价格由「剩余预算/剩余轮数」稀缺性内生涌现；
+     * 治理器未配置预算（tokenBudget=costBudget=0）时挂载不生效（走原路径）。
+     */
+    banditKnapsack?: {
+      enabled: boolean;
+      /** 乐观半径置信参数 α（越小越探索，缺省 0.05） */
+      ucbAlpha?: number;
+      /** 可行性松弛（缺省 0.25） */
+      feasibilitySlack?: number;
+      /** roundsRemaining 缺省时的视界估计（缺省 100） */
+      horizonDefault?: number;
+    };
+    /**
+     * 稳健统计配置（预留：运行时接线随后续版本进入）。
+     */
+    robustStatistics?: {
+      enabled: boolean;
+      alpha?: number;
+    };
+    /**
+     * 差分隐私配置（预留：运行时接线随后续版本进入）。
+     */
+    privacy?: {
+      enabled: boolean;
+      epsilon?: number;
+      delta?: number;
+    };
+    /**
+     * 容量规划配置（预留：运行时接线随后续版本进入）。
+     */
+    capacityPlanning?: {
+      enabled: boolean;
+      targetWaitMs?: number;
+      defaultScv?: number;
+    };
     /** 目标分解器注入（测试离线模拟） */
     decomposer?: import('./goal-engine.js').GoalDecomposer;
   };
@@ -719,6 +836,12 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     headerProvider,
     onKeyOutcome: (modelId, keyAttempt, success, status) => keyHealth.recordOutcome(modelId, keyAttempt, success, status),
     externalChat: hostChat,
+    // 23.0 稳健延迟统计：启用后每模型维护 RobustStream（mean → MoM →
+    // Catoni 随样本量自适应），getModelStatuses 输出 robustAvgLatencyMs /
+    // robustLatencyMethod；未启用时不传（字段不出现，零漂移）
+    ...(cfg.autonomy?.robustStatistics?.enabled === true
+      ? { robustLatency: { alpha: cfg.autonomy.robustStatistics.alpha } }
+      : {}),
   });
   for (const model of mergedModels) llm.registerModel(model);
   // strategist 模型确保已注册（决策调用专用）
@@ -731,6 +854,24 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
   for (const model of mergedModels) {
     const sources = describeKeySources(model.id);
     if (sources.length > 0) logger.info('模型 %s 密钥来源: %s', model.id, sources.join(', '));
+  }
+
+  // ── 24.0 差分隐私内核：遥测发布的预算记账（心智报告 / Sankey 能量流）──
+  // 启用后对外视图的数值叶子经 Laplace 扰动（每次发布折半分账，几何级数
+  // 保证总消耗 ≤ ε，超限返回 undefined 并保持原值）；id / 时间戳 / 计数类
+  // 键自动跳过。未启用时 accountant 为 undefined，一切导出路径逐位不变。
+  const privacyAccountant = cfg.autonomy?.privacy?.enabled === true
+    ? new PrivacyAccountant({
+        epsilon: cfg.autonomy.privacy.epsilon,
+        delta: cfg.autonomy.privacy.delta,
+      })
+    : undefined;
+  if (privacyAccountant) {
+    logger.info(
+      '24.0 差分隐私内核已启用：遥测数值发布经 Laplace 扰动（ε=%s, δ=%s）',
+      cfg.autonomy?.privacy?.epsilon ?? 3.0,
+      cfg.autonomy?.privacy?.delta ?? 1e-6,
+    );
   }
 
   // ── 能力层 ──
@@ -1162,6 +1303,9 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
 
   const metaCognition = new MetaCognitionEngine({
     ...cfg.autonomy?.metaCognition,
+    // 注入当前真实质量阈值读取器：successRate 退化的「放宽质量阈值」
+    // 规则以实际阈值为基线（反射引擎动态阈值 → 全局配置兜底）
+    getQualityThreshold: () => reflectionEngine.getCurrentThreshold() ?? cfg.qualityThreshold,
     applier: (action: TuningAction) => {
       // 元认知自调优落地：参数调整应用到真实引擎
       if (action.parameter === 'qualityThreshold') {
@@ -1385,6 +1529,95 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     }
   }
 
+  // ── 21.0 最优索引调度内核：候选排序的可证明最优口径 ──
+  // 质变基座：UCB 是乐观置信上界启发式、EFE 是变分近似，Gittins 索引是
+  // 折扣 bandit 的可证明最优策略（Weber 1992 对 Bernoulli+Beta 情形）。
+  // 启用后调度器动态选型对每个候选的 Beta 后验精确计算 ν(a,b)（退休
+  // MDP 三角形反向归纳，无需不动点迭代），按 effectiveIndex = ν ×
+  // availability 排序取榜首；学习溢价随证据积累自动归零（探索自我
+  // 终结，无需手设探索预算）。缺省关闭（零漂移——不挂载即原路径；
+  // preferred 短路与 avoidModels 语义不变）。
+  if (cfg.autonomy?.indexScheduling?.enabled === true) {
+    const indexScheduler = new IndexScheduler(
+      new GittinsIndexTable({
+        discount: cfg.autonomy.indexScheduling.discount,
+        maxCount: cfg.autonomy.indexScheduling.maxCount,
+      }),
+    );
+    modelScheduler.attachIndexScheduler(indexScheduler);
+    logger.info(
+      '21.0 最优索引调度内核已挂载：Gittins 指数精确计算（discount=%s, maxCount=%s）',
+      cfg.autonomy.indexScheduling.discount ?? 0.95,
+      cfg.autonomy.indexScheduling.maxCount ?? 48,
+    );
+  }
+
+  // ── 22.0 预算最优路由内核：Bandits with Knapsacks ──
+  // 质变基座：固定 costWeight 只是影子价格 λ 的一次性猜测，本内核让
+  // 预算约束直接参与在线选臂：质量走经验伯恩斯坦乐观上界（复用 12.0），
+  // 可行性按「剩余预算/剩余轮数」×(1+slack) 判定，λ 从不可行高质臂与
+  // 选中臂的混合 LP 顶点内生涌现；无可行臂时选最廉臂止血（负载卸载，
+  // 而非假装最优仍存在）。治理器未配置预算时 budgetSnapshot() 恒
+  // undefined，路由不介入（走原路径）。缺省关闭（零漂移）。
+  if (cfg.autonomy?.banditKnapsack?.enabled === true) {
+    const bwKRouter = new BwKRouter({
+      ucbAlpha: cfg.autonomy.banditKnapsack.ucbAlpha,
+      feasibilitySlack: cfg.autonomy.banditKnapsack.feasibilitySlack,
+      horizonDefault: cfg.autonomy.banditKnapsack.horizonDefault,
+    });
+    modelScheduler.attachBwKRouter(bwKRouter, () => governor.budgetSnapshot());
+    logger.info(
+      '22.0 预算最优路由内核已挂载：Bandits with Knapsacks（ucbAlpha=%s, feasibilitySlack=%s, horizonDefault=%s）',
+      cfg.autonomy.banditKnapsack.ucbAlpha ?? 0.05,
+      cfg.autonomy.banditKnapsack.feasibilitySlack ?? 0.25,
+      cfg.autonomy.banditKnapsack.horizonDefault ?? 100,
+    );
+  }
+
+  // ── 17.0 最优传输内核：漂移检测看见分布的形状 ──
+  // 质变基座：12.0 的 e-过程 / 置信序列盯的是均值水位——均值不变、
+  // 形状巨变的分布（双峰化 / 尾部变厚）完全隐形。启用后元认知挂载
+  // Wasserstein-1 形状漂移监视（滑动窗 vs 基准窗 + 历史分位自适应
+  // 阈值）：「水平没变但世界换了」第一次可见；保形区间（13.0）的
+  // 覆盖前提在漂移下失效——本内核是其绊线。缺省关闭（零漂移）。
+  if (cfg.autonomy?.optimalTransport?.enabled === true) {
+    metaCognition.attachTransportDrift({
+      kpis: cfg.autonomy.optimalTransport.kpis,
+      windowSize: cfg.autonomy.optimalTransport.windowSize,
+      referenceSize: cfg.autonomy.optimalTransport.referenceSize,
+      thresholdQuantile: cfg.autonomy.optimalTransport.thresholdQuantile,
+      minSamples: cfg.autonomy.optimalTransport.minSamples,
+    });
+  }
+
+  // ── 18.0 信息几何内核：进化在流形上行走 ──
+  // 质变基座：坐标轴独立变异把「坐标怎么标」当成「空间怎么弯」，
+  // 基因间相关结构不可见、步长无信息单位。启用后策略变异升级为
+  // Fisher 流形自然变异：种群协方差主轴联合相关步（有利基因组合
+  // 完整传递）+ KL 信任域（步长以 nat 计价，仿射重参数化不变）。
+  // 缺省关闭（零漂移——原坐标高斯变异）。
+  if (cfg.autonomy?.informationGeometry?.enabled === true) {
+    strategyEvolution.attachInformationGeometry({
+      klBudget: cfg.autonomy.informationGeometry.klBudget,
+      stepScale: cfg.autonomy.informationGeometry.stepScale,
+    });
+  }
+
+  // ── 19.0 最优停止内核：等待有了数学价格 ──
+  // 质变基座：规则 C 的「urgency < 0.3 且成本 > 5000 → defer 5 分钟」
+  // 是无最优性依据的魔数。启用后高成本信号是否现在占坑由继续价值
+  // 裁决：紧急度流经验分布 + 向后归纳精确阈值 V_{horizon}（先知
+  // 不等式审计成色）——defer 从「不敢做」升维为「等下一个机会期望
+  // 更优」。缺省关闭（零漂移——原魔数规则）。
+  if (cfg.autonomy?.optimalStopping?.enabled === true) {
+    decisionEngine.attachOptimalStopper({
+      horizon: cfg.autonomy.optimalStopping.horizon,
+      minSamples: cfg.autonomy.optimalStopping.minSamples,
+    });
+  }
+
+  // ── 20.0 层论共识内核：分歧的形状可见（Tool 注册见下方 tool 列表） ──
+
   /** KPI 采集器：从真实引擎状态聚合 KPI 快照 */
   const collectKpi = () => {
     const modelStatuses = llm.getModelStatuses();
@@ -1581,6 +1814,79 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     return signal.id;
   };
 
+  // ── 25.0 容量规划内核：心跳 2.5 段的容量反解（λ̂ × 服务统计 → 最小并发）──
+  // λ̂ = 世界模型 60 秒窗口预测到达数之和 / 60（每秒）；服务时长 = 各模型
+  // 稳健平均延迟（23.0 robustAvgLatencyMs，未启用时回退 avgLatency）按
+  // totalCalls 加权平均（无权重数据时简单平均）；当前并发 = 各模型
+  // maxConcurrency 之和（取不到兜底 4）。Erlang-C / Kingman 反解最小可行
+  // 并发，不可行（ρ≥1）或建议并发 > 当前×1.2 时产出 capacity-warning
+  // 洞察回流目标引擎。未启用时 advisor 不注入（自主循环零改动）。
+  const capacityPlanner = cfg.autonomy?.capacityPlanning?.enabled === true
+    ? new CapacityPlanner({
+        targetWaitMs: cfg.autonomy.capacityPlanning.targetWaitMs,
+        defaultScv: cfg.autonomy.capacityPlanning.defaultScv,
+      })
+    : undefined;
+  /** 最近一次容量规划产物（introspect 审计口径；未启用/未产出时恒 undefined） */
+  let lastCapacityPlan: CapacityPlan | undefined;
+  const runCapacityPlanning = (): Insight[] => {
+    if (!capacityPlanner) return [];
+    // λ̂：expectedCount 为趋势/时段热度修正后的调整值；无观测类型无从规划
+    const predictions = worldModel.predictArrivals(60_000);
+    if (predictions.length === 0) return [];
+    const totalArrivals = predictions.reduce((sum, p) => sum + (Number.isFinite(p.expectedCount) ? p.expectedCount : 0), 0);
+    if (totalArrivals <= 0) return [];
+    const predictedArrivalPerSec = totalArrivals / 60;
+    // 服务时长：稳健延迟优先（23.0），按调用量加权；无任何有限延迟数据返回 []
+    const statuses = llm.getModelStatuses();
+    let latencyWeightedSum = 0;
+    let weightSum = 0;
+    let unweightedSum = 0;
+    let unweightedCount = 0;
+    for (const status of statuses) {
+      const latency = status.robustAvgLatencyMs ?? status.avgLatency;
+      if (!Number.isFinite(latency) || latency <= 0) continue;
+      if (status.totalCalls > 0) {
+        latencyWeightedSum += latency * status.totalCalls;
+        weightSum += status.totalCalls;
+      } else {
+        unweightedSum += latency;
+        unweightedCount += 1;
+      }
+    }
+    const serviceMeanMs = weightSum > 0
+      ? latencyWeightedSum / weightSum
+      : unweightedCount > 0
+        ? unweightedSum / unweightedCount
+        : undefined;
+    if (serviceMeanMs === undefined) return [];
+    // 当前并发：各模型并发上限之和（异常配置兜底 4，与调度器 computeParallelism 的兜底口径一致）
+    const currentConcurrency = statuses.reduce((sum, s) => sum + (s.maxConcurrency > 0 ? s.maxConcurrency : 0), 0) || 4;
+    const plan = capacityPlanner.plan({ predictedArrivalPerSec, serviceMeanMs, currentConcurrency });
+    lastCapacityPlan = plan;
+    if (plan.feasible && plan.headroom <= 1.2) return [];
+    const severity = !plan.feasible ? 0.9 : Math.min(0.85, 0.5 + (plan.headroom - 1.2));
+    return [
+      {
+        source: 'meta-cognition',
+        category: 'capacity-warning',
+        taskType: undefined,
+        severity,
+        message: `容量规划：预测到达率 ${predictedArrivalPerSec.toFixed(3)}/s × 平均服务 ${Math.round(serviceMeanMs)}ms，当前并发 ${plan.currentConcurrency}（利用率 ρ=${plan.rho}）；反解建议并发 ${plan.recommendedConcurrency}，预计平均等待 ${plan.feasible ? `${plan.expectedWaitMs}ms` : `超出目标 ${plan.targetWaitMs}ms（不可达）`}`,
+        suggestion: !plan.feasible
+          ? '并发上限内无法满足目标等待：立即扩容模型并发上限或对低价值信号降载，防止队列排队失控'
+          : `建议把模型并发上限扩至 ${plan.recommendedConcurrency}（当前 ${plan.currentConcurrency}），或对低价值信号降载以守住 ${plan.targetWaitMs}ms 等待目标`,
+      },
+    ];
+  };
+  if (capacityPlanner) {
+    logger.info(
+      '25.0 容量规划内核已启用：心跳 2.5 段反解最小并发（targetWaitMs=%s, defaultScv=%s）',
+      cfg.autonomy?.capacityPlanning?.targetWaitMs ?? 5000,
+      cfg.autonomy?.capacityPlanning?.defaultScv ?? 2.0,
+    );
+  }
+
   const autonomyLoop = new AutonomyLoop({
     config: {
       ...cfg.autonomy?.loop,
@@ -1610,6 +1916,8 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     curiosity,
     governor,
     dispatchExploration,
+    // 25.0 容量规划桥接（心跳 2.5 段：λ̂ × 服务统计 → 反解最小并发 → 扩容洞察）
+    capacityAdvisor: capacityPlanner ? runCapacityPlanning : undefined,
     // 第三阶段（质级升级）：调度策略进化桥接
     // 每轮周期：① 喂数金丝雀（决策反馈真实成败/质量 → 自动回滚/晋升）
     // ② 刷新沙盒素材（任务集/校准表/模型快照与操作环同步）→ 触发进化周期
@@ -1663,7 +1971,15 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
             symbiosisTickCount += 1;
             if (sankeyPath && symbiosisTickCount % sankeyEveryNTicks === 0) {
               try {
-                fs.writeFileSync(sankeyPath, symbiosisBridge.sankeyHtml());
+                // 24.0 差分隐私：能量流数值（links[].amount / totals 等）经
+                // Laplace 扰动后再渲染——账本口径不再裸暴露单一模型/渠道的
+                // 精确金额；seqRange / count 等键被 SKIP 正则自动跳过，
+                // 预算耗尽后剩余字段原样返回（status 可审计）。
+                const sankeyReport = symbiosisBridge.sankey();
+                const safeReport = privacyAccountant
+                  ? perturbNumbers(sankeyReport, privacyAccountant)
+                  : sankeyReport;
+                fs.writeFileSync(sankeyPath, renderSankeyHtml(safeReport));
                 broadcast({ type: 'sankey-updated', path: sankeyPath, tick: symbiosisTickCount });
                 logger.debug('能量 Sankey 已落盘: %s', sankeyPath);
               } catch (err) {
@@ -2199,22 +2515,27 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       limit: { type: 'number', description: 'history 返回条数上限，缺省 10' },
     },
     handler: async (args) => {
+      // 24.0 差分隐私：报告数值叶子经 Laplace 扰动后出站（id/时间戳/计数
+      // 键自动跳过；未启用 privacy 时原样返回，逐位不变）。generate 分支的
+      // 人类可读版从扰动后的报告渲染，保证文本与对象口径一致。
+      const privacyView = <T,>(view: T): T => (privacyAccountant ? perturbNumbers(view, privacyAccountant) : view);
       switch (args.action) {
         case 'generate': {
           const report = await selfModel.generateMentalReport();
+          const safeReport = privacyView(report);
           broadcast({ type: 'mental-report', reportIndex: report.reportIndex, status: 'generated', stabilityScore: report.systemStability.stabilityScore });
           return {
-            report,
-            formatted: selfModel.formatReport(report),
+            report: safeReport,
+            formatted: selfModel.formatReport(safeReport),
           };
         }
         case 'latest': {
           const report = selfModel.getLatestReport();
           if (!report) throw new ToolError('暂无心智报告，先执行 action=generate');
-          return { report };
+          return { report: privacyView(report) };
         }
         case 'history':
-          return { history: selfModel.getReportHistory().slice(-Math.max(1, args.limit ?? 10)) };
+          return { history: privacyView(selfModel.getReportHistory().slice(-Math.max(1, args.limit ?? 10))) };
         case 'trend':
           return { trend: selfModel.getTrendSeries() };
         case 'formatted': {
@@ -2602,8 +2923,19 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
         case 'reset-circuit':
           governor.resetCircuit();
           return { circuitState: governor.getCircuitState() };
-        case 'introspect':
-          return { introspection: autonomyLoop.introspect() };
+        case 'introspect': {
+          // 21.0/22.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现，
+          // 保持返回对象简洁）
+          const kernelDiagnostics = modelScheduler.getAttachedDiagnostics();
+          return {
+            introspection: autonomyLoop.introspect(),
+            ...(kernelDiagnostics.indexScheduling ? { indexScheduling: kernelDiagnostics.indexScheduling } : {}),
+            ...(kernelDiagnostics.lastBwK ? { banditKnapsack: kernelDiagnostics.lastBwK } : {}),
+            // 24.0/25.0：隐私预算账本快照与最近容量规划产物（未启用/未产出时不出现）
+            ...(privacyAccountant ? { privacy: privacyAccountant.status() } : {}),
+            ...(lastCapacityPlan ? { capacity: lastCapacityPlan } : {}),
+          };
+        }
         default:
           throw new ToolError(`未知 action: ${args.action}`);
       }
@@ -2641,6 +2973,68 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       }
     },
   });
+
+  // 15. sheaf_consensus — 层论共识（20.0：多源信念结构化融合，缺省关闭）
+  if (cfg.autonomy?.sheafConsensus?.enabled === true) {
+    tools.register({
+      name: 'sheaf_consensus',
+      description:
+        '层论共识：把多源信念（模型估计 / 市场价 / 直接观测）按「谁与谁、在哪些声明上应该一致」的结构调和为全局共识——'
+        + '平均化会编造共识（0.9 与 0.1 平均成 0.5，无人真的这么认为），本工具在结构性分歧时明确说「无解」并指出最大翻供者',
+      parameters: {
+        vertices: {
+          type: 'array',
+          description: '顶点声明：[{id, dim}]（dim = 该源的信念向量维度，标量源 dim=1）',
+          required: true,
+        },
+        edges: {
+          type: 'array',
+          description:
+            '一致性约束边：[{a, b, sharedA?, sharedB?}]——a/b 为顶点 id；'
+            + 'sharedA/sharedB 为两侧参与共享的坐标下标表（长度相等；省略 = 同序全维度等值约束）',
+        },
+        observations: {
+          type: 'array',
+          description: '观测锚点：[{id, values, weight?}]（values 长度 = 顶点 dim；weight = 置信权重，缺省 1）',
+          required: true,
+        },
+      },
+      handler: (args) => {
+        const vertices = Array.isArray(args.vertices) ? args.vertices : [];
+        const edges = Array.isArray(args.edges) ? args.edges : [];
+        const observations = Array.isArray(args.observations) ? args.observations : [];
+        if (vertices.length === 0 || observations.length === 0) {
+          throw new ToolError('sheaf_consensus 需要 vertices 与 observations（至少各 1 项）');
+        }
+        const sheaf = new CellularSheaf();
+        for (const v of vertices) {
+          if (typeof v?.id !== 'string' || typeof v?.dim !== 'number') throw new ToolError('顶点格式：{id: string, dim: number}');
+          sheaf.addVertex(v.id, v.dim);
+        }
+        for (const e of edges) {
+          if (typeof e?.a !== 'string' || typeof e?.b !== 'string') throw new ToolError('边格式：{a, b, sharedA?, sharedB?}');
+          try {
+            sheaf.addEdge({
+              a: e.a,
+              b: e.b,
+              sharedA: Array.isArray(e.sharedA) ? e.sharedA.map(Number) : undefined,
+              sharedB: Array.isArray(e.sharedB) ? e.sharedB.map(Number) : undefined,
+            });
+          } catch (err) {
+            throw new ToolError(`边 ${e.a}↔${e.b} 无效: ${(err as Error).message}`);
+          }
+        }
+        const anchors = observations
+          .filter((o: { id?: unknown; values?: unknown }) => typeof o?.id === 'string' && Array.isArray(o.values))
+          .map((o: { id: string; values: unknown[]; weight?: unknown }) => ({
+            id: o.id,
+            values: o.values.map(Number),
+            weight: typeof o.weight === 'number' ? o.weight : 1,
+          }));
+        return sheaf.harmonize(anchors, { misfitTolerance: cfg.autonomy?.sheafConsensus?.misfitTolerance });
+      },
+    });
+  }
 
   // ─────────────────────────── 官方 Tool 注册链路桥接 ───────────────────────────
   // 宿主加载了 @deepseek-ai/dsh-tools（ctx.tools 服务）时，把内部 14 个 Tool
@@ -2813,6 +3207,24 @@ export * from './core/quality-diversity.js';
 export * from './core/runtime-verification.js';
 // ── 16.0 Shapley 归因内核：公理化公平分配 + 任意时刻有效置信区间 ──
 export * from './core/shapley.js';
+// ── 17.0 最优传输内核：Wasserstein 漂移 + Sinkhorn + 重心（分布形状可见）──
+export * from './core/optimal-transport.js';
+// ── 18.0 信息几何内核：Fisher 度量自然变异 + KL 信任域（步长以 nat 计价）──
+export * from './core/information-geometry.js';
+// ── 19.0 最优停止内核：先知不等式 + 向后归纳 + 机会停止器（等待有数学价格）──
+export * from './core/optimal-stopping.js';
+// ── 20.0 层论共识内核：胞腔层拉普拉斯 + 调和共识 + 结构性障碍检测 ──
+export * from './core/sheaf-consensus.js';
+// ── 21.0 最优索引调度内核：Gittins 指数精确计算（退休 MDP 三角形反向归纳）──
+export * from './core/index-scheduling.js';
+// ── 22.0 预算最优路由内核：Bandits with Knapsacks（影子价格从预算稀缺性内生涌现）──
+export * from './core/bandit-knapsack.js';
+// ── 23.0 稳健统计内核：Catoni + Median-of-Means（重尾延迟的 sub-Gaussian 估计）──
+export * from './core/robust-statistics.js';
+// ── 24.0 差分隐私内核：Laplace/Gaussian 机制 + Rényi-DP 记账（遥测不裸暴露个体）──
+export * from './core/differential-privacy.js';
+// ── 25.0 容量规划内核：Erlang-C/Kingman 反解最小并发 + Little 定律自检 ──
+export * from './core/capacity-planning.js';
 // 4.0 弹性内核：熔断器 / 指数退避 / 错误分型（可靠执行共享组件）
 export {
   CircuitBreaker,

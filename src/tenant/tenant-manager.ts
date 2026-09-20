@@ -24,7 +24,7 @@ import path from 'node:path';
 import { ConfigError } from '../errors.js';
 import { LongTermMemory } from '../memory/long-term-memory.js';
 import type { ModelLongTermProfile } from '../memory/long-term-memory.js';
-import type { CryptoEngine } from '../security/crypto-engine.js';
+import { CryptoEngine, type EncryptedField } from '../security/crypto-engine.js';
 import type { Signal } from '../sentinel.js';
 
 /** 租户静态配置 */
@@ -348,20 +348,26 @@ export class TenantManager {
 
   // ─────────────────────────── 内部实现 ───────────────────────────
 
-  /** 加载注册表（不存在时初始化） */
+  /** 加载注册表（不存在时初始化；检测到加密结构时先解密再校验） */
   private loadRegistry(): TenantRegistry {
     if (!fs.existsSync(this.registryPath)) {
       return { version: 1, tenants: [], globalDefaults: { ...DEFAULT_GLOBALS } };
     }
     try {
       const raw = JSON.parse(fs.readFileSync(this.registryPath, 'utf-8'));
-      if (!Array.isArray(raw.tenants)) {
+      // 读回时检测到字段级加密结构（__encrypted 标记）→ 先解密再走原校验；
+      // cryptoEngine 缺失时不做解密（向后兼容：旧明文注册表照常加载）
+      const data =
+        this.cryptoEngine && CryptoEngine.hasEncryptedFields(raw)
+          ? this.cryptoEngine.decryptSensitiveFields(raw).result
+          : raw;
+      if (!Array.isArray(data.tenants)) {
         throw new Error('注册表结构非法：缺少 tenants 数组');
       }
       return {
-        version: raw.version ?? 1,
-        tenants: raw.tenants,
-        globalDefaults: { ...DEFAULT_GLOBALS, ...raw.globalDefaults },
+        version: data.version ?? 1,
+        tenants: data.tenants,
+        globalDefaults: { ...DEFAULT_GLOBALS, ...data.globalDefaults },
       };
     } catch (err) {
       throw new ConfigError(`租户注册表加载失败: ${this.registryPath}`, {
@@ -370,12 +376,60 @@ export class TenantManager {
     }
   }
 
-  /** 持久化注册表（原子写入） */
+  /** 持久化注册表（原子写入；apiKey 经字段级加密后落盘，不再明文存储） */
   private persistRegistry(): void {
     fs.mkdirSync(this.dataDir, { recursive: true });
     const tmp = `${this.registryPath}.tmp.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(this.registry, null, 2), 'utf-8');
+    fs.writeFileSync(tmp, JSON.stringify(this.encryptRegistryForDisk(), null, 2), 'utf-8');
     fs.renameSync(tmp, this.registryPath);
+  }
+
+  /**
+   * 生成落盘载荷：存在加密引擎时对注册表做字段级加密（apiKey 等敏感
+   * 字段封为 __encrypted 结构）；加密失败降级为明文写并在 stderr 警告
+   * （租户持久化是关键路径，不允许因加密故障整体失败）。
+   */
+  private encryptRegistryForDisk(): TenantRegistry {
+    if (!this.cryptoEngine) return this.registry;
+    try {
+      // 主路径：引擎的敏感字段加密（实例 sensitiveFields 通常已含 apiKey）
+      const { result } = this.cryptoEngine.encryptSensitiveFields(this.registry);
+      // 兜底路径：引擎 sensitiveFields 未覆盖 apiKey 时，手动补封剩余明文字段
+      return this.sealRemainingApiKeys(result) as TenantRegistry;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[tenant-manager] 警告: 注册表字段加密失败，降级为明文写入: ${message}\n`);
+      return this.registry;
+    }
+  }
+
+  /**
+   * 兜底封印：深扫载荷中仍是明文字符串的 apiKey 字段（引擎的
+   * sensitiveFields 配置可能不含 apiKey），逐个用引擎的整段加密原语
+   * 封为与 EncryptedField 同构的结构（__encrypted 标记 + keyVersion），
+   * 读回路径 decryptSensitiveFields 可统一解密。不修改原对象。
+   */
+  private sealRemainingApiKeys(node: unknown): unknown {
+    if (node === null || typeof node !== 'object') return node;
+    if (Array.isArray(node)) return node.map((item) => this.sealRemainingApiKeys(item));
+    if ((node as { __encrypted?: boolean }).__encrypted === true) return node;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'apiKey' && typeof value === 'string' && value.length > 0) {
+        const sealed = this.cryptoEngine!.encryptFile(value);
+        out[key] = {
+          __encrypted: true,
+          algorithm: sealed.algorithm,
+          iv: sealed.iv,
+          tag: sealed.tag,
+          ciphertext: sealed.ciphertext,
+          keyVersion: sealed.keyVersion,
+        } satisfies EncryptedField;
+      } else {
+        out[key] = this.sealRemainingApiKeys(value);
+      }
+    }
+    return out;
   }
 
   /** 解析租户记忆库路径 */

@@ -5,7 +5,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-339933?logo=nodedotjs&logoColor=white)](#installation)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-8250df)](https://github.com/topics/dsh-plugin)
 
-> **Proactive Intelligence scheduling plugin** — a multi-model collaborative scheduling system for the DeepSeek Harness (DSH) ecosystem: it perceives, decides, and evolves on its own, with a built-in **Scientist / Theorist dual mind**, a **cognitive energy symbiosis economy**, and **fourteen phase-change kernels (evidence → guarantee layer: anytime-valid / conformal / quality-diversity / formal safety / fair attribution)**.
+> **Proactive Intelligence scheduling plugin** — a multi-model collaborative scheduling system for the DeepSeek Harness (DSH) ecosystem: it perceives, decides, and evolves on its own, with a built-in **Scientist / Theorist dual mind**, a **cognitive energy symbiosis economy**, and **eighteen phase-change kernels (evidence → geometry & topology layer: anytime-valid / conformal / quality-diversity / formal safety / fair attribution / optimal transport / information geometry / optimal stopping / sheaf consensus)**.
 >
 > English | [中文](./README.md)
 
@@ -33,12 +33,14 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 │  Operational: signal→decide→execute→reflect 10-step pipeline │
 │  Evolution: policy evolver + sandbox + canary (policy/)      │
 │  Meta outer: self-model → conservative tune → rollback (meta/)│
-├─ Kernel Stack (core/) — fourteen kernels, 3.0 → 16.0 ────────┤
+├─ Kernel Stack (core/) — eighteen kernels, 3.0 → 20.0 ───────┤
 │  Evidence 3.0  Resilience 4.0  Causal 5.0  Free-Energy 6.0   │
 │  Deliberation 7.0  Metareasoning 8.0  Abstraction 9.0        │
 │  Scientist 10.0  Theorist 11.0                               │
 │  Anytime Evidence 12.0  Conformal 13.0  Quality-Diversity 14.0│
 │  Runtime Verification 15.0  Shapley Attribution 16.0          │
+│  Optimal Transport 17.0  Info-Geometry 18.0                  │
+│  Optimal Stopping 19.0  Sheaf Consensus 20.0                  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -60,7 +62,13 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 - **Runtime-verification kernel** ([core/runtime-verification.ts](./src/core/runtime-verification.ts)): LTLf specification monitoring — **safety specs made formal, verdicts carry proofs**. The default spec set (no failure storms / commands must be answered / periodic heartbeat / authorize-before-execute) compiles into four monitor atoms; violation reports carry full evidence traces and counterexample witnesses; severity-based escalation (critical → Kill Switch, warn → circuit breaker, info → audit)
 - **Shapley kernel** ([core/shapley.ts](./src/core/shapley.ts)): axiomatic fair attribution — **value split backed by a mathematical theorem**. Efficiency / symmetry / dummy / additivity axioms all hold exactly; permutation sampling with anytime-valid confidence intervals (bounds while you sample, guaranteed whether you stop or not); synergy detection automatically flags 1+1>2 positive synergies and free-riding negative ones
 
-### Kernel Stack (core/, 3.0 → 16.0)
+### Optimal Transport / Information Geometry / Optimal Stopping / Sheaf Consensus (17.0 → 20.0)
+- **Optimal-transport kernel** ([core/optimal-transport.ts](./src/core/optimal-transport.ts)): Wasserstein distance + Sinkhorn — **drift detection sees the shape of the distribution**. Exact 1-D W₁ (quantile coupling, O(n log n)), log-domain stabilized Sinkhorn (arbitrary cost matrices), Wasserstein barycenter (shape-preserving distribution fusion); once the shape-aware drift monitor (sliding window vs disjoint reference + adaptive quantile threshold) is mounted on meta-cognition — **"the mean didn't move but the world changed" becomes visible for the first time** (fills the blind spot of the 12.0 watermark detectors, tripwire for 13.0 conformal validity)
+- **Information-geometry kernel** ([core/information-geometry.ts](./src/core/information-geometry.ts)): Fisher metric + KL trust region — **evolution walks on the manifold**. Strategy mutation upgrades from per-coordinate noise to joint correlated steps along the population-covariance principal axes (favorable gene combinations transfer whole); step size is priced in nats (Mahalanobis-capped KL trust region) and **strictly invariant under affine reparameterization** (numerically verified: identical to 6 decimals after 100×/0.01× coordinate rescaling); condition number / effective dimension make the search geometry itself observable
+- **Optimal-stopping kernel** ([core/optimal-stopping.ts](./src/core/optimal-stopping.ts)): prophet inequality + backward induction — **waiting has a mathematical price**. Exact stopping-value recursion over the empirical distribution (V_k = E[max(X, V_{k+1})]), prophet benchmark (exact order-statistics E[max]), Samuel-Cahn single-threshold rule (≥ ½ of prophet for any distribution), secretary 1/e rule and Bruss' odds algorithm; once mounted on decision-engine Rule C, **defer/execute for costly signals upgrades from the "urgency < 0.3" magic number to a continuation-value verdict** (act iff current value ≥ V_{horizon} — mathematically optimal to grab the slot, otherwise waiting pays)
+- **Sheaf-consensus kernel** ([core/sheaf-consensus.ts](./src/core/sheaf-consensus.ts)): cellular-sheaf Laplacian + harmonic consensus — **the shape of disagreement is visible**. "Who must agree with whom, on which claims" becomes a first-class mathematical object (vertex stalks + edge restriction maps); weighted harmonic consensus (dual solve: soft mediation + best fit on the perfect-consensus manifold) reports the consensus assignment, per-source walk-back distances (outlier localization), and **structural-obstruction detection** — under circular hard constraints with contradictory observations (0.9/0.1/0.5) averaging says a happy 0.5, this kernel says "no solution exists, resolve the contradiction first"; the `sheaf_consensus` Tool lets the LLM call structured belief fusion at reasoning time
+
+### Kernel Stack (core/, 3.0 → 20.0)
 | Kernel | Version | In one line |
 |------|------|--------|
 | evidence.ts | 3.0 | Unified evidence language: Wilson bounds / time decay / evidence ranking, spread across all memory layers |
@@ -77,6 +85,10 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 | quality-diversity.ts | 14.0 | Quality-diversity: MAP-Elites behavioral archive (see above) |
 | runtime-verification.ts | 15.0 | Runtime verification: LTLf spec monitoring + proof-carrying verdicts (see above) |
 | shapley.ts | 16.0 | Shapley: axiomatic fair attribution + anytime-valid confidence intervals (see above) |
+| optimal-transport.ts | 17.0 | Optimal transport: Wasserstein drift + Sinkhorn + barycenter (see above) |
+| information-geometry.ts | 18.0 | Information geometry: Fisher-metric natural mutation + KL trust region (see above) |
+| optimal-stopping.ts | 19.0 | Optimal stopping: prophet inequality + backward induction + opportunity stopper (see above) |
+| sheaf-consensus.ts | 20.0 | Sheaf consensus: cellular-sheaf Laplacian + harmonic consensus + obstruction detection (see above) |
 
 ### Cognitive Energy Symbiosis Economy (symbiosis/)
 - **Energy ledger** (ledger.ts): cognitive energy cannot be forged — global conservation via double-entry bookkeeping, every transfer sha256-chained for audit and replay, a Gini coefficient measures ecosystem health
@@ -156,9 +168,9 @@ pnpm build
 - **Multi-key failover**: when several candidate keys exist for a vendor, auth failures (401/403) or quota exhaustion (429) automatically rotate to the next candidate key, upgraded with **health-aware routing** — keys are selected by success/failure statistics, with a 1-minute cooldown for 429 and a 5-minute cooldown for 401/403, auto-recovering on success; users can reorder key usage via the `manage_keys` tool (persisted across restarts); startup logs report each model's key sources (never the key values), and runtime key health is inspectable via `query_memory keys`;
 - For a single vendor only, use the per-vendor patches under `patches/domestic-models/`; regenerate with `pnpm generate:patches`.
 
-All runtime options (sentinel / encryption / sync / consensus / hot reload / tenants / autonomy loop `autonomy` / host fusion `hostFusion`) are likewise built into [cordis.patch.yml](./cordis.patch.yml) and need no changes; symbiosis options live under `autonomy.symbiosis` (futarchy voting, energy feedback, etc., off by default). Guarantee-layer kernel options 12.0-16.0 are also off by default (zero drift): `autonomy.anytimeEvidence` (α / reference watermark), `autonomy.conformal` (α / calibration capacity / threshold risk & confidence), `autonomy.qualityDiversity` (explore rate), `autonomy.runtimeVerification` (additional `specs`).
+All runtime options (sentinel / encryption / sync / consensus / hot reload / tenants / autonomy loop `autonomy` / host fusion `hostFusion`) are likewise built into [cordis.patch.yml](./cordis.patch.yml) and need no changes; symbiosis options live under `autonomy.symbiosis` (futarchy voting, energy feedback, etc., off by default). Guarantee-layer kernel options 12.0-16.0 and geometry/topology-layer options 17.0-20.0 are also off by default (zero drift): `autonomy.anytimeEvidence` (α / reference watermark), `autonomy.conformal` (α / calibration capacity / threshold risk & confidence), `autonomy.qualityDiversity` (explore rate), `autonomy.runtimeVerification` (additional `specs`), `autonomy.optimalTransport` (monitored KPIs / windows / threshold quantile), `autonomy.informationGeometry` (KL budget / step scale), `autonomy.optimalStopping` (opportunity horizon / min samples), `autonomy.sheafConsensus` (obstruction misfit tolerance).
 
-## Tool Catalog (18)
+## Tool Catalog (18 + sheaf consensus Tool, off by default)
 
 | Group | Tools |
 |------|------|
@@ -167,6 +179,7 @@ All runtime options (sentinel / encryption / sync / consensus / hot reload / ten
 | Meta-cognition | `mental_report` · `self_knowledge` · `meta_cognition` |
 | Autonomy governance | `manage_autonomy` · `manage_keys` |
 | Infrastructure | `manage_tenants` · `manage_encryption` · `manage_sync` · `manage_consensus` · `manage_hot_reload` |
+| Sheaf consensus (off by default) | `sheaf_consensus` (20.0: structured multi-source belief fusion + structural-disagreement detection, enable via `autonomy.sheafConsensus.enabled`) |
 
 Get the seven-dimension introspection report via `manage_autonomy`:
 
@@ -189,7 +202,7 @@ Other common operations:
 - `manage_autonomy`: `start` / `stop` / `tick` / `kill-switch` / `revive` / `reset-circuit`
 - `query_memory`: `world-model` / `curiosity` / `governance` / `patterns` / `lessons` / `keys`, etc.
 
-## Offline Verification (29, zero API keys)
+## Offline Verification (31, zero API keys)
 
 Every kernel and subsystem has an offline end-to-end verification script (`node scripts/verify-*.mjs`):
 
@@ -200,6 +213,8 @@ node scripts/verify-symbiosis.mjs      # Symbiosis: ledger / market / 3-agent 6-
 node scripts/verify-self-evolution.mjs # Self-evolution: adoption / fast path / three hedging mechanisms
 node scripts/verify-anytime-evidence.mjs # Anytime evidence: CS time-uniformity / e-process verdicts / e-BH FDR
 node scripts/verify-shapley.mjs        # Shapley: four axioms / confidence intervals / synergy detection
+node scripts/verify-frontier-kernels.mjs # Geometry & topology 17.0-20.0: analytic-solution checks / affine invariance / prophet 2/3 / sheaf obstruction
+node scripts/verify-frontier-wiring.mjs # Geometry & topology wiring: real engines end-to-end (drift insight / natural mutation / mathematical defer)
 ```
 
 | Group | Scripts |
@@ -207,6 +222,7 @@ node scripts/verify-shapley.mjs        # Shapley: four axioms / confidence inter
 | Dual mind | verify-scientist · verify-theorist |
 | Kernel stack | verify-unified-evidence · verify-resilience-governance · verify-causal-kernel · verify-active-inference · verify-deliberation · verify-metareasoning · verify-abstraction |
 | Guarantee-layer kernels 12.0-16.0 | verify-anytime-evidence · verify-conformal · verify-quality-diversity · verify-runtime-verification · verify-shapley |
+| Geometry & topology layer 17.0-20.0 | verify-frontier-kernels · verify-frontier-wiring |
 | Symbiosis economy | verify-symbiosis · verify-symbiosis-bridge · verify-belief-market · verify-futarchy · verify-energy-feedback · verify-full-agents · verify-observability |
 | Learning & evolution | verify-self-evolution · verify-self-evolution-v2 · verify-knowledge-distillation · verify-policy-evolution · verify-meta-cognition · verify-meta-cognition-v2 · verify-meta-edge · verify-consensus-sync |
 
@@ -239,7 +255,7 @@ Config section `hostFusion`: `enabled` / `observeToolResults` / `governToolCalls
 ├── cordis.patch.yml              # Bundle config layer (dsh.bundle.patch target, all domestic models, zero keys)
 ├── symbiosis-sankey-demo.html    # Cognitive-ecosystem energy-flow Sankey panorama (zero-dependency, self-contained)
 ├── patches/domestic-models/      # Optional per-vendor patches (9 vendors + all-domestic.yml)
-├── scripts/                      # Patch generator + 29 offline verification scripts
+├── scripts/                      # Patch generator + 31 offline verification scripts
 └── src/
     ├── index.ts                  # Plugin entry: 10-step pipeline orchestration + 18 tool registrations
     ├── types.ts / errors.ts      # Shared type layer / unified error hierarchy (stable machine-readable codes)

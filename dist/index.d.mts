@@ -280,7 +280,33 @@ declare class DecisionEngine {
   /** 决策审计环形缓冲 */
   private audit;
   private stats;
+  /** 19.0：机会停止器（挂载后 defer/execute 由继续价值阈值裁决） */
+  private stopper?;
+  /** 19.0：defer 窗口内的预计剩余机会数（继续价值 V_{k−1} 的口径） */
+  private stopperHorizon;
+  /** 19.0：停止器裁决审计（最近若干次） */
+  private stopperVerdicts;
   constructor(config?: Partial<DecisionEngineConfig>);
+  /**
+   * 19.0：挂载最优停止内核（幂等；挂载后规则 C 的成本闸门从
+   * 「urgency < 0.3 且 cost > 5000 → defer」的魔数口径升级为
+   * 继续价值裁决：每类信号的紧急度流喂入经验分布，defer 窗口内
+   * 预计还有 horizon 次同类机会——当前紧急度 ≥ V_{horizon}（向后
+   * 归纳精确阈值）即执行（占坑数学最优），否则 defer（等待有价）。
+   * 不 attach 即零漂移（原魔数规则）。
+   */
+  attachOptimalStopper(options?: {
+    horizon?: number;
+    minSamples?: number;
+  }): void;
+  /** 19.0：最近停止器裁决审计 */
+  getStopperVerdicts(limit?: number): Array<{
+    signalType: string;
+    at: number;
+    act: boolean;
+    value: number;
+    threshold: number;
+  }>;
   /**
    * 对一批信号做决策（四级流水线）
    * @param signals 聚合后的信号批次
@@ -312,6 +338,14 @@ declare class DecisionEngine {
   reset(): void;
   /** 第 1 级：规则快速路径 */
   private applyRules;
+  /**
+   * 19.0：机会价值评估（规则 C 内部调用）。
+   *
+   * 紧急度流已在 decide() 逐信号喂入停止器；此处评估当前抽值是否
+   * 越过继续价值。未挂载或经验不足（insufficient）返回 undefined
+   * ——回退原魔数口径（诚实弃权，零漂移）。
+   */
+  private assessOpportunity;
   /** 第 2 级：缓存查询（校验 TTL 与置信度） */
   private lookupCache;
   /** 缓存写入（LRU 淘汰） */
@@ -419,6 +453,8 @@ type NodeRunner = (params: {
   modelId: string;
   context: Record<string, string>;
   signal: Signal;
+  /** 全局中止信号（计划级超时/外部中止时中断在途 LLM 请求） */
+  abortSignal?: AbortSignal;
   attempt: number;
 }) => Promise<{
   output: string;
@@ -766,16 +802,28 @@ interface ContributorProb {
  */
 declare function coalitionValue(members: ContributorProb[]): number;
 /**
- * 精确 Shapley 值（子集枚举，n ≤ 16 时精确；更大时按权重截断）。
+ * Shapley 值（n ≤ 12 子集枚举精确；n > 12 确定性置换采样估计）。
  *
- * φ_i = Σ_{S ⊆ N∖{i}} [|S|! (n−|S|−1)! / n!] · [v(S ∪ {i}) − v(S)]
+ * 精确路径：φ_i = Σ_{S ⊆ N∖{i}} [|S|! (n−|S|−1)! / n!] · [v(S ∪ {i}) − v(S)]
+ *
+ * 采样路径（n > 12）：固定 512 个随机排列（缺省 mulberry32 种子
+ * 0xC0FFEE，确定性可复现；可注入自定义 rng），每个排列沿前缀逐步
+ * 计算各贡献者的边际贡献，取全体排列的平均 —— 无偏估计，
+ * 复杂度 O(512·n)。分界理由：n > 12 时 2^n 联盟枚举超过 4096 次
+ * 联盟估值（n·2^(n−1) 次边际差），精确解成本指数膨胀而采样方差
+ * 可控；且位掩码枚举在 n ≥ 33 时 `1 << others` 溢出 32 位整数
+ * （死循环/错值），采样路径不依赖位掩码，任意 n 安全。
  *
  * 质变点：分红不再按「表现分的线性份额」（搭便车者只要有正分就
  * 永远分钱），而按「边际反事实贡献」——拔掉你，任务成功率掉多少，
  * 你就分多少。两个都干了活的智能体平分；只挂名不出力的边际贡献
  * ≈ 0，自然饿死（能量经济的真公平）。
+ *
+ * @param contributors 贡献者及其个体成功概率
+ * @param rng 可选随机源注入（缺省 mulberry32(0xC0FFEE)，确定性采样）
+ * @returns agentId → Shapley 值（采样路径下为边际贡献均值）
  */
-declare function shapleyValues(contributors: ContributorProb[]): Map<string, number>;
+declare function shapleyValues(contributors: ContributorProb[], rng?: () => number): Map<string, number>;
 //#endregion
 //#region src/core/conformal.d.ts
 /**
@@ -2797,6 +2845,186 @@ declare class AnytimeEvidenceRegistry {
 /** 六位小数圆整（13.0/16.0 内核复用的展示口径） */
 declare function round(x: number): number;
 //#endregion
+//#region src/core/optimal-transport.d.ts
+/**
+ * optimal-transport.ts — 最优传输内核（项目 17.0「漂移检测看见分布的形状」质变基座）
+ *
+ * 升级前的根本局限（均值水位检测的形状盲区）：
+ * - 12.0 的 e-过程 / 置信序列盯的是**均值水位**（μ 是否越过水位线）——
+ *   一个均值不变、形状巨变的分布（双峰化、方差爆炸、尾部变厚）在
+ *   水位线检测下完全隐形：μ̂ 纹丝不动，系统却已经换了世界；
+ * - z-score / 方差检测只看一两个矩——矩相同而分布不同的两个世界
+ *   无穷多，二阶统计不足以充当「世界没变」的证书；
+ * - KL 散度在不相交支撑（旧窗口全是 0.6，新窗口全是 0.9）上
+ *   发散为 ∞，既不可比较也不可累积；平方误差只看均值差。
+ *
+ * 本内核引入 Monge–Kantorovich 最优传输理论（Villani 2009 Fields /
+ * Cuturi 2013 Sinkhorn / Peyré–Cuturi 2019 计算最优传输）：
+ *
+ * 1. **一维精确 Wasserstein-p**（分位数耦合）：
+ *      W_p(μ, ν) = ( ∫₀¹ |F_μ⁻¹(q) − F_ν⁻¹(q)|ᵖ dq )^{1/p}
+ *    一维情形最优耦合就是分位数单调配对（秩相依 / comonotone 耦合），
+ *    经验分布上排序后逐分位配对即**精确值**——不是近似，O(n log n)。
+ *    W₁ = 「把分布 μ 的土搬到 ν 的最小搬运代价」，单位就是被监测
+ *    量本身的单位（质量分 / 延迟毫秒）——可解释、可设定阈。
+ *
+ * 2. **熵正则 Sinkhorn（任意代价矩阵的离散 OT）**：
+ *      min_π ⟨C, π⟩ + ε·KL(π ‖ a bᵀ),  s.t. π1 = μ, πᵀ1 = ν
+ *    Cuturi 2013：Sinkhorn 不动点迭代在 Hilbert 度量下收缩，
+ *    O(k²) 每步、线性收敛；对数域稳定化（log-sum-exp）防下溢。
+ *    代价矩阵可以是任意「行为距离」——预算在 niche 网格间的
+ *    最小移动方案（探索预算再平衡）有了数学最优解。
+ *
+ * 3. **Wasserstein 重心（barycenter）**：
+ *    一维固定质量情形，重心 = 分位数平均：B⁻¹(q) = Σ wᵢ Fᵢ⁻¹(q)。
+ *    多个窗口 / 多个模型的分布信息融合为一条「共识分布」——
+ *    比「平均的均值」保留全部形状（均值融合丢掉形状，重心融合
+ *    保留形状），11.0 定律归纳的分布版。
+ *
+ * 4. **形状感知漂移监视器（TransportDriftMonitor）**：
+ *    滑动窗 vs 基准窗的 W₁ 持续计算；阈值不是拍的——历史窗口间
+ *    W₁ 的经验分布给出「正常漂移」的分位数（conformal 式阈值，
+ *    与 13.0 同一哲学：让数据自己定阈），超越即报 shape-drift。
+ *
+ * 与 12.0 的关系：12.0 盯水位（均值），本内核盯形状（全分布）——
+ * 「水平没变但世界换了」第一次可见；与 13.0 的关系：保形覆盖保证
+ * 在分布漂移下失效，本内核是保形区间的**绊线**（先见漂移、再谈覆盖）；
+ * 与 14.0 的关系：Sinkhorn 给出探索预算跨 niche 的最优搬运方案，
+ * 多样性维护从「均匀采样」升维为「最小代价再平衡」。
+ */
+/**
+ * 一维经验 Wasserstein-p 距离（精确：分位数单调耦合）。
+ *
+ * 两个样本集各自视为等权经验分布；排序后按分位配对：
+ *   W_p = ( (1/m) Σ |a_(i) − b_(i)|ᵖ )^{1/p}（m = n 时逐秩配对；
+ *   m ≠ n 时按经验分位数网格插值）。
+ *
+ * @param p 距离阶数（1 = 搬运代价，2 = 能量距离；缺省 1）
+ */
+declare function wasserstein1D(samplesA: readonly number[], samplesB: readonly number[], p?: number): number;
+/** 排序数组的经验分位数（线性插值；q ∈ [0,1]） */
+declare function quantileSorted(sorted: readonly number[], q: number): number;
+/**
+ * 一维 Wasserstein 重心（分位数平均）：多个经验分布按权重融合为一条共识分布。
+ *
+ * B⁻¹(q) = Σᵢ wᵢ Fᵢ⁻¹(q)——保留全部形状信息的「分布平均」
+ * （均值的平均只留一个数，重心的平均留一条曲线）。
+ *
+ * @returns 重心的代表样本集（分位数网格采样），可直接参与后续 W 距离计算
+ */
+declare function wassersteinBarycenter1D(distributions: readonly (readonly number[])[], weights?: readonly number[]): number[];
+/** Sinkhorn 求解配置 */
+interface SinkhornConfig {
+  /** 熵正则强度 ε（越小越接近精确 OT、收敛越慢；缺省 0.05） */
+  epsilon: number;
+  /** 最大迭代数（缺省 200） */
+  maxIterations: number;
+  /** 收敛容差（边际约束残差；缺省 1e-9） */
+  tolerance: number;
+  /** 代价矩阵数值范围保护（|C| 上限；缺省 100） */
+  maxCost: number;
+}
+declare const DEFAULT_SINKHORN_CONFIG: SinkhornConfig;
+/** Sinkhorn 求解结果 */
+interface SinkhornResult {
+  /** 传输方案 π（π[i][j] = 从 i 搬到 j 的质量） */
+  plan: number[][];
+  /** 熵正则传输代价 ⟨C, π⟩（+ ε·KL 已剔除的主项） */
+  cost: number;
+  /** 收敛判定 */
+  converged: boolean;
+  /** 实际迭代数 */
+  iterations: number;
+  /** 边际约束最大残差 */
+  residual: number;
+}
+/**
+ * 对数域稳定化 Sinkhorn 求解器
+ *
+ * 不动点迭代（Hilbert 度量压缩，Franklin–Lorenz 1989；Cuturi 2013）：
+ *   f_i ← −ε log Σ_j exp((g_j − C_ij)/ε) a_j
+ *   g_j ← −ε log Σ_i exp((f_i − C_ij)/ε) b_i
+ * 全程 log-sum-exp，指数下溢免疫；f、g 为对偶势（Kantorovich 最优
+ * 对偶变量的熵正则版）。
+ */
+declare function sinkhorn(cost: readonly (readonly number[])[], sourceMass: readonly number[], targetMass: readonly number[], config?: Partial<SinkhornConfig>): SinkhornResult;
+/** 传输漂移监视器配置 */
+interface TransportDriftConfig {
+  /** 滑动窗容量（近期样本；缺省 50） */
+  windowSize: number;
+  /** 基准窗容量（历史样本；缺省 200） */
+  referenceSize: number;
+  /** 漂移阈值的经验分位数（历史窗间 W₁ 的分位；缺省 0.95） */
+  thresholdQuantile: number;
+  /** 最小样本量（双方达标才开始判定；缺省 20） */
+  minSamples: number;
+  /** 严重度平滑因子（severity = W₁ / threshold 的自然缩放；缺省 1） */
+  severityScale: number;
+}
+declare const DEFAULT_TRANSPORT_DRIFT_CONFIG: TransportDriftConfig;
+/** 漂移视图 */
+interface TransportDriftView {
+  /** 窗口 vs 基准的 W₁（被监测量原单位） */
+  w1: number;
+  /** 自适应阈值（历史漂移的分位数） */
+  threshold: number;
+  /** 是否判定漂移 */
+  drifting: boolean;
+  /** 严重度 = w1 / threshold（>1 越多越严重） */
+  severity: number;
+  /** 方向洞察：均值位移量（窗口均值 − 基准均值） */
+  meanShift: number;
+  /** 形状洞察：分布展宽比（窗口 σ / 基准 σ；≈1 形状未变，>1 双峰化/尾部变厚） */
+  spreadRatio: number;
+  /** 漂移主成分：level（均值水位）/ shape（形状重排）/ both / none */
+  kind: 'none' | 'level' | 'shape' | 'both';
+  /** 样本量（窗口 / 基准） */
+  samples: {
+    window: number;
+    reference: number;
+  };
+  interpretation: string;
+}
+/** 漂移事件（翻转沿审计） */
+interface TransportDriftEvent {
+  at: number;
+  kind: TransportDriftView['kind'];
+  severity: number;
+  w1: number;
+  threshold: number;
+}
+/**
+ * 形状感知传输漂移监视器
+ *
+ * 用法：
+ *   const monitor = new TransportDriftMonitor();
+ *   monitor.observe(0.82);  // 持续喂入被监测量（质量分 / 延迟 / 收益）
+ *   monitor.drift();        // 任意时刻读取（W₁ 原单位 + 自适应阈值）
+ *
+ * 几何细节：基准窗取**滑动窗之前**的样本（两窗不相交）——若拿
+ * 包含自身的历史当基准，W₁ 被窗口⊂基准的相关性系统性压低，
+ * 阈值口径失真。阈值哲学（与 13.0 同源）：不拍脑袋——历史平稳期
+ * 两两 W₁ 构成「正常漂移」经验分布，thresholdQuantile 分位即阈值；
+ * 新 W₁ 入账前先裁决，漂移期样本不污染基准。
+ */
+declare class TransportDriftMonitor {
+  private readonly config;
+  private readonly buffer;
+  private readonly historyW1;
+  private lastDrifting;
+  private events;
+  constructor(config?: Partial<TransportDriftConfig>);
+  /** 观测一次被监测量 */
+  observe(x: number): TransportDriftView;
+  /** 当前漂移视图（纯读取） */
+  drift(): TransportDriftView;
+  /** 漂移事件审计（翻转沿） */
+  recentEvents(limit?: number): TransportDriftEvent[];
+  /** 当前自适应阈值（历史 W₁ 的分位；历史不足时退化为 2.5σ 启发） */
+  private currentThreshold;
+  private interpret;
+}
+//#endregion
 //#region src/meta-cognition.d.ts
 /** KPI 快照 */
 interface KpiSnapshot {
@@ -2964,6 +3192,12 @@ interface MetaCognitionConfig {
   tuningCooldownMs: number;
   /** 参数调整落地回调（由 index.ts 桥接到真实引擎） */
   applier?: (action: TuningAction) => void;
+  /**
+   * 读取当前真实质量阈值的回调（可选注入）。
+   * 提供时 successRate 退化规则的 from/to 以当前实际阈值（而非成功率
+   * 目标）为基线——「放宽」才名实相符；未提供时保持旧行为（零漂移）。
+   */
+  getQualityThreshold?: () => number;
 }
 /** 默认配置 */
 declare const DEFAULT_META_COGNITION_CONFIG: MetaCognitionConfig;
@@ -3008,6 +3242,10 @@ declare class MetaCognitionEngine {
   private scientistMind?;
   /** 12.0：KPI 保证层（挂载后退化/恢复判定获得任意时刻有效背书） */
   private anytimeGuards?;
+  /** 17.0：形状感知传输漂移监视（挂载后分布形状变化可见） */
+  private transportDrift?;
+  /** 17.0：各 KPI 的上次漂移态（翻转沿触发洞察） */
+  private transportDriftState;
   /** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
   private guardAlpha;
   /**
@@ -3038,6 +3276,26 @@ declare class MetaCognitionEngine {
   attachAnytimeGuards(options?: {
     alpha?: number;
   }): void;
+  /**
+   * 17.0：挂载形状感知传输漂移监视（幂等；缺省覆盖 avgQuality / avgLatency）。
+   *
+   * 12.0 保证层盯**均值水位**（μ 是否越过目标线），本层盯**分布形状**
+   * （滑动窗 vs 基准窗的 Wasserstein-1）——均值不变而形状巨变
+   * （双峰化 / 尾部变厚）的「换了世界」第一次可见；13.0 保形区间的
+   * 覆盖保证在漂移下失效，本层是其绊线。阈值自适应（历史 W₁ 分位），
+   * 不 attach 即零漂移。
+   */
+  attachTransportDrift(options?: Partial<{
+    kpis: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+    windowSize: number;
+    referenceSize: number;
+    thresholdQuantile: number;
+    minSamples: number;
+  }>): void;
+  /** 17.0：形状漂移检验（每批快照后调用；翻转沿产出洞察，稳态不重复打扰） */
+  private checkTransportDrift;
+  /** 17.0：各 KPI 的当前形状漂移视图（纯读取；未挂载返回 undefined） */
+  transportDriftView(kpi: string): TransportDriftView | undefined;
   /**
    * 12.0：保证层检验（每批快照后调用）。
    *
@@ -3338,6 +3596,160 @@ declare const STRATEGY_BEHAVIOR_SPACE: {
  */
 declare function strategyBehaviorDescriptor(genes: StrategyGenesLike): number[];
 //#endregion
+//#region src/core/information-geometry.d.ts
+/**
+ * information-geometry.ts — 信息几何内核（项目 18.0「进化在流形上行走」质变基座）
+ *
+ * 升级前的根本局限（坐标空间变异的几何盲区）：
+ * - 高斯变异在**原始坐标轴**上独立加噪——步长正比于各基因的取值
+ *   范围，本质是把「坐标怎么标」当成了「空间怎么弯」：把某个基因
+ *   的单位从秒改成毫秒，同样的变异在物理上走 1000 倍远——进化的
+ *   行为被坐标系绑架（参数化依赖）；
+ * - 基因间的**相关结构**完全不可见：lowConfidenceThreshold 与
+ *   costDeferRatio 在历史上可能总是同向移动（一个隐性组合在起作用），
+ *   独立加噪把每次变异都强行拆散——有利的基因组合永远无法被
+ *   一次变异完整传递；
+ * - 步长没有信息单位：变异走多远用「参数距离」度量，而参数距离
+ *   在重参数化下不守恒——「这次变异改变策略分布多少信息」才是
+ *   不变量，坐标系无权过问。
+ *
+ * 本内核引入信息几何（Amari 自然梯度 / Fisher 信息度量；
+ * Kakade 2001 自然梯度 RL；Schulman 2015 TRPO 信任域）：
+ *
+ * 1. **Fisher 信息度量**：搜索分布 N(θ, Σ) 的均值参数上，
+ *      F = Σ⁻¹
+ *    概率分布族构成黎曼流形，Fisher 度量给出其上真实的「距离」——
+ *    两个策略参数点的距离不是欧氏范数，而是
+ *      ‖δ‖_F = √(δᵀ Σ⁻¹ δ)（Mahalanobis 范数）
+ *
+ * 2. **不变性（本内核的数学心脏）**：种群协方差在仿射重参数化
+ *    y = Ax 下协变（Σ_y = AΣAᵀ），故 Mahalanobis 距离严格不变：
+ *      δ_yᵀ Σ_y⁻¹ δ_y = δ_xᵀ Σ_x⁻¹ δ_x
+ *    单位换算、量纲缩放、坐标旋转——几何不变量纹丝不动。
+ *    变异第一次拥有了与坐标系无关的「真实步长」。
+ *
+ * 3. **自然变异（协方差白化采样）**：ε ~ N(0, I)，子代 =
+ *      parent + σ · L ε，L = Cholesky(Σ̂)
+ *    变异方向沿种群历史方差的主轴展开——显性组合方向自动获得
+ *    更大步幅（有利的基因组合被完整传递），垂直方向自动收紧；
+ *    等价于在 Fisher 流形上沿测地方向迈步（自然梯度的采样版）。
+ *
+ * 4. **KL 信任域（步长以 nat 计价）**：同协方差高斯的
+ *      KL(N(θ) ‖ N(θ+δ)) = ½ δᵀ Σ⁻¹ δ
+ *    步长用信息单位（nat）度量：Mahalanobis 距离超界即整体缩放
+ *    回信任域——单次进化对策略分布的最大信息改动被数学封顶，
+ *    「大步翻车」与「小步原地」都不再取决于坐标系标定。
+ *
+ * 5. **协方差收缩（Ledoit–Wolf 式）**：小种群（个位数）的样本
+ *    协方差病态；Σ̂ = (1−λ)S + λ·(tr S / d)·I 以种群规模定 λ，
+ *    良态保证 Cholesky 可分解；条件数 / 有效维数（参与比）随报告
+ *    输出——搜索几何本身成为可观测对象。
+ *
+ * 与 8.0 的关系：8.0 元推理把「思考」按 nat 计价，本内核把「进化」
+ * 按 nat 计价——认知经济学的两种支出（推理与变异）统一信息单位；
+ * 与 14.0 的关系：14.0 在**行为空间**（结果维度）保流派不灭，本内核
+ * 在**参数流形**（策略维度）让搜索沿几何走——结果空间的多样性与
+ * 参数空间的几何是两层互补的正交保护；与 16.0 的关系：Shapley 的
+ * 协同检测找出 1+1>2 的玩家对，本内核的协方差主轴找出总是同向
+ * 移动的基因组合——归因在智能体层，几何在基因层。
+ */
+/** 信息几何配置 */
+interface InformationGeometryConfig {
+  /** KL 信任域半径 δ_max（Mahalanobis 上限；缺省 1.2 ≈ 单步 ≤ 0.72 nat） */
+  klBudget: number;
+  /** 基础变异尺度 σ（信任域内的高斯步幅；缺省 0.5） */
+  stepScale: number;
+  /** 收缩强度覆盖（缺省按种群规模自适应：λ = 2/(n+2)，n = 种群数） */
+  shrinkageIntensity?: number;
+  /** 最大维度（超出拒绝估计；缺省 32） */
+  maxDimension: number;
+  /** 随机数源（缺省 Math.random） */
+  rng?: () => number;
+}
+declare const DEFAULT_INFORMATION_GEOMETRY_CONFIG: InformationGeometryConfig;
+/** 自然变异结果 */
+interface NaturalMutationResult {
+  /** 变异后的点（归一化空间） */
+  child: number[];
+  /** Mahalanobis 步长 ‖δ‖_F（信任域口径；坐标不变量） */
+  mahalanobis: number;
+  /** KL 步长（nat）= mahalanobis² / 2 */
+  klStep: number;
+  /** 是否触发信任域缩放（步长超界被整体收缩） */
+  trustRegionClipped: boolean;
+}
+/** 几何诊断报告 */
+interface InformationGeometryReport {
+  /** 估计样本数（种群规模口径） */
+  samples: number;
+  /** 维度 */
+  dimension: number;
+  /** 收缩强度 λ（0 = 纯样本协方差，1 = 各向同性） */
+  shrinkage: number;
+  /** 条件数 κ(Σ̂)（大 = 主轴悬殊；∞ 防护 = 奇异） */
+  conditionNumber: number;
+  /** 有效维数（参与比 (tr Σ)²/tr Σ² ∈ [1, d]；小 = 搜索低维流形） */
+  effectiveDimension: number;
+  /** 平均步长（最近变异的 Mahalanobis 均值；无样本 = 0） */
+  meanStep: number;
+  /** 信任域触发率（最近变异中缩放占比） */
+  trustRegionRate: number;
+  interpretation: string;
+}
+/**
+ * 收缩协方差估计：Σ̂ = (1−λ)·S + λ·(tr S / d)·I。
+ *
+ * λ 缺省 = 2/(n+2)（贝叶斯收缩的经典口径：n 个样本时各向同性先验
+ * 占 2/(n+2)——种群越小收缩越强，Cholesky 良态有保证）。
+ */
+declare function shrinkageCovariance(points: readonly (readonly number[])[], intensity?: number): number[][];
+/** Cholesky 分解（下三角；非正定时加抖动重试，仍失败返回 undefined） */
+declare function cholesky(matrix: readonly (readonly number[])[]): number[][] | undefined;
+/** 条件数 κ = λ_max / λ_min（幂迭代 + 逆幂迭代近似；奇异返回 Infinity） */
+declare function conditionNumber(matrix: readonly (readonly number[])[]): number;
+/** 参与比（有效维数）：(tr Σ)² / tr(Σ²) ∈ [1, d] */
+declare function participationRatio(matrix: readonly (readonly number[])[]): number;
+/**
+ * Fisher 几何引擎：估计种群几何 + 自然变异 + 诊断
+ *
+ * 用法：
+ *   const geo = new FisherGeometryEngine({ klBudget: 1.2 });
+ *   geo.estimate(populationPoints);          // 归一化参数点（[0,1]^d）
+ *   const { child } = geo.naturalMutate(parentPoint);  // 沿流形测地方向变异
+ *   geo.report();                            // 条件数 / 有效维数 / 步长审计
+ *
+ * 所有点在**归一化空间**（各维 [0,1]）进出——坐标不变量保证这些
+ * 数值与外部标定无关。
+ */
+declare class FisherGeometryEngine {
+  private readonly config;
+  private readonly rng;
+  private dimension;
+  private samples;
+  private shrinkageUsed;
+  private covariance;
+  private choleskyFactor?;
+  /** 最近变异步长审计（信任域触发率 / 均值口径） */
+  private recentSteps;
+  constructor(config?: Partial<InformationGeometryConfig>);
+  /**
+   * 估计种群几何（归一化点集 → 收缩协方差 + Cholesky）。
+   *
+   * 点集通常为当前种群全部个体（含精英）；样本 ≤ 1 时几何退化为
+   * 各向同性（自然变异回退坐标无关的等幅噪声）。
+   */
+  estimate(points: readonly (readonly number[])[]): boolean;
+  /**
+   * 自然变异：ε ~ N(0,I) 沿 Cholesky 主轴展开，KL 信任域封顶。
+   *
+   * 未估计几何（estimate 未调用 / 失败）时回退各向同性小步——
+   * 调用方无需关心几何是否可用（优雅降级，零漂移）。
+   */
+  naturalMutate(parent: readonly number[], scale?: number): NaturalMutationResult;
+  /** 几何诊断报告 */
+  report(): InformationGeometryReport;
+}
+//#endregion
 //#region src/strategy-evolution.d.ts
 /** 基因组基因（决策引擎可调超参数子集） */
 interface StrategyGenes {
@@ -3411,6 +3823,8 @@ interface EvolutionStatusReport {
   qd?: QualityDiversityMetrics;
   /** 12.0：任意时刻证据报告（attachAnytimeEvidence 后输出） */
   anytime?: AnytimeEvidenceRegistryReport;
+  /** 18.0：搜索几何报告（attachInformationGeometry 后输出） */
+  geometry?: InformationGeometryReport;
 }
 /**
  * 决策策略在线进化引擎
@@ -3444,6 +3858,8 @@ declare class StrategyEvolutionEngine {
   private qdArchive?;
   /** 14.0：前沿 niche 采样概率（探索预算占比） */
   private qdExploreRate;
+  /** 18.0：Fisher 几何引擎（attach 后变异沿搜索流形测地方向） */
+  private geometry?;
   constructor(config?: Partial<StrategyEvolutionConfig>);
   /**
    * 12.0：挂载任意时刻证据内核（幂等；挂载后适应度用置信序列下界，
@@ -3462,6 +3878,25 @@ declare class StrategyEvolutionEngine {
     exploreRate?: number;
     rng?: () => number;
   }): void;
+  /**
+   * 18.0：挂载信息几何内核（幂等；挂载后变异从坐标轴加噪升级为
+   * Fisher 流形上的自然变异）。
+   *
+   * 变异路径变化：种群归一化协方差（Ledoit–Wolf 收缩）→ Cholesky
+   * 主轴展开的**联合相关**变异（显性基因组合完整传递；各向同性
+   * 加噪被结构性替代）→ KL 信任域（Mahalanobis 半径）封顶单步
+   * 信息量——步长以 nat 计价，仿射重参数化下严格不变。
+   * 几何每代进化前从当前种群重估。不 attach 即零漂移（原高斯路径）。
+   */
+  attachInformationGeometry(options?: {
+    klBudget?: number;
+    stepScale?: number;
+    rng?: () => number;
+  }): void;
+  /** 18.0：从当前种群重估搜索几何（归一化 [0,1]^d 参数空间） */
+  private estimateGeometry;
+  /** 18.0：几何诊断报告（未挂载返回 undefined） */
+  geometryReport(): InformationGeometryReport | undefined;
   /**
    * UCB1 选择当前基因组（探索-利用平衡；4.0 利用项 = 证据化适应度）
    *
@@ -3531,7 +3966,13 @@ declare class StrategyEvolutionEngine {
   private fitness;
   /** 锦标赛选择（3 选 1） */
   private tournamentSelect;
-  /** 高斯变异：按变异概率逐基因扰动 */
+  /**
+   * 变异产生后代
+   *
+   * 18.0 挂载后：Fisher 流形上的自然变异（种群协方差主轴展开的
+   * 联合相关步 + KL 信任域封顶——步长以 nat 计价，坐标不变）；
+   * 未挂载：原各基因独立近似高斯变异（坐标空间，零漂移回退）。
+   */
   private mutate;
   /** 种群平均收益 */
   private populationMeanReward;
@@ -7504,6 +7945,16 @@ declare class SafetyGovernor {
     reason?: string;
     blockedBy?: 'kill-switch' | 'circuit-breaker';
   };
+  /**
+   * 22.0：预算剩余快照（只读——不消耗限流配额、不记审计、不推进任何状态）。
+   * 供预算路由内核（Bandits with Knapsacks）在每次模型选型时读取剩余资源；
+   * tokenBudget 与 costBudget 均为 0（不限预算）时返回 undefined
+   * （无预算约束即无路由依据，调度器据此走原路径）。
+   */
+  budgetSnapshot(): {
+    tokensRemaining: number;
+    costRemaining: number;
+  } | undefined;
   /** 启用 Kill Switch */
   engageKillSwitch(): void;
   /** 解除 Kill Switch */
@@ -7600,6 +8051,15 @@ interface MetaCognitionBridge {
 interface SymbiosisBridgeHook {
   runSymbiosisTick(snapshot: KpiSnapshot): Promise<Insight[]>;
 }
+/**
+ * 25.0 容量规划顾问（由 index.ts 桥接到 CapacityPlanner）。
+ *
+ * 心跳 2.5 段调用：λ̂（世界模型预测到达率）× 服务统计（稳健平均延迟）
+ * 反解最小可行并发，不可行（ρ≥1）或建议并发超出当前 1.2 倍时返回
+ * capacity-warning 洞察（扩容/降载）；无数据或未启用时返回空数组。
+ * 失败由调用侧静默隔离，不阻断主链路。
+ */
+type CapacityAdvisor = () => Insight[] | void;
 /** 自主心跳配置 */
 interface AutonomyLoopConfig {
   /** 心跳间隔（毫秒） */
@@ -7666,6 +8126,8 @@ declare class AutonomyLoop {
   private metaCognitionBridge?;
   /** 第五阶段 Phase 2.5：共生进化桥接（可选注入，缺省不启用） */
   private symbiosis?;
+  /** 25.0：容量规划顾问（可选注入；心跳 2.5 段消费，缺省零改动） */
+  private capacityAdvisor?;
   private worldModel?;
   private curiosity?;
   private governor?;
@@ -7694,6 +8156,8 @@ declare class AutonomyLoop {
     metaCognitionBridge?: MetaCognitionBridge;
     /** 第五阶段 Phase 2.5：共生进化桥接（可选，缺省不启用） */
     symbiosis?: SymbiosisBridgeHook;
+    /** 25.0：容量规划顾问（可选，缺省不启用） */
+    capacityAdvisor?: CapacityAdvisor;
     worldModel?: WorldModel;
     curiosity?: CuriosityEngine;
     governor?: SafetyGovernor;
@@ -7985,10 +8449,23 @@ declare class TenantManager {
   getGlobalStats(): Record<string, any>;
   /** 释放全部运行时（进程退出前调用） */
   dispose(): void;
-  /** 加载注册表（不存在时初始化） */
+  /** 加载注册表（不存在时初始化；检测到加密结构时先解密再校验） */
   private loadRegistry;
-  /** 持久化注册表（原子写入） */
+  /** 持久化注册表（原子写入；apiKey 经字段级加密后落盘，不再明文存储） */
   private persistRegistry;
+  /**
+   * 生成落盘载荷：存在加密引擎时对注册表做字段级加密（apiKey 等敏感
+   * 字段封为 __encrypted 结构）；加密失败降级为明文写并在 stderr 警告
+   * （租户持久化是关键路径，不允许因加密故障整体失败）。
+   */
+  private encryptRegistryForDisk;
+  /**
+   * 兜底封印：深扫载荷中仍是明文字符串的 apiKey 字段（引擎的
+   * sensitiveFields 配置可能不含 apiKey），逐个用引擎的整段加密原语
+   * 封为与 EncryptedField 同构的结构（__encrypted 标记 + keyVersion），
+   * 读回路径 decryptSensitiveFields 可统一解密。不修改原对象。
+   */
+  private sealRemainingApiKeys;
   /** 解析租户记忆库路径 */
   private resolveMemoryPath;
   /** 构建租户运行时 */
@@ -8813,6 +9290,17 @@ interface LLMClientConfig {
    * （经 ctx 获取的已配置客户端），本客户端仅保留并发控制/统计/重试外壳。
    */
   externalChat?: (modelId: string, messages: ChatMessage[], options: ChatOptions) => Promise<LLMResponse>;
+  /**
+   * 23.0 稳健延迟统计（可选）：配置后为每模型维护一条 RobustStream
+   * （样本量自适应切换 mean → median-of-means → Catoni，重尾延迟下
+   * 算术均值被极端值支配的问题被截断影响函数免疫），每次成功调用的
+   * 延迟（毫秒）喂入流；getModelStatuses 相应输出 robustAvgLatencyMs /
+   * robustLatencyMethod。未配置时两字段不出现、零开销（零漂移）。
+   */
+  robustLatency?: {
+    alpha?: number;
+    maxSamples?: number;
+  };
 }
 /** 单次调用选项 */
 interface ChatOptions {
@@ -8858,6 +9346,13 @@ interface ModelRuntimeStatus {
   totalTokensUsed: number;
   totalCost: number;
   taskScores: Record<string, number>;
+  /**
+   * 23.0 稳健平均延迟（毫秒，Catoni/MoM/均值按样本量自适应）；
+   * 仅当 LLMClient 配置了 robustLatency 时出现，否则键不存在（零漂移）。
+   */
+  robustAvgLatencyMs?: number;
+  /** 23.0 稳健估计方法（'mean' | 'mom' | 'catoni'；样本 < 8 时如实输出 'mean'） */
+  robustLatencyMethod?: string;
 }
 /** 模型调用错误（携带 HTTP 状态与可重试标记） */
 declare class LLMError extends AppError {
@@ -8877,6 +9372,8 @@ declare class LLMClient {
   private models;
   private fetchImpl;
   private disposed;
+  /** 23.0：每模型稳健延迟流（仅配置 robustLatency 时创建） */
+  private readonly robustStreams;
   constructor(config?: Partial<LLMClientConfig>);
   /**
    * 注册一个模型端点（重复注册同 id 时覆盖配置并保留统计）
@@ -8918,6 +9415,12 @@ declare class LLMClient {
    * 关闭客户端：拒绝所有排队中的请求
    */
   dispose(): void;
+  /**
+   * 23.0：取（或惰性创建）模型的稳健延迟流。
+   * 仅在配置 robustLatency 时返回流，否则返回 undefined（零开销路径）；
+   * dispose 后不再复活统计流（清空即终态）。
+   */
+  private robustStreamFor;
   /** 获取并发槽位（必要时排队） */
   private acquireSlot;
   /** 释放并发槽位并唤醒队首 */
@@ -8933,6 +9436,184 @@ declare class LLMClient {
  * @returns 解析结果，失败返回 undefined
  */
 declare function parseJSONLoose<T = any>(text: string): T | undefined;
+//#endregion
+//#region src/core/index-scheduling.d.ts
+/**
+ * 21.0 最优索引调度内核 —— Gittins 指数 + 可用性折算(Whittle 一阶近似)
+ *
+ * 数学: 折扣 Bernoulli bandit 的最优调度 = Gittins 索引策略(Gittins 1979; Weber 1992 对
+ * Bernoulli+Beta 情形的最优性证明)。臂 = 模型, 臂状态 = Beta(α, β) 后验。
+ *
+ * 精确计算(本实现的要害): 对固定退休金 R 的「退休 MDP」
+ *     V_R(a,b) = max( R/(1−γ),  p·(1 + γ·V_R(a+1,b)) + (1−p)·γ·V_R(a,b+1) ),  p = a/(a+b)
+ * 因转移严格增大 n = a+b, 整个值函数在 (a,b) 三角形上是 DAG —— 按 n 从 maxCount 向下
+ * 反向归纳一遍即得全部 V_R, 无需任何不动点迭代。Gittins 指数
+ *     ν(a,b) = sup{ R ≥ 0 : 在状态 (a,b) 继续播放优于退休 }
+ * 对 R 二分(每次一遍 O(三角形) 归纳)即得。边界 n = maxCount 处后验视为已收敛,
+ * 播放值取 p/(1−γ)(永续开采)。
+ *
+ * 关键性质(验证脚本逐条断言):
+ *   1. ν ≥ p̂ 恒成立(已知臂的指数 = p̂, 不确定性带来学习溢价);
+ *   2. ν(a+1,b) > ν(a,b) 单调(更多成功 → 更高指数);
+ *   3. α+β → ∞ 时学习溢价 → 0(探索自我终结);
+ *   4. 恒成功臂 (p=1) 指数恰为 1;
+ *   5. 多臂截断视界 DP 对照: 索引策略折扣价值 ≥ 最优价值 − 容差(最优性的实证检查)。
+ *
+ * 可用性折算(Whittle 一阶): 熔断/不健康使臂成为「躁动臂」(restless)。精确 Whittle 指数
+ * 一般不可判定(PSPACE-hard), 本内核取一阶折算 effectiveIndex = ν × availability,
+ * availability ∈ [0,1] 由调用方按熔断/健康状态折算, 0 表示不可用直接剔除。
+ */
+interface GittinsConfig {
+  /** 贴现因子 γ ∈ (0,1): 一步未来的奖励折算比例 */
+  discount: number;
+  /** 后验计数网格上限 N = α+β ≤ maxCount, 超出按比例钳制到边界(学习溢价已趋零) */
+  maxCount: number;
+  /** 无差异退休金 R 的二分轮数(精度 2^{-rounds}) */
+  bisectionRounds: number;
+}
+declare const DEFAULT_GITTINS_CONFIG: GittinsConfig;
+interface GittinsSnapshot {
+  discount: number;
+  maxCount: number;
+  computedStates: number;
+  cacheHits: number;
+}
+/** 惰性 Gittins 指数表: 每个后验状态首次查询时精确计算并缓存 */
+declare class GittinsIndexTable {
+  private readonly discount;
+  private readonly maxCount;
+  private readonly bisectionRounds;
+  private readonly cache;
+  private cacheHits;
+  constructor(config?: Partial<GittinsConfig>);
+  /**
+   * 状态 (α, β) 的 Gittins 指数。计数超网格时按比例钳制到边界并标记 clamped
+   * (大样本后验的学习溢价本就趋零, 钳制误差有界)。
+   */
+  index(alpha: number, beta: number): number;
+  /** 是否经过了网格钳制(审计口径) */
+  clamped(alpha: number, beta: number): boolean;
+  snapshot(): GittinsSnapshot;
+  /**
+   * 核心: 对退休金 R 反向归纳求 V_R(a0,b0), 返回「播放是否最优」。
+   * 只在 (a0,b0) 可达的三角形 (a≥a0, b≥b0, a+b ≤ maxCount) 上归纳。
+   */
+  private playOptimal;
+  private computeIndex;
+}
+interface IndexArm {
+  id: string;
+  /** 成功次数(加权计数亦可为小数, 内部取整钳制) */
+  successes: number;
+  failures: number;
+  /** 可用性 ∈ [0,1], 缺省 1; 熔断 open → 建议 0, half-open → 建议 0.3~0.5 */
+  availability?: number;
+}
+interface ArmIndex {
+  id: string;
+  alpha: number;
+  beta: number;
+  posteriorMean: number;
+  gittinsIndex: number;
+  /** 学习溢价 = ν − p̂ ≥ 0(定理保证): 越不确定越值得探索 */
+  learningPremium: number;
+  availability: number;
+  /** ν × availability(Whittle 一阶折算), 调度依据 */
+  effectiveIndex: number;
+  rank: number;
+  clamped: boolean;
+}
+/**
+ * 索引调度器: 把候选模型(臂)按 effectiveIndex 降序排列。
+ * 与 UCB 的本质区别: UCB 是乐观置信上界启发式, Gittins 是折扣 bandit 的
+ * **可证明最优**指数; 挂载后调度器的候选排序升级为最优口径(零漂移: 不挂载即旧行为)。
+ */
+declare class IndexScheduler {
+  private readonly table;
+  constructor(table?: GittinsIndexTable);
+  getTable(): GittinsIndexTable;
+  rank(arms: IndexArm[]): ArmIndex[];
+}
+//#endregion
+//#region src/core/bandit-knapsack.d.ts
+/**
+ * 22.0 预算最优路由内核 —— Bandits with Knapsacks(Badanidiyuru–Kleinberg–Slivkins 2013;
+ * Agrawal–Devanur 2014): 预算约束下最大化累计质量, 成本权重从对偶中内生涌现。
+ *
+ * 问题形式化(每轮选一个臂 = 模型执行一次):
+ *     max E[ Σ_t q_{i_t} ]   s.t.  Σ_t c_{i_t} ≤ B_tokens, Σ_t cost_{i_t} ≤ B_cost
+ * LP 松弛: max Σ π_i q_i s.t. Σ π_i c_i ≤ b, Σ π = 1(b = 剩余预算率);
+ * 对偶影子价格 λ ≥ 0 使最优集中于 argmax(q_i − λ c_i) —— 固定 costWeight=0.2 只是 λ 的
+ * 一次性猜测, 本内核让 λ 由「剩余预算 / 剩余轮数」的稀缺性实时决定。
+ *
+ * 在线算法(乐观可行性 + 预算感知贪心, BalK 结构):
+ *   1. 质量采用乐观上界 q⁺ = q̂ + r_q(r_q 为 12.0 经验伯恩斯坦半径, 复用
+ *      fixedSampleUpperBound), token 消耗半径用无界支撑的 EB 公式;
+ *   2. 可行性: 均值消耗 ≤ 剩余预算率 × (1 + slack) —— slack 为噪声与突发留缓冲;
+ *   3. 无可行臂 → 选最廉臂并标记 urgent(必须卸载负载, 而非假装最优仍存在);
+ *   4. 影子价格: 取「最高质量但不可行臂 f」与「选中臂 c」的混合 LP 解
+ *      λ = (q⁺_f − q⁺_c) / (c_f − c_c) —— 两臂混合 t* = (b − c_c)/(c_f − c_c) 是 LP 最优顶点,
+ *      λ 即该顶点处预算约束的对偶变量(边际质量/单位 token)。
+ *
+ * 零漂移: 未挂载时调度器行为与升级前逐位一致。
+ */
+interface BwKConfig {
+  /** 乐观半径的置信参数(α 越小半径越大, 越探索) */
+  ucbAlpha: number;
+  /** 可行性松弛: 均值消耗 ≤ 预算率 × (1 + slack) */
+  feasibilitySlack: number;
+  /** 臂样本少于此值时半径退化为均值一半(诚实的大不确定性) */
+  minSamples: number;
+  /** roundsRemaining 缺省时的视界估计 */
+  horizonDefault: number;
+}
+declare const DEFAULT_BWK_CONFIG: BwKConfig;
+interface BwKArmStat {
+  id: string;
+  /** 历史平均质量 ∈ [0,1] */
+  qualityMean: number;
+  qualityVar?: number;
+  /** 历史平均 token 消耗 */
+  tokensMean: number;
+  tokensVar?: number;
+  /** 可选第二资源(货币成本) */
+  costMean?: number;
+  costVar?: number;
+  samples: number;
+}
+interface BwKBudgets {
+  tokensRemaining: number;
+  costRemaining?: number;
+  roundsRemaining: number;
+}
+interface BwKCandidateView {
+  id: string;
+  optimisticQuality: number;
+  tokensMean: number;
+  feasible: boolean;
+  radiusQuality: number;
+}
+interface BwKVerdict {
+  chosenId: string;
+  /** ucb-feasible: 乐观贪心命中可行臂; cheapest-shed: 无可行臂被迫卸载; empty: 无臂 */
+  basis: 'ucb-feasible' | 'cheapest-shed' | 'empty';
+  urgent: boolean;
+  rateTokens: number;
+  rateCost: number;
+  /** 混合 LP 顶点的对偶影子价格(边际质量/单位 token); 无混合结构时为 0 */
+  shadowPriceTokens: number;
+  shadowPriceCost: number;
+  /** 不可行的高质量臂(影子价格的另一端) */
+  bottleneckArmId?: string;
+  candidates: BwKCandidateView[];
+  reason: string;
+}
+declare class BwKRouter {
+  private readonly config;
+  constructor(config?: Partial<BwKConfig>);
+  getConfig(): Readonly<Required<BwKConfig>>;
+  route(arms: BwKArmStat[], budgets: BwKBudgets): BwKVerdict;
+}
 //#endregion
 //#region src/model-scheduler.d.ts
 /** 模型调度配置 */
@@ -9010,6 +9691,14 @@ declare class ModelScheduler {
   private economicMultipliers;
   /** 6.0：自由能引擎（EFE 调度模式；未挂载/未启用零漂移） */
   private freeEnergy?;
+  /** 21.0：索引调度器（Gittins 指数口径；未挂载零漂移） */
+  private indexScheduler?;
+  /** 22.0：预算路由器（Bandits with Knapsacks；未挂载零漂移） */
+  private bwKRouter?;
+  /** 22.0：预算提供器（每次选型时只读治理器剩余预算） */
+  private bwKBudgetProvider?;
+  /** 22.0：最近一次路由裁决（诊断口径；getAttachedDiagnostics 消费） */
+  private lastBwKVerdict?;
   constructor(params: {
     llm: LLMClient;
     memory: LongTermMemory;
@@ -9036,6 +9725,30 @@ declare class ModelScheduler {
    */
   attachFreeEnergy(engine: FreeEnergyEngine, outcomeNode?: string): void;
   private efeOutcomeNode;
+  /**
+   * 21.0：挂载索引调度器（幂等覆盖，挂载即生效）。
+   *
+   * 挂载后 assignModelWithInsight 的动态选型升级为 Gittins 索引口径：
+   * 候选（Beta 后验臂）按 effectiveIndex = ν × availability 降序取榜首。
+   * preferred 短路 / avoidModels 剔除 / 无候选抛 ExecutionError 的语义
+   * 保持不变；未挂载时动态选型与原路径逐位一致（零漂移）。
+   */
+  attachIndexScheduler(scheduler: IndexScheduler): void;
+  /**
+   * 22.0：挂载预算路由器与预算提供器（幂等覆盖）。
+   *
+   * budgetProvider 在每次选型时读取剩余预算（只读，不推进状态）；
+   * 返回 undefined 或 tokensRemaining ≤ 0 时本路由不介入（走原路径）。
+   */
+  attachBwKRouter(router: BwKRouter, budgetProvider: () => {
+    tokensRemaining: number;
+    costRemaining: number;
+  } | undefined): void;
+  /** 21.0/22.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
+  getAttachedDiagnostics(): {
+    indexScheduling?: GittinsSnapshot;
+    lastBwK?: BwKVerdict;
+  };
   /** 模型的当前经济乘数（无信号 = 中性 1；economicFeedbackEnabled 关闭时恒为 1） */
   economicMultiplierOf(modelId: string): number;
   /**
@@ -9068,6 +9781,15 @@ declare class ModelScheduler {
   /** 所选模型的贝叶斯置信度（重试切换后由执行器刷新洞察用） */
   modelInsight(taskType: string, modelId: string): SchedulingInsight;
   /**
+   * 21.0/22.0：已挂载数学内核的候选选型（零漂移守卫——未挂载/预算
+   * 不可用时返回 undefined，调用方走原路径，行为与升级前逐位一致）。
+   *
+   * 优先级：indexScheduler（可证明最优的 Gittins 索引口径）>
+   * bwKRouter（预算约束下的 BwK 路由）> 原评分路径。两条内核路径均
+   * 保持 preferred 短路与 avoidModels 剔除之后的候选集语义。
+   */
+  private selectWithAttachedKernels;
+  /**
    * 为任务类型分配最优模型（能力画像 × 贝叶斯记忆画像 × 成本感知 × 探索/利用权衡）
    *
    * 第三阶段：评分核心改用策略参数化的 scoreModelWithPolicy
@@ -9090,6 +9812,9 @@ declare class ModelScheduler {
    * 4.0：avoidModels 负向约束——经验规避模型（历史超时/能力不足）从候选剔除，
    * 推荐模型被规避时同样降级为动态评分选型（勘察修复：升级前 avoidModels
    * 产出后无人消费，负向经验在调度端断链）。
+   * 21.0/22.0：挂载索引调度器 / 预算路由器后动态选型升级为 Gittins 索引 /
+   * Bandits-with-Knapsacks 口径（preferred 短路与 avoidModels 语义不变；
+   * 未挂载时逐位保持原行为）。
    */
   assignModelWithInsight(taskType: string, preferred?: string, context?: SchedulerTaskContext, options?: {
     avoidModels?: string[];
@@ -9649,6 +10374,640 @@ declare class ShapleyAttributionEngine {
   /** 联盟值查询（排序记忆化：同一玩家集合只估值一次） */
   private coalition;
   private interpretExact;
+}
+//#endregion
+//#region src/core/optimal-stopping.d.ts
+/**
+ * optimal-stopping.ts — 最优停止内核（项目 19.0「等待有了数学价格」质变基座）
+ *
+ * 升级前的根本局限（defer 决策的拍脑袋阈值）：
+ * - 「紧急度 < 0.3 且成本 > 5000 → 延迟 5 分钟」——两个魔数没有任何
+ *   最优性依据：为什么是 0.3？为什么延迟恰好 5 分钟？延迟之后世界
+ *   会更好还是更差？现有口径一概不知，defer 只是「不敢做」的委婉语；
+ * - 「现在做」vs「等下一个机会」之间没有价值权衡：信号到达是随机的
+ *   流，当前机会的紧急度是一次抽样——如果未来还会来 k 个机会，
+ *   当前这次值不值得占坑，是一个标准的最优停止问题，但系统从没
+ *   把它当最优停止问题对待过；
+ * - 无竞争性保证：任何在线停止策略都至少要回答「最坏比能看到的
+ *   最好的差多少」（先知差距）——没有这个下界，defer 策略无法
+ *   自证不是在系统性放弃价值。
+ *
+ * 本内核引入最优停止理论（经典秘书问题谱系：Krengel–Sucheston–
+ * Garling 先知不等式；Samuel-Cahn 1984 阈值规则；Bruss 2000 赔率算法）：
+ *
+ * 1. **精确向后归纳（经验分布上的最优解）**：机会价值 ~ 经验分布
+ *      Vₙ = E[X]；V_k = E[max(X, V_{k+1})] = (1/m) Σᵢ max(xᵢ, V_{k+1})
+ *    还剩 k 次机会时的期望所得 V_k 逐层精确递推（经验测度下无近似）；
+ *    最优策略是阈值策略：当前值 ≥ V_{k−1}（继续价值）即停。
+ *
+ * 2. **先知基准（prophet value）**：E[max X₁..Xₙ] 由次序统计量精确计算
+ *      P(M ≤ x) = F(x)ⁿ ⇒ E[M] = Σᵢ x₍ᵢ₎·[(i/m)ⁿ − ((i−1)/m)ⁿ]
+ *    任何在线策略的所得 ≤ 先知所得——先知差距（competitive ratio）
+ *    衡量停止策略的成色。
+ *
+ * 3. **Samuel-Cahn 单阈值规则（分布无关 ½ 保证）**：取 τ = max 的中位数
+ *    （F(τ)ⁿ = 1/2 的解），首见 X ≥ τ 即停。对**任意分布**保证
+ *      E[规则所得] ≥ ½·E[先知所得]
+ *    ——不需要知道分布形状的保守底线，且对适中的 n 常显著超过 ½。
+ *
+ * 4. **秘书问题与赔率算法（序贯选择的另两把刀）**：
+ *    - 1/e 规则（n 已知、只见相对名次）：跳过前 n/e 个，之后取首个
+ *      纪录——以恰好 1/e 概率选中全局最优，渐近最优；
+ *    - Bruss 赔率算法（独立事件「最后一个成功」）：赔率 r = p/(1−p)，
+ *      从最后一个 Σ r ≥ 1 的下标起在首个成功处停——期望停止次数
+ *      与最优相差 ≤ 1 的优雅定理。
+ *
+ * 5. **机会停止器（OpportunityStopper）**：按上下文（信号类型）流式
+ *    积累机会价值经验分布，`assess(当前值, 剩余机会数)` 返回
+ *    { act, threshold, ruleValue, prophetValue, competitiveRatio }——
+ *    defer/execute 第一次由「继续价值的精确阈值」而非拍脑袋魔数裁决。
+ *
+ * 与 8.0 的关系：8.0 元推理回答「**思考**何时停」（内部计算的最优
+ * 分配），本内核回答「**等待**何时停」（外部机会的最优锁定）——
+ * 内外两种停止问题共用「继续价值 vs 立即价值」的同一数学骨架；
+ * 与 12.0 的关系：12.0 保证「随时下结论不夸大」（证据侧），本内核
+ * 保证「何时下结论不吃亏」（行动侧）——结论的有效性与结论的时机
+ * 构成决策的完整两面；与 18.0 的关系：18.0 约束单步变异的信息量，
+ * 本内核约束单步等待的机会成本——进化与行动都有了自己的最优性口径。
+ */
+/**
+ * 先知价值 E[max X₁..Xₙ]（经验分布次序统计量精确计算）。
+ *
+ * m 个样本的经验分布上：P(Mₙ ≤ x₍ᵢ₎) = (i/m)ⁿ，故
+ *   E[Mₙ] = Σᵢ x₍ᵢ₎·[(i/m)ⁿ − ((i−1)/m)ⁿ]
+ * @param samples 经验样本（机会价值历史）
+ * @param n 未来机会次数
+ */
+declare function prophetValue(samples: readonly number[], n: number): number;
+/**
+ * 向后归纳最优停止价值 V_k（经验测度精确递推）。
+ *
+ * V_k = 还剩 k 次机会时的期望所得；thresholds[k] = V_{k−1} 为
+ * 「剩 k 次时的最优接受阈值」（当前值 ≥ thresholds[k] 即停）。
+ * @returns [V₁..Vₙ]（剩 k 次的价值）与对应阈值
+ */
+declare function backwardInduction(samples: readonly number[], n: number): {
+  values: number[];
+  thresholds: number[];
+};
+/**
+ * Samuel-Cahn 单阈值规则：τ = Mₙ 的中位数（F(τ)ⁿ = 1/2）。
+ *
+ * 分布无关保证：E[规则所得] ≥ ½·E[先知所得]（任意分布）。
+ * @returns 阈值 τ 与规则期望所得
+ */
+declare function samuelCahnRule(samples: readonly number[], n: number): {
+  threshold: number;
+  ruleValue: number;
+  prophet: number;
+};
+/**
+ * 1/e 规则（秘书问题，n 已知）：跳过前 ⌊n/e⌋ 个候选，之后录取首个
+ * 纪录（比已见全部更好者）。选中全局最优的概率 → 1/e（渐近最优）。
+ * @returns 观察期内应跳过的数量
+ */
+declare function secretarySkipCount(n: number): number;
+/**
+ * Bruss 赔率算法（最后一个成功问题）：独立事件成功概率 p₁..pₙ，
+ * 赔率 r = p/(1−p)。s* = 最大下标使后缀赔差和 Σ_{k≥s} rₖ ≥ 1
+ * （从最后一个事件往前累加，和首次达到 1 的下标即 s*）；从 s* 起
+ * 在首个成功处停。定理：期望停止次数与最优策略相差 ≤ 1（若存在 s*）。
+ * p=1 的臂赔差为 Infinity：后缀和必 ≥ 1，规则自然落在最后一个 p=1
+ * 位置处或其后（Infinity 仅参与加法与比较，不产生 NaN）。
+ * @returns 起始下标 s*（1 起；无 s* 返回 0 = 全程不押）
+ */
+declare function brussOddsIndex(successProbabilities: readonly number[]): number;
+/** 机会停止器配置 */
+interface OptimalStoppingConfig {
+  /** 开始裁决的最小经验样本（缺省 8——之前诚实返回 insufficient） */
+  minSamples: number;
+  /** 单上下文最大样本记忆（缺省 200，FIFO） */
+  maxSamples: number;
+  /** 保守系数：接受阈值 = 继续价值 × 该系数（>1 更挑剔；缺省 1） */
+  thresholdMultiplier: number;
+}
+declare const DEFAULT_OPTIMAL_STOPPING_CONFIG: OptimalStoppingConfig;
+/** 停止裁决视图 */
+interface StoppingVerdict {
+  /** 当前机会价值是否 ≥ 继续价值（true = 立即行动数学最优） */
+  act: boolean;
+  /** 继续价值阈值（剩 k 次机会的最优接受线） */
+  threshold: number;
+  /** 当前值 */
+  value: number;
+  /** 剩余机会数（评估口径） */
+  remaining: number;
+  /** 向后归纳最优价值 V_k（当前持有的期望所得） */
+  optimalValue: number;
+  /** Samuel-Cahn 规则期望所得 */
+  ruleValue: number;
+  /** 先知价值 E[max]（任何在线策略的上界） */
+  prophet: number;
+  /** 成色 = 规则所得 / 先知所得（≥ 0.5 有定理背书） */
+  competitiveRatio: number;
+  /** 经验样本量 */
+  samples: number;
+  /** 裁决口径（insufficient = 样本不足，诚实弃权） */
+  basis: 'backward-induction' | 'insufficient';
+  interpretation: string;
+}
+/**
+ * 机会停止器：按上下文流式积累机会价值分布，精确裁决「现在 vs 等待」。
+ *
+ * 用法：
+ *   const stopper = new OpportunityStopper();
+ *   stopper.note('deploy-request', 0.62);  // 每次机会到达时喂值
+ *   const v = stopper.assess('deploy-request', 0.58, 3);  // 现值 0.58、还会来 ~3 次
+ *   if (v.act) 执行(); else 等待();       // 阈值由 V_{k−1} 精确给出
+ *
+ * 数学保证：act = (value ≥ V_{remaining}) 是经验测度下的精确最优
+ * 策略（阈值策略）；competitiveRatio ≥ 0.5 由 Samuel-Cahn 定理背书
+ * （报告侧审计用）。
+ */
+declare class OpportunityStopper {
+  private readonly config;
+  private readonly contexts;
+  /** 最近裁决审计 */
+  private recent;
+  constructor(config?: Partial<OptimalStoppingConfig>);
+  /** 记录一次机会价值观测（FIFO 容量控制） */
+  note(context: string, value: number): void;
+  /** 上下文样本量 */
+  sampleCount(context: string): number;
+  /**
+   * 裁决「立即行动 vs 等待」。
+   *
+   * @param context 上下文（如信号类型）
+   * @param value 当前机会价值（0~1 口径）
+   * @param remaining 预计剩余机会数（缺省 1——等价于最后一搏）
+   */
+  assess(context: string, value: number, remaining?: number): StoppingVerdict;
+  /** 最近裁决审计 */
+  recentVerdicts(limit?: number): {
+    context: string;
+    at: number;
+    act: boolean;
+    value: number;
+    threshold: number;
+    competitiveRatio: number;
+  }[];
+}
+//#endregion
+//#region src/core/sheaf-consensus.d.ts
+/**
+ * sheaf-consensus.ts — 层论共识内核（项目 20.0「分歧的形状可见」质变基座）
+ *
+ * 升级前的根本局限（平均化共识的结构性盲区）：
+ * - 多源信念聚合只有「平均 / 投票 / 市场价」三种武器，三者都把
+ *   分歧当成标量噪声抹平：「A 说任务简单、B 说任务难」平均成
+ *   「中等难度」——这是**编造的共识**：没有人真的认为它中等，
+ *   平均值不在任何信息源的支持集里；
+ * - 结构性分歧不可检测：循环异议（A 信 0.9、B 信 0.1、约束要求
+ *   A=B）不是噪声，是**无解**——但平均给出 0.5 且皆大欢喜，
+ *   系统永远不知道「共识根本不存在」这件事本身；
+ * - 聚合结构不可声明：市场价（LMSR）按资产独立聚合，跨资产的
+ *   一致性要求（「模型 X 在任务类的成功率信念应与任务类自身的
+ *   统计一致」）没有表达语言——聚合器不知道什么应该一致。
+ *
+ * 本内核引入胞腔层（cellular sheaf）共识（Hansen–Ghrist 2019
+ * 《Toward a spectral theory of cellular sheaves》；Hansen–Ghrist 2021
+ * 《Opinion dynamics on discourse sheaves》——应用层论进入分布式
+ * 共识与观点动力学的前沿框架）：
+ *
+ * 1. **层 = 局部一致性结构的精确语言**：图上每个顶点挂一个 stalk
+ *    （该智能体/数据源的信念向量空间），每条边挂一个 edge stalk
+ *    （共享声明空间）与两个限制映射 F_{v≺e}, F_{w≺e}（顶点信念
+ *    投影到共享声明的线性映射）——**「谁与谁、在哪些声明上、
+ *    应该一致到什么程度」第一次成为一等数学对象**。
+ *
+ * 2. **全局截面（global section）= 完美共识**：所有边约束同时满足
+ *    的信念指派。共识不再是「平均」，而是「方程组的解」。
+ *
+ * 3. **层拉普拉斯算子（sheaf Laplacian）**：
+ *      L_F = δ_F† δ_F，L[v][v] = Σ_{e∋v} FᵀF，L[v][w] = −Fᵀ_{v≺e}F_{w≺e}
+ *    分歧能量 E(x) = xᵀL_F x = Σ_e ‖F_{v≺e}x_v − F_{w≺e}x_w‖²
+ *    调和指派（ker L_F）= 全局截面；λ_max 给出分歧能量的谱上界。
+ *
+ * 4. **加权调和共识（观测锚定最小二乘）**：
+ *      min_x Σ_e ‖F_v x_v − F_w x_w‖² + Σ_v α_v‖x_v − b_v‖²
+ *    正规方程 (L_F + A)x = Ab——高斯消元精确求解。产物：
+ *    - **共识指派**：每个顶点的调和信念（最接近观测且最大程度
+ *      满足一致结构——不是平均，是最小化「翻供量」的代数调解）；
+ *    - **离群者定位**：各锚定顶点为达成共识翻供的距离 ‖x*_v − b_v‖
+ *      ——谁最抗拒共识，谁最可能是错的一方；
+ *    - **结构性障碍（obstruction）检测**：调和后的分歧能量地板
+ *      E* > 0 ⇒ 约束网络与观测**无联合实现**——共识在数学上不
+ *      存在，系统第一次能说「别装了，你们根本不一致」。
+ *
+ * 与 16.0 的关系：Shapley 拆分「合作剩余如何公平分配」（博弈论侧），
+ * 本内核回答「多源信念如何结构性融合」（拓扑侧）——分配与融合
+ * 构成多智能体问责的两大代数支柱；与 6.0 的关系：自由能度量
+ * 「预测与观测的惊异」，本内核度量「信念彼此的惊异」——世界对
+ * 系统的惊喜与系统内部的自相惊喜同构；与共生经济的关系：LMSR
+ * 市场价聚合单资产标量，本内核聚合**带一致性结构的向量信念**——
+ * 市场与层论是聚合的两个正交维度（价格 vs 结构）。
+ */
+/** 顶点声明：id + 信念空间维度 */
+interface SheafVertexSpec {
+  id: string;
+  /** 信念向量维度（标量信念 = 1） */
+  dim: number;
+}
+/**
+ * 边声明：a↔b 之间的局部一致性约束。
+ *
+ * 两种写法（二选一）：
+ * - 显式矩阵：mapA / mapB（d_e×d 的行主序矩阵，顶点信念 → 共享声明空间）；
+ * - 坐标速记：sharedA / sharedB（顶点 a/b 中参与共享的坐标下标表，
+ *   长度必须相等——投影矩阵自动生成；全维度同序共享可整体省略）。
+ */
+interface SheafEdgeSpec {
+  a: string;
+  b: string;
+  /** a 的限制映射（d_e × dim(a)；与 mapB 的共享维度一致） */
+  mapA?: number[][];
+  /** b 的限制映射（d_e × dim(b)） */
+  mapB?: number[][];
+  /** 速记：a 侧参与共享的坐标下标（与 mapA 互斥） */
+  sharedA?: number[];
+  /** 速记：b 侧参与共享的坐标下标（与 mapB 互斥） */
+  sharedB?: number[];
+}
+/** 观测锚点：某顶点的实测信念 + 置信权重 α（大 = 硬约束） */
+interface SheafAnchorSpec {
+  id: string;
+  values: number[];
+  /** 锚定权重（缺省 1；0 = 该顶点完全由邻接结构外推） */
+  weight?: number;
+}
+/** 层共识报告 */
+interface SheafConsensusReport {
+  /** 调和共识指派（每顶点的信念向量） */
+  consensus: Record<string, number[]>;
+  /** 分歧能量地板 E*（> 阈值 ⇒ 结构性障碍：完美共识不存在） */
+  disagreementEnergy: number;
+  /** 归一化分歧（E* / (E* + 锚定拟合能)；0 = 存在完美共识） */
+  normalizedDisagreement: number;
+  /** 结构性障碍裁决 */
+  obstruction: 'none' | 'structural-conflict';
+  /** 各锚定顶点为共识翻供的距离（离群者 = 最大翻供者） */
+  deviations: Record<string, number>;
+  /** 谁最抗拒共识（翻供距离降序） */
+  outliers: string[];
+  /** 层拉普拉斯谱半径 λ_max（分歧能量的谱上界口径） */
+  spectralRadius: number;
+  /** 参与顶点数 / 边数 / 总维度 */
+  size: {
+    vertices: number;
+    edges: number;
+    dimension: number;
+  };
+  interpretation: string;
+}
+/**
+ * 胞腔层：图上的局部一致性结构 + 调和共识求解器。
+ *
+ * 用法：
+ *   const sheaf = new CellularSheaf();
+ *   sheaf.addVertex('market', 1);        // 市场价信念（标量）
+ *   sheaf.addVertex('stats', 1);         // 统计估计信念（标量）
+ *   sheaf.addEdge('market', 'stats');    // 标量等值约束（缺省单位映射）
+ *   const report = sheaf.harmonize([
+ *     { id: 'market', values: [0.82], weight: 1 },
+ *     { id: 'stats', values: [0.55], weight: 2 },
+ *   ]);
+ *   // consensus ≈ 加权调解；structuralConflict = false（标量等值总有解）
+ *
+ * 结构性障碍示例：三方循环硬约束 0.9 / 0.1 / 0.5（α→大）——
+ * 调和后能量地板 > 0，obstruction = 'structural-conflict'：
+ * 平均会说 0.5，本内核说「无解，先解决矛盾再谈共识」。
+ */
+declare class CellularSheaf {
+  private readonly vertexIds;
+  private readonly vertexDims;
+  private readonly edges;
+  /** 添加顶点（幂等：重复 id 覆盖维度声明，边失效自检） */
+  addVertex(id: string, dim: number): this;
+  /** 添加一致性约束边（速记自动展开为投影矩阵） */
+  addEdge(spec: SheafEdgeSpec): this;
+  /** 顶点数 / 边数 */
+  get size(): {
+    vertices: number;
+    edges: number;
+    dimension: number;
+  };
+  /** 全局维度布局：顶点 → 起始行号 */
+  private layout;
+  /** 总维度 */
+  private totalDim;
+  /**
+   * 层拉普拉斯 L_F（D×D 块矩阵；D = Σ 各顶点维度）。
+   *
+   * L[v][v] = Σ_{e∋v} Fᵀ_{v≺e}F_{v≺e}；L[v][w] = −Fᵀ_{v≺e}F_{w≺e}
+   * （F 为 d_e×d 的限制映射；FᵀF 与 FᵀG 对共享维度 i 单重求和）
+   */
+  buildLaplacian(): number[][];
+  /**
+   * 加权调和共识（双解口径）：
+   *
+   * - 软调解解 x_soft：min_x E_disagree(x) + Σ αᵢ‖xᵢ − bᵢ‖²
+   *   —— 正规方程 (L_F + A)x = Ab，一致性与观测忠诚度的最优折衷；
+   * - 完美共识解 x_hard：min Σ αᵢ‖xᵢ − bᵢ‖² s.t. L_F x = 0
+   *   —— 刚度惩罚 (A + M·L_F)x = Ab（M 大）实现约束最小二乘：
+   *   **完美共识流形上对观测的最佳拟合**；
+   * - 障碍裁决：x_hard 的加权锚定失配
+   *     misfit = Σ α‖x_hard − b‖² / Σ α
+   *   超过容差 ⇒ 任何完美共识都无法解释观测——**结构性障碍**
+   *   （平均化会编造共识，本内核宣布无解）；否则共识 = x_hard
+   *   （完美一致 + 最忠实观测），障碍时共识 = x_soft（冲突下的
+   *   最小翻供调解），两态各得其所。
+   *
+   * @param anchors 观测锚点（至少 1 个；其余顶点由结构外推——
+   *                完全无锚的连通分量无信息，解退化为 0 向量）
+   * @param options.misfitTolerance 障碍判定的加权失配容差
+   *        （均方差口径；缺省 0.0025 ≈ 5% 标准差）
+   */
+  harmonize(anchors: readonly SheafAnchorSpec[], options?: {
+    misfitTolerance?: number;
+  }): SheafConsensusReport;
+  private interpret;
+}
+/**
+ * 标量等值层（经典平均共识的层论化）：全部顶点标量信念、边为单位
+ * 等值约束——调和共识退化为加权平均，但额外输出翻供距离与
+ * （多维时）障碍检测。快路径工具与对照实验用。
+ */
+declare function scalarAgreementSheaf(ids: readonly string[]): CellularSheaf;
+/**
+ * 声明重叠层（多源向量信念融合的标准形）：每个源一个顶点，维度 =
+ * 其本地声明表长度；边声明两侧共享声明的坐标映射。
+ *
+ * 例：模型 A 信念表 [c1,c2,c3]，模型 B 信念表 [c1,c2,c4]——
+ *   overlapSheaf([dimA=3, dimB=3], edges=[{a,b,sharedA:[0,1],sharedB:[0,1]}])
+ * c1/c2 上强制一致，c3/c4 各自独立保留——「在哪一致、在哪各说各话」
+ * 逐声明精确声明。
+ */
+declare function overlapSheaf(vertices: ReadonlyArray<{
+  id: string;
+  dim: number;
+}>, edges: ReadonlyArray<{
+  a: string;
+  b: string;
+  sharedA: number[];
+  sharedB: number[];
+}>): CellularSheaf;
+//#endregion
+//#region src/core/robust-statistics.d.ts
+/**
+ * 23.0 重尾稳健统计内核 —— Catoni 估计 + Median-of-Means
+ *
+ * 动机: LLM 延迟与评审质量分呈重尾(偶发 100× 尾部), 算术均值与 EMA 被极端值支配,
+ * 而 12.0 的经验伯恩斯坦界依赖有界支撑 [0,1]。本内核在**仅有限方差**假设下给出
+ * sub-Gaussian 型置信界:
+ *
+ *   Median-of-Means(n ≥ k 块):  P( |μ̂ − μ| ≥ σ·√(32·ln(1/α)/n) ) ≤ α   —— 无需有界性
+ *     (每块均值 sub-Gaussian 化由 Chebyshev + 中位数聚合 Chernoff 完成, k = ⌈8 ln(1/α)⌉)
+ *
+ *   Catoni 估计: 解单调方程  Σ_i ψ_δ(x_i − θ) = 0,  ψ_δ(y) = sign(y)·ln(1 + δ|y| + δ²y²/2)
+ *     偏差界  |μ̂ − μ| ≤ 2σ²δ/n + 2ln(2/α)/(δn),  最优 δ = √(2ln(2/α)/(nσ²))
+ *     → 半径 ≈ σ·√(8·ln(2/α)/n), 尾部指数衰减 —— 影响函数线性段截断使单点污染无法搬动估计
+ *
+ *   尺度 σ̂ 用 MAD(中位绝对偏差)×1.4826(正态一致性常数)—— 尺度本身稳健, 极端值无法
+ *   先污染尺度再污染区间。
+ *
+ * 零漂移: 未挂载时一切统计路径与升级前逐位一致。
+ */
+interface RobustStatisticsConfig {
+  /** 置信参数 α: 区间覆盖 ≥ 1 − α */
+  alpha: number;
+  /** 流式估计保留的最大样本数(环形) */
+  maxSamples: number;
+  /** 切换到 Catoni 的最小样本量(低于此用 MoM/普通均值) */
+  catoniMinSamples: number;
+  /** MoM 的最小样本量 */
+  momMinSamples: number;
+}
+declare const DEFAULT_ROBUST_CONFIG: RobustStatisticsConfig;
+/** MAD 稳健尺度估计: σ̂ = 1.4826 × median|x_i − median(x)| */
+declare function madSigma(samples: number[]): number;
+/**
+ * Catoni 稳健均值: 对 θ 二分解单调方程 Σψ_δ(x_i−θ)=0。
+ * 返回估计与半径 |μ̂−μ| ≤ σ̂·√(8·ln(2/α)/n) 的置信区间(钳到数据范围)。
+ */
+declare function catoniMean(samples: number[], alpha?: number): {
+  mean: number;
+  lower: number;
+  upper: number;
+  sigma: number;
+  radius: number;
+};
+/** Median-of-Means: k = ⌈8·ln(1/α)⌉ 块连续切分, 块均值取中位数 */
+declare function medianOfMeans(samples: number[], alpha?: number): {
+  mean: number;
+  blocks: number;
+  lower: number;
+  upper: number;
+  sigma: number;
+};
+type RobustMethod = 'mean' | 'mom' | 'catoni';
+interface RobustRead {
+  n: number;
+  mean: number;
+  robustMean: number;
+  lower: number;
+  upper: number;
+  method: RobustMethod;
+  sigma: number;
+}
+/** 流式稳健估计: 环形保留最近 maxSamples 个观测, read() 自动选择方法 */
+declare class RobustStream {
+  private readonly config;
+  private readonly buffer;
+  constructor(config?: Partial<RobustStatisticsConfig>);
+  observe(x: number): void;
+  get size(): number;
+  read(): RobustRead;
+}
+//#endregion
+//#region src/core/differential-privacy.d.ts
+/**
+ * 24.0 差分隐私内核 —— Laplace/Gaussian 机制 + Rényi-DP 记账
+ *
+ * 定义: 随机机制 M 满足 (ε, δ)-DP 当且仅当对一切相邻数据集 D, D′(至多一个个体不同):
+ *     P[M(D) ∈ S] ≤ e^ε · P[M(D′) ∈ S] + δ,  ∀S
+ * 相邻个体的存在性不可区分 —— 遥测(心智报告 / Sankey 能量流 / 模型画像)不再裸暴露
+ * 单一模型或单一租户的商业敏感数据。
+ *
+ * 机制:
+ *   Laplace(数值/直方图, 精确 (ε,0)-DP): 加噪 Lap(b), b = Δ₁/ε, Δ₁ = 敏感度
+ *     (相邻数据集下查询输出的最大 L1 变化)。计数敏感度 1; n 条值的钳位均值敏感度 (hi−lo)/n。
+ *   Gaussian + Rényi-DP 组合(多轮发布): 单次发布满足 RDP(α_ord) = α_ord·Δ₂²/(2σ²);
+ *     组合 = 各次 RDP 求和(无论相关性); 转 (ε, δ):
+ *     ε = sup_{α>1} [ RDP(α) + ln(1/δ)/(α−1) ]。
+ *     本实现取固定阶 α_ord = 8 的单阶记账(合法上界, 工程上简洁): σ = Δ₂·√(α_ord/(2·ε_alloc))。
+ *
+ * 预算记账: PrivacyAccountant 维护总 ε 预算, 每次发布折半分账(几何分配, 永不超支),
+ * 超预算返回 undefined 并标记 exhausted —— 差分隐私的保证以预算纪律为前提。
+ *
+ * 零漂移: 未启用时一切导出路径输出与升级前逐位一致。
+ */
+interface PrivacyConfig {
+  /** 总 ε 预算(整个账本生命周期) */
+  epsilon: number;
+  /** 高斯机制的 δ(建议 ≤ 1e-6, 须远小于 1/数据集规模) */
+  delta: number;
+}
+declare const DEFAULT_PRIVACY_CONFIG: PrivacyConfig;
+/** RDP 组合采用的固定阶 */
+declare const RDP_ORDER = 8;
+interface PrivacyRelease {
+  tag: string;
+  mechanism: 'laplace' | 'gaussian-rdp';
+  epsilonSpent: number;
+  at: number;
+}
+interface PrivacyStatus {
+  epsilonBudget: number;
+  epsilonSpent: number;
+  epsilonRemaining: number;
+  delta: number;
+  releases: PrivacyRelease[];
+  exhausted: boolean;
+}
+type Rng = () => number;
+/** Laplace(0, b) 噪声: 逆 CDF 采样, U(0,1) → −b·sign(u−½)·ln(1−2|u−½|) */
+declare function laplaceNoise(scale: number, rng?: Rng): number;
+/** 标准正态噪声(Box–Muller) */
+declare function gaussianNoise(rng?: Rng): number;
+/** Laplace 机制单值: (ε,0)-DP, 无记账(机制级原语) */
+declare function dpValue(value: number, epsilon: number, sensitivity?: number, rng?: Rng): number;
+/** 钳位均值 + Laplace: 敏感度 (hi−lo)/n */
+declare function dpMeanClamped(values: number[], epsilon: number, lo: number, hi: number, rng?: Rng): number;
+/** 直方图 + Laplace: 不相交桶并行组合, 敏感度 1 */
+declare function dpHistogram(counts: number[], epsilon: number, rng?: Rng): number[];
+/** RDP(α_ord) 转 (ε, δ): 单阶记账的解析转换 */
+declare function rdpToEpsilon(rdpAtOrder: number, order: number, delta: number): number;
+/**
+ * 差分隐私账本: 折半分账的预算管理。
+ * 每次 gaussianRdp/laplace 调用消耗剩余预算的一半 —— 几何级数保证总消耗 ≤ ε,
+ * 且任何时刻可读出已耗/剩余。
+ */
+declare class PrivacyAccountant {
+  private readonly config;
+  private readonly rng;
+  private spent;
+  private readonly releases;
+  private readonly releaseLimit;
+  constructor(config?: Partial<PrivacyConfig>, rng?: Rng);
+  get remaining(): number;
+  get exhausted(): boolean;
+  /** Laplace 发布(消耗折半预算); 超限返回 undefined */
+  laplace(value: number, sensitivity: number, tag: string): number | undefined;
+  /**
+   * Gaussian + RDP 发布: σ 由本次分配的 ε 与固定阶推得;
+   * 返回加噪后的数值数组, 超限返回 undefined。
+   */
+  gaussianRdp(values: number[], l2Sensitivity: number, tag: string): number[] | undefined;
+  /** 状态快照(自身不含敏感数值) */
+  status(): PrivacyStatus;
+  private allocate;
+}
+/**
+ * 通用视图扰动: 深度优先遍历 JSON 视图, 对数值叶子施加 Laplace(敏感度 1)。
+ * 跳过 id/时间戳/版本/计数类键(这些字段本身不可逆推个体), 每次调用最多扰动 maxFields 个
+ * 数值以控制预算燃烧。预算耗尽后剩余字段原样返回(不静默失败——status 可审计)。
+ */
+declare function perturbNumbers<T>(view: T, accountant: PrivacyAccountant, maxFields?: number): T;
+//#endregion
+//#region src/core/capacity-planning.d.ts
+/**
+ * 25.0 排队论容量规划内核 —— Erlang-C 精解 + Kingman 重尾近似 + Little 定律
+ *
+ * 模型: 每个模型组 = 一个 c 台服务池(c = maxConcurrency); 到达率 λ̂ 来自世界模型预测,
+ * 服务时间分布 S 由 LLM 统计估计(μ̂ = 稳健平均延迟, SCV C_s² = σ̂²/μ̂², 重尾时 > 1)。
+ *
+ * M/M/c 精确解(Erlang-C):
+ *     a = λ/μ(提供负载), ρ = a/c < 1
+ *     Erlang-B 递推: B(0)=1, B(k) = a·B(k−1)/(k + a·B(k−1))
+ *     等待概率 C = B(c) / (1 − ρ·(1 − B(c)))
+ *     Wq = C / (cμ − λ),  Lq = λ·Wq
+ *   c=1 时 C = ρ, Wq = ρ/(μ−λ) 恰为 M/M/1 精确解(自检锚点)。
+ *
+ * M/G/c 无闭式 → Kingman 重尾近似(负载越高越准):
+ *     Wq ≈ ((C_a² + C_s²)/2) · (ρ/(1−ρ)) · E[S]/c,  泊松到达 C_a² = 1
+ *   c=1 且 C_s²=1 时退化为 M/M/1 精确解(第二个自检锚点)。
+ *
+ * 容量反解: Wq(c) 关于 c 单调下降 → 二分求最小 c 使 Wq(c) ≤ W*(目标等待)。
+ *   输出建议并发/预计等待/利用率 ρ/余量 —— 把「提前预留容量」从口号变成不等式。
+ *
+ * Little 定律自检: L = λ·W(实测在途数 vs 理论队长), 偏差过大说明模型失配(如非平稳到达)。
+ *
+ * 零漂移: 未挂载时自主循环不产生任何容量洞察。
+ */
+interface QueueMetrics {
+  /** 服务台数 */
+  servers: number;
+  /** 利用率 ρ = λ/(cμ) */
+  rho: number;
+  /** 系统稳定(ρ < 1) */
+  stable: boolean;
+  /** 等待概率(Erlang-C) */
+  waitProbability: number;
+  /** 平均排队等待(与输入时间单位一致) */
+  avgWait: number;
+  /** 平均队列长 Lq = λ·Wq */
+  avgQueueLength: number;
+  basis: 'erlang-c' | 'kingman' | 'unstable' | 'invalid';
+}
+interface CapacityPlan {
+  recommendedConcurrency: number;
+  currentConcurrency: number;
+  rho: number;
+  expectedWaitMs: number;
+  targetWaitMs: number;
+  feasible: boolean;
+  /** 余量 = 建议/当前, > 1.2 触发扩容洞察 */
+  headroom: number;
+  basis: string;
+  metricsAtRecommended: QueueMetrics;
+}
+interface CapacityPlannerConfig {
+  /** 目标平均等待(毫秒) */
+  targetWaitMs: number;
+  /** 搜索并发上限 */
+  maxConcurrency: number;
+  /** 服务 SCV 未知时的缺省(指数服务 = 1; LLM 重尾建议 2~4) */
+  defaultScv: number;
+}
+declare const DEFAULT_CAPACITY_CONFIG: CapacityPlannerConfig;
+/** M/M/c Erlang-C 精确指标。λ 每单位时间到达数, μ 单台每单位时间服务率, c 台 */
+declare function erlangC(lambda: number, mu: number, servers: number): QueueMetrics;
+/** M/G/c Kingman 重尾近似; scv = 服务时间平方变异系数 C_s² */
+declare function kingmanWq(lambda: number, mu: number, servers: number, scv: number): number;
+/** Little 定律自检: 返回实测与理论在途数之比(< 0.5 或 > 2 提示模型失配) */
+declare function littleCheck(lambda: number, avgSojournMs: number, observedInFlight: number): {
+  theoretical: number;
+  observed: number;
+  ratio: number;
+};
+/** 容量规划器: 由预测到达率与服务统计反解最小并发 */
+declare class CapacityPlanner {
+  private readonly config;
+  constructor(config?: Partial<CapacityPlannerConfig>);
+  getConfig(): Readonly<Required<CapacityPlannerConfig>>;
+  /**
+   * @param input.predictedArrivalPerSec 预测到达率(次/秒, 世界模型 predictArrivals ÷ horizon 秒)
+   * @param input.serviceMeanMs 稳健平均服务时长(毫秒, 建议 23.0 robustMean)
+   * @param input.serviceScv 服务 SCV(σ̂²/μ̂², 缺省 defaultScv)
+   * @param input.currentConcurrency 当前该池并发上限
+   */
+  plan(input: {
+    predictedArrivalPerSec: number;
+    serviceMeanMs: number;
+    serviceScv?: number;
+    currentConcurrency: number;
+  }): CapacityPlan;
+  private build;
 }
 //#endregion
 //#region src/core/resilience.d.ts
@@ -11688,6 +13047,117 @@ interface SchedulerConfig {
       /** 附加安全规约（在缺省规约集之上注册，id 幂等） */
       specs?: SafetySpec[];
     };
+    /**
+     * 17.0：最优传输配置（漂移检测看见分布的形状）。
+     * enabled 时元认知挂载形状感知传输漂移监视（滑动窗 vs 基准窗的
+     * Wasserstein-1 + 自适应阈值）——均值不变而形状巨变的「换了世界」
+     * 第一次可见（12.0 水位检测的盲区补位，13.0 保形区间的绊线）。
+     * 缺省关闭（零漂移）。
+     */
+    optimalTransport?: {
+      enabled?: boolean;
+      /** 监测的 KPI 列表（缺省 avgQuality + avgLatency） */
+      kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+      /** 滑动窗容量（缺省 50） */
+      windowSize?: number;
+      /** 基准窗容量（缺省 200） */
+      referenceSize?: number;
+      /** 漂移阈值的经验分位数（缺省 0.95） */
+      thresholdQuantile?: number;
+      /** 最小样本量（缺省 20） */
+      minSamples?: number;
+    };
+    /**
+     * 18.0：信息几何配置（进化在流形上行走）。
+     * enabled 时策略变异从坐标轴独立加噪升级为 Fisher 流形上的
+     * 自然变异：种群协方差主轴联合相关步 + KL 信任域封顶——
+     * 步长以 nat 计价，仿射重参数化下严格不变。缺省关闭（零漂移）。
+     */
+    informationGeometry?: {
+      enabled?: boolean;
+      /** KL 信任域半径 δ_max（Mahalanobis 上限；缺省 1.2） */
+      klBudget?: number;
+      /** 基础变异尺度 σ（缺省 0.5） */
+      stepScale?: number;
+    };
+    /**
+     * 19.0：最优停止配置（等待有了数学价格）。
+     * enabled 时决策引擎规则 C 的成本闸门从「urgency < 0.3 → defer」
+     * 魔数升级为继续价值裁决：紧急度流经验分布 + 向后归纳精确阈值
+     * （现值 ≥ V_{horizon} 即执行——占坑数学最优，否则等待有价）。
+     * 缺省关闭（零漂移——原魔数规则）。
+     */
+    optimalStopping?: {
+      enabled?: boolean;
+      /** defer 窗口内预计剩余机会数（继续价值口径；缺省 3） */
+      horizon?: number;
+      /** 开始裁决的最小经验样本（缺省 8） */
+      minSamples?: number;
+    };
+    /**
+     * 20.0：层论共识配置（分歧的形状可见）。
+     * enabled 时注册 sheaf_consensus Tool：多源信念融合从平均/投票
+     * 升级为胞腔层调和共识——「谁与谁、在哪些声明上应该一致」成为
+     * 一等数学对象，结构性分歧（无解的循环异议）第一次可检测。
+     * 缺省关闭（不注册即零漂移）。
+     */
+    sheafConsensus?: {
+      enabled?: boolean;
+      /** 障碍判定的加权失配容差（均方差口径；缺省 0.0025 ≈ 5% 标准差） */
+      misfitTolerance?: number;
+    };
+    /**
+     * 21.0：最优索引调度配置（可证明最优的模型调度）。
+     * enabled 时调度器动态选型升级为 Gittins 索引口径：对每个候选的
+     * Beta 后验精确计算折扣 bandit 最优指数（退休 MDP 三角形反向归纳，
+     * 无需不动点迭代），学习溢价随证据积累自动归零（探索自我终结）。
+     * preferred 短路与 avoidModels 语义不变。缺省关闭（零漂移）。
+     */
+    indexScheduling?: {
+      enabled: boolean;
+      /** 贴现因子 γ ∈ (0,1)（缺省 0.95） */
+      discount?: number;
+      /** 后验计数网格上限 α+β ≤ N（缺省 48） */
+      maxCount?: number;
+    };
+    /**
+     * 22.0：预算最优路由配置（Bandits with Knapsacks）。
+     * enabled 时治理器预算成为调度的一等约束：乐观可行性 + 预算感知
+     * 贪心选臂，影子价格由「剩余预算/剩余轮数」稀缺性内生涌现；
+     * 治理器未配置预算（tokenBudget=costBudget=0）时挂载不生效（走原路径）。
+     */
+    banditKnapsack?: {
+      enabled: boolean;
+      /** 乐观半径置信参数 α（越小越探索，缺省 0.05） */
+      ucbAlpha?: number;
+      /** 可行性松弛（缺省 0.25） */
+      feasibilitySlack?: number;
+      /** roundsRemaining 缺省时的视界估计（缺省 100） */
+      horizonDefault?: number;
+    };
+    /**
+     * 稳健统计配置（预留：运行时接线随后续版本进入）。
+     */
+    robustStatistics?: {
+      enabled: boolean;
+      alpha?: number;
+    };
+    /**
+     * 差分隐私配置（预留：运行时接线随后续版本进入）。
+     */
+    privacy?: {
+      enabled: boolean;
+      epsilon?: number;
+      delta?: number;
+    };
+    /**
+     * 容量规划配置（预留：运行时接线随后续版本进入）。
+     */
+    capacityPlanning?: {
+      enabled: boolean;
+      targetWaitMs?: number;
+      defaultScv?: number;
+    };
     /** 目标分解器注入（测试离线模拟） */
     decomposer?: GoalDecomposer;
   };
@@ -12016,4 +13486,4 @@ declare const pluginEntry: typeof apply & {
   provide: string[];
 };
 //#endregion
-export { AbstractSkillEntry, AbstractionConfig, AbstractionEngine, AbstractionStats, AccountId, ActionResult, ActiveTask, AdjustmentKnob, AdjustmentReport, AgentBase, AgentGoal, AgentKind, AgentMeta, AgentMode, AgentProposal, AgentReputation, AliasMap, AnytimeEvidenceConfig, AnytimeEvidenceRegistry, AnytimeEvidenceRegistryReport, AnytimeEvidenceStream, AnytimeEvidenceView, AnytimeVerdict, AppError, ArbitrationResult, ArchiveReport, ArmStats, ArrivalPrediction, ArrivalStats, AssetKind, AuditEntry, AutonomyLoop, AutonomyLoopConfig, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, type BackoffConfig, BayesianEstimate, BeliefAsset, BeliefMarket, BeliefMarketConfig, BeliefOutcome, BeliefPosition, type SettlementReport as BeliefSettlementReport, BeliefStatus, BeliefView, BenchmarkEngine, BenchmarkReport, BenchmarkResult, BenchmarkScenario, BenchmarkStats, BetReceipt, BidOrder, type BreakerProbe, type BreakerState, type BreakerStatus, BuiltinScenarioContext, CHANNEL_GROUPS, CalibrationRecord, CalibrationStatus, CanaryState, CancelReport, CascadeHandler, CausalEdge, CausalEdgeEvidence, CausalEffect, CausalExperiment, CausalExplorationRecord, CausalKernel, CausalKernelConfig, CausalNode, CausalNodeKind, CausalQuestion, ChangeEntry, ChangePayload, ChannelGroup, ChatMessage, ChatOptions, CircuitBreaker, type CircuitBreakerConfig, CircuitBreakerInfo, CircuitBreakerRegistry, CircuitState, ClusterNodeConfig, ClusterStatus, CoalitionValueFunction, CognitiveEconomy, CognitiveMarket, ConfidenceSequenceView, Config, ConfigError, ConformalInterval, ConformalIntervalConfig, ConformalIntervalEngine, ConformalStatus, ConsensusLogEntry, ContributorProb, CounterfactualInsight, CoverageDriftMonitor, CoverageDriftView, CryptoEngine, CryptoError, CryptoResult, CuriosityEngine, CuriosityEngineConfig, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, Decision, DecisionAction, DecisionAuditEntry, DecisionEngine, DecisionEngineConfig, DecisionEngineStats, DecisionFeedback, DecisionInsightRecord, DecisionMode, DeliberationConfig, DeliberationEngine, DeliberationResult, type SettlementReport$1 as DeliberationSettlementReport, SettlementReport$1 as SettlementReport, DesignedExperiment, DistillationReport, DistilledStrategy, DistributedSync, DistributionReport, EBHEntry, EFEAction, EFEEvaluation, EProcess, EProcessSide, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EncryptedField, EncryptedFile, EncryptionConfig, EnergyLedger, EnergySankeyReport, EnergyTransfer, type ErrorClassification, EvaluationReport, EvidenceCensus, EvidenceCensusLayer, type EvidenceView, EvolutionCycleOutcome, EvolutionCycleReport, EvolutionReport, EvolutionStatusReport, EvolverAgent, EvolverAgentConfig, EvolverEfficiencySummary, EvolverMetrics, ExecutionError, ExecutionGrant, ExecutionPlan, ExperienceLookup, ExperimentLedgerEntry, ExplorationDispatcher, ExplorationProposal, ExplorationRecord, ExportOptions, FailureRecord, FreeEnergyConfig, FreeEnergyEngine, Goal, GoalDecomposer, GoalEngine, GoalEngineConfig, GoalStatus, GoalSubtask, GovernanceAuditEntry, GovernanceGate, GovernanceVerdict, GovernedAction, GovernorPersistState, GrantOutcome, Habit, HealthReport, HierarchicalPrior, HomeostasisBands, HomeostasisStatus, HotReloadConfig, HotReloadEngine, HotReloadEvent, HotReloadStatus, IAgent, IMemoryStore, IMetaCognitiveController, INCINERATOR, IOptimizer, IPolicyEvolver, IReflector, ISandbox, ISelfModel, ImaginationReport, ImprovementEvidence, Insight, InterventionRecord, JsonMemoryBackend, JudgeMetric, JudgeModel, KnobEffectiveness, KnowledgeAsset, KnowledgeFrontier, KnowledgeGap, KnowledgeProvider, KpiAnomaly, KpiCollector, KpiSnapshot, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMClientConfig, LLMError, LLMResponse, LedgerConfig, LedgerSnapshot, LedgerStats, Lesson, LessonExtractor, LessonProvider, ListError, ListingView, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, ManagedAgent, MapElitesArchive, MapElitesConfig, MarketConfig, MarketSnapshot, MemoryAgent, MemoryAgentConfig, MemoryBackend, MemoryCondition, MemoryEdge, MemoryError, type MemoryEvidence, MemoryGraph, MemoryLayer, MemoryMaintainer, MemoryMatchContext, MemoryMetrics, MemoryNode, MemoryQualitySummary, MemorySearchHit, MemoryStore, MentalReport, MergeStrategy, MetaCognitionBridge, MetaCognitionConfig, MetaCognitionEngine, MetaCognitiveController, MetaControllerConfig, MetaControllerState, MetaDecision, MetaStabilitySummary, MetareasoningConfig, MetricForecast, MigrationConflict, MigrationPackage, MigrationRecordVersion, MigrationReport, MigrationTool, ModelAgent, ModelConfig, ModelLongTermProfile, ModelRuntimeStatus, ModelScheduler, ModelSchedulerConfig, ModelScoreInput, ModelTaskStats, MonitorStatus, NetworkError, NodeResult, NodeRole, NodeRunner, OperationalMetrics, Optimizer, OptimizerAgent, OptimizerAgentConfig, OptimizerConfig, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, Perception, PerformanceThreshold, PlacementOutcome, PlanExecutionResult, PlanNode, PluginVersion, Policy, PolicyEvaluationMetrics, PolicyEvolutionBridge, PolicyEvolver, PolicyEvolverConfig, PolicyEvolverStatus, PolicyFitness, PolicyMatchContext, PolicyRule, PolicySimulator, ProactiveRisk, ProceduralAction, ProceduralCondition, ProceduralConditionDimension, ProceduralMemory, ProgressBroadcaster, ProgressEvent, ProposalKind, QualityDiversityMetrics, QualityTrendPoint, RaftConfig, RaftEngine, RationalMetareasoner, RecommendedAdjustment, RecordDecisionFeedbackParams, RecordFailureParams, RecordSuccessParams, ReflectionEngine, ReflectionEngineConfig, ReflectionVerdict, Reflector, ReflectorConfig, ReputationTier, type RetryClass, RiskControlResult, RollbackResult, RootCauseCategory, RoyaltyPayout, RuntimeEvent, RuntimeVerifier, RuntimeVerifierStatus, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafeEnvelopeInfo, SafetyGovernor, SafetyGovernorConfig, SafetyMonitor, SafetyPattern, SafetySpec, Sandbox, SandboxConfig, SandboxTask, SankeyLink, SankeyNode, SankeyTotals, ScalarGeneKey, SchedulerConfig, SchedulerPolicyParams, SchedulerService, SchedulerTaskContext, SchedulingInsight, ScientistConfig, ScientistMind, SelfModel, SelfModelCollectors, SelfModelConfig, SemanticConclusion, SemanticCondition, SemanticConditionDimension, SemanticMemory, Sentinel, SentinelConfig, SentinelStatus, ShapleyAttribution, ShapleyAttributionEngine, ShapleyConfig, ShapleyReport, Signal, SignalBatch, SignalEnrichment, SignalHistoryStats, SignalSourceConfig, SimCalibration, SimCalibrationEntry, SimModelStatus, Skill, SqliteMemoryBackend, StepEvaluation, StrategistVerdict, StrategyApplier, StrategyBehaviorDim, StrategyEvolutionConfig, StrategyEvolutionEngine, StrategyGenes, StrategyGenesLike, StrategyGenome, StrategyPerformanceSummary, SubtaskDispatcher, SuccessfulPlanRecord, SymbiosisBridge, SymbiosisBridgeConfig, SymbiosisBridgeHook, SymbiosisConfig, SymbiosisRuntime, SymbiosisTickReport, SyncBatch, SyncConflict, SyncLogEntry, SyncNodeConfig, SyncState, SynergyPair, SystemMetrics, SystemStabilitySummary, TREASURY, TaskExecutor, TaskExecutorConfig, TaskPatternMemory, TenantConfig, TenantManager, TenantRegistry, TenantRuntime, TheoristConfig, TheoristEngine, Theory, TheoryFrontier, TheoryMember, TheoryPrediction, TickReport, TimeoutError, ToolDefinition, ToolError, ToolRegistry, TopicNode, TradeListener, TradeRecord, TransferError, TransferReceipt, TransitionPosterior, TrendMetric, TrendSummary, TuningAction, TypeCorrelation, VariationalReport, ViolationReport, ViolationSeverity, WorldModel, WorldModelConfig, WorldModelSummary, abortableSleep, apply, attachDashboard, backoffDelayMs, bernoulliKL, betaEntropy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, classifyError, coalitionValue, computeHomeostasis, conformalQuantile, cosineSimilarity, createBaselinePolicy, createMemoryBackend, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, eBenjaminiHochberg, emptyMemoryStore, evaluateMemoryCondition, evidenceRankScore, extractReplayTasks, fixedSampleUpperBound, generateAdversarialTasks, initEvidence, isTradeListener, lessonsToInsights, listingsOf, lnGamma, matchesMemoryConditions, modelAgentId, modelSignalKey, name, normalizePolicyParams, observeEvidence, parseJSONLoose, policyParamsWithinBounds, policyRuleMatches, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, sanitizeMemoryStore, scoreModelWithPolicy, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, toSparseVector, tokenizeChinese, wilsonLowerBound };
+export { AbstractSkillEntry, AbstractionConfig, AbstractionEngine, AbstractionStats, AccountId, ActionResult, ActiveTask, AdjustmentKnob, AdjustmentReport, AgentBase, AgentGoal, AgentKind, AgentMeta, AgentMode, AgentProposal, AgentReputation, AliasMap, AnytimeEvidenceConfig, AnytimeEvidenceRegistry, AnytimeEvidenceRegistryReport, AnytimeEvidenceStream, AnytimeEvidenceView, AnytimeVerdict, AppError, ArbitrationResult, ArchiveReport, ArmIndex, ArmStats, ArrivalPrediction, ArrivalStats, AssetKind, AuditEntry, AutonomyLoop, AutonomyLoopConfig, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, type BackoffConfig, BayesianEstimate, BeliefAsset, BeliefMarket, BeliefMarketConfig, BeliefOutcome, BeliefPosition, type SettlementReport as BeliefSettlementReport, BeliefStatus, BeliefView, BenchmarkEngine, BenchmarkReport, BenchmarkResult, BenchmarkScenario, BenchmarkStats, BetReceipt, BidOrder, type BreakerProbe, type BreakerState, type BreakerStatus, BuiltinScenarioContext, BwKArmStat, BwKBudgets, BwKCandidateView, BwKConfig, BwKRouter, BwKVerdict, CHANNEL_GROUPS, CalibrationRecord, CalibrationStatus, CanaryState, CancelReport, CapacityAdvisor, CapacityPlan, CapacityPlanner, CapacityPlannerConfig, CascadeHandler, CausalEdge, CausalEdgeEvidence, CausalEffect, CausalExperiment, CausalExplorationRecord, CausalKernel, CausalKernelConfig, CausalNode, CausalNodeKind, CausalQuestion, CellularSheaf, ChangeEntry, ChangePayload, ChannelGroup, ChatMessage, ChatOptions, CircuitBreaker, type CircuitBreakerConfig, CircuitBreakerInfo, CircuitBreakerRegistry, CircuitState, ClusterNodeConfig, ClusterStatus, CoalitionValueFunction, CognitiveEconomy, CognitiveMarket, ConfidenceSequenceView, Config, ConfigError, ConformalInterval, ConformalIntervalConfig, ConformalIntervalEngine, ConformalStatus, ConsensusLogEntry, ContributorProb, CounterfactualInsight, CoverageDriftMonitor, CoverageDriftView, CryptoEngine, CryptoError, CryptoResult, CuriosityEngine, CuriosityEngineConfig, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, Decision, DecisionAction, DecisionAuditEntry, DecisionEngine, DecisionEngineConfig, DecisionEngineStats, DecisionFeedback, DecisionInsightRecord, DecisionMode, DeliberationConfig, DeliberationEngine, DeliberationResult, type SettlementReport$1 as DeliberationSettlementReport, SettlementReport$1 as SettlementReport, DesignedExperiment, DistillationReport, DistilledStrategy, DistributedSync, DistributionReport, EBHEntry, EFEAction, EFEEvaluation, EProcess, EProcessSide, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EncryptedField, EncryptedFile, EncryptionConfig, EnergyLedger, EnergySankeyReport, EnergyTransfer, type ErrorClassification, EvaluationReport, EvidenceCensus, EvidenceCensusLayer, type EvidenceView, EvolutionCycleOutcome, EvolutionCycleReport, EvolutionReport, EvolutionStatusReport, EvolverAgent, EvolverAgentConfig, EvolverEfficiencySummary, EvolverMetrics, ExecutionError, ExecutionGrant, ExecutionPlan, ExperienceLookup, ExperimentLedgerEntry, ExplorationDispatcher, ExplorationProposal, ExplorationRecord, ExportOptions, FailureRecord, FisherGeometryEngine, FreeEnergyConfig, FreeEnergyEngine, GittinsConfig, GittinsIndexTable, GittinsSnapshot, Goal, GoalDecomposer, GoalEngine, GoalEngineConfig, GoalStatus, GoalSubtask, GovernanceAuditEntry, GovernanceGate, GovernanceVerdict, GovernedAction, GovernorPersistState, GrantOutcome, Habit, HealthReport, HierarchicalPrior, HomeostasisBands, HomeostasisStatus, HotReloadConfig, HotReloadEngine, HotReloadEvent, HotReloadStatus, IAgent, IMemoryStore, IMetaCognitiveController, INCINERATOR, IOptimizer, IPolicyEvolver, IReflector, ISandbox, ISelfModel, ImaginationReport, ImprovementEvidence, IndexArm, IndexScheduler, InformationGeometryConfig, InformationGeometryReport, Insight, InterventionRecord, JsonMemoryBackend, JudgeMetric, JudgeModel, KnobEffectiveness, KnowledgeAsset, KnowledgeFrontier, KnowledgeGap, KnowledgeProvider, KpiAnomaly, KpiCollector, KpiSnapshot, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMClientConfig, LLMError, LLMResponse, LedgerConfig, LedgerSnapshot, LedgerStats, Lesson, LessonExtractor, LessonProvider, ListError, ListingView, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, ManagedAgent, MapElitesArchive, MapElitesConfig, MarketConfig, MarketSnapshot, MemoryAgent, MemoryAgentConfig, MemoryBackend, MemoryCondition, MemoryEdge, MemoryError, type MemoryEvidence, MemoryGraph, MemoryLayer, MemoryMaintainer, MemoryMatchContext, MemoryMetrics, MemoryNode, MemoryQualitySummary, MemorySearchHit, MemoryStore, MentalReport, MergeStrategy, MetaCognitionBridge, MetaCognitionConfig, MetaCognitionEngine, MetaCognitiveController, MetaControllerConfig, MetaControllerState, MetaDecision, MetaStabilitySummary, MetareasoningConfig, MetricForecast, MigrationConflict, MigrationPackage, MigrationRecordVersion, MigrationReport, MigrationTool, ModelAgent, ModelConfig, ModelLongTermProfile, ModelRuntimeStatus, ModelScheduler, ModelSchedulerConfig, ModelScoreInput, ModelTaskStats, MonitorStatus, NaturalMutationResult, NetworkError, NodeResult, NodeRole, NodeRunner, OperationalMetrics, OpportunityStopper, OptimalStoppingConfig, Optimizer, OptimizerAgent, OptimizerAgentConfig, OptimizerConfig, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, Perception, PerformanceThreshold, PlacementOutcome, PlanExecutionResult, PlanNode, PluginVersion, Policy, PolicyEvaluationMetrics, PolicyEvolutionBridge, PolicyEvolver, PolicyEvolverConfig, PolicyEvolverStatus, PolicyFitness, PolicyMatchContext, PolicyRule, PolicySimulator, PrivacyAccountant, PrivacyConfig, PrivacyRelease, PrivacyStatus, ProactiveRisk, ProceduralAction, ProceduralCondition, ProceduralConditionDimension, ProceduralMemory, ProgressBroadcaster, ProgressEvent, ProposalKind, QualityDiversityMetrics, QualityTrendPoint, QueueMetrics, RDP_ORDER, RaftConfig, RaftEngine, RationalMetareasoner, RecommendedAdjustment, RecordDecisionFeedbackParams, RecordFailureParams, RecordSuccessParams, ReflectionEngine, ReflectionEngineConfig, ReflectionVerdict, Reflector, ReflectorConfig, ReputationTier, type RetryClass, RiskControlResult, Rng, RobustMethod, RobustRead, RobustStatisticsConfig, RobustStream, RollbackResult, RootCauseCategory, RoyaltyPayout, RuntimeEvent, RuntimeVerifier, RuntimeVerifierStatus, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafeEnvelopeInfo, SafetyGovernor, SafetyGovernorConfig, SafetyMonitor, SafetyPattern, SafetySpec, Sandbox, SandboxConfig, SandboxTask, SankeyLink, SankeyNode, SankeyTotals, ScalarGeneKey, SchedulerConfig, SchedulerPolicyParams, SchedulerService, SchedulerTaskContext, SchedulingInsight, ScientistConfig, ScientistMind, SelfModel, SelfModelCollectors, SelfModelConfig, SemanticConclusion, SemanticCondition, SemanticConditionDimension, SemanticMemory, Sentinel, SentinelConfig, SentinelStatus, ShapleyAttribution, ShapleyAttributionEngine, ShapleyConfig, ShapleyReport, SheafAnchorSpec, SheafConsensusReport, SheafEdgeSpec, SheafVertexSpec, Signal, SignalBatch, SignalEnrichment, SignalHistoryStats, SignalSourceConfig, SimCalibration, SimCalibrationEntry, SimModelStatus, SinkhornConfig, SinkhornResult, Skill, SqliteMemoryBackend, StepEvaluation, StoppingVerdict, StrategistVerdict, StrategyApplier, StrategyBehaviorDim, StrategyEvolutionConfig, StrategyEvolutionEngine, StrategyGenes, StrategyGenesLike, StrategyGenome, StrategyPerformanceSummary, SubtaskDispatcher, SuccessfulPlanRecord, SymbiosisBridge, SymbiosisBridgeConfig, SymbiosisBridgeHook, SymbiosisConfig, SymbiosisRuntime, SymbiosisTickReport, SyncBatch, SyncConflict, SyncLogEntry, SyncNodeConfig, SyncState, SynergyPair, SystemMetrics, SystemStabilitySummary, TREASURY, TaskExecutor, TaskExecutorConfig, TaskPatternMemory, TenantConfig, TenantManager, TenantRegistry, TenantRuntime, TheoristConfig, TheoristEngine, Theory, TheoryFrontier, TheoryMember, TheoryPrediction, TickReport, TimeoutError, ToolDefinition, ToolError, ToolRegistry, TopicNode, TradeListener, TradeRecord, TransferError, TransferReceipt, TransitionPosterior, TransportDriftConfig, TransportDriftEvent, TransportDriftMonitor, TransportDriftView, TrendMetric, TrendSummary, TuningAction, TypeCorrelation, VariationalReport, ViolationReport, ViolationSeverity, WorldModel, WorldModelConfig, WorldModelSummary, abortableSleep, apply, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, brussOddsIndex, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, catoniMean, cholesky, classifyError, coalitionValue, computeHomeostasis, conditionNumber, conformalQuantile, cosineSimilarity, createBaselinePolicy, createMemoryBackend, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, dpHistogram, dpMeanClamped, dpValue, eBenjaminiHochberg, emptyMemoryStore, erlangC, evaluateMemoryCondition, evidenceRankScore, extractReplayTasks, fixedSampleUpperBound, gaussianNoise, generateAdversarialTasks, initEvidence, isTradeListener, kingmanWq, laplaceNoise, lessonsToInsights, listingsOf, littleCheck, lnGamma, madSigma, matchesMemoryConditions, medianOfMeans, modelAgentId, modelSignalKey, name, normalizePolicyParams, observeEvidence, overlapSheaf, parseJSONLoose, participationRatio, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, prophetValue, quantileSorted, rdpToEpsilon, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, shrinkageCovariance, sinkhorn, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, toSparseVector, tokenizeChinese, wasserstein1D, wassersteinBarycenter1D, wilsonLowerBound };

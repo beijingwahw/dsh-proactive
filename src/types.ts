@@ -71,6 +71,8 @@ export type NodeRunner = (params: {
   modelId: string;
   context: Record<string, string>;
   signal: Signal;
+  /** 全局中止信号（计划级超时/外部中止时中断在途 LLM 请求） */
+  abortSignal?: AbortSignal;
   attempt: number;
 }) => Promise<{ output: string; quality: number; tokensUsed?: number }>;
 

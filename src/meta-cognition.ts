@@ -23,6 +23,7 @@ import {
   EmpiricalBernsteinSequence,
   type AnytimeVerdict,
 } from './core/anytime-evidence.js';
+import { TransportDriftMonitor, type TransportDriftView } from './core/optimal-transport.js';
 
 /** KPI 快照 */
 export interface KpiSnapshot {
@@ -177,6 +178,12 @@ export interface MetaCognitionConfig {
   tuningCooldownMs: number;
   /** 参数调整落地回调（由 index.ts 桥接到真实引擎） */
   applier?: (action: TuningAction) => void;
+  /**
+   * 读取当前真实质量阈值的回调（可选注入）。
+   * 提供时 successRate 退化规则的 from/to 以当前实际阈值（而非成功率
+   * 目标）为基线——「放宽」才名实相符；未提供时保持旧行为（零漂移）。
+   */
+  getQualityThreshold?: () => number;
 }
 
 /** 默认配置 */
@@ -256,6 +263,10 @@ export class MetaCognitionEngine {
   private scientistMind?: import('./core/scientist.js').ScientistMind;
   /** 12.0：KPI 保证层（挂载后退化/恢复判定获得任意时刻有效背书） */
   private anytimeGuards?: Map<string, AnytimeEvidenceStream>;
+  /** 17.0：形状感知传输漂移监视（挂载后分布形状变化可见） */
+  private transportDrift?: Map<string, TransportDriftMonitor>;
+  /** 17.0：各 KPI 的上次漂移态（翻转沿触发洞察） */
+  private transportDriftState = new Map<string, boolean>();
   /** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
   private guardAlpha = 0.05;
   /**
@@ -302,6 +313,58 @@ export class MetaCognitionEngine {
       ['avgQuality', new AnytimeEvidenceStream({ alpha, reference: this.config.qualityTarget })],
     ]);
     this.regimeWatches = new Map();
+  }
+
+  /**
+   * 17.0：挂载形状感知传输漂移监视（幂等；缺省覆盖 avgQuality / avgLatency）。
+   *
+   * 12.0 保证层盯**均值水位**（μ 是否越过目标线），本层盯**分布形状**
+   * （滑动窗 vs 基准窗的 Wasserstein-1）——均值不变而形状巨变
+   * （双峰化 / 尾部变厚）的「换了世界」第一次可见；13.0 保形区间的
+   * 覆盖保证在漂移下失效，本层是其绊线。阈值自适应（历史 W₁ 分位），
+   * 不 attach 即零漂移。
+   */
+  attachTransportDrift(
+    options?: Partial<{ kpis: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>; windowSize: number; referenceSize: number; thresholdQuantile: number; minSamples: number }>,
+  ): void {
+    const kpis = options?.kpis ?? ['avgQuality', 'avgLatency'];
+    // 仅传递已定义字段（显式 undefined 展开会覆盖内核缺省值）
+    const monitorOptions: Record<string, number | undefined> = {};
+    for (const key of ['windowSize', 'referenceSize', 'thresholdQuantile', 'minSamples'] as const) {
+      const v = options?.[key];
+      if (typeof v === 'number' && Number.isFinite(v)) monitorOptions[key] = v;
+    }
+    this.transportDrift = new Map();
+    for (const kpi of kpis) {
+      this.transportDrift.set(kpi, new TransportDriftMonitor(monitorOptions));
+    }
+  }
+
+  /** 17.0：形状漂移检验（每批快照后调用；翻转沿产出洞察，稳态不重复打扰） */
+  private checkTransportDrift(kpi: string, value: number): Insight[] {
+    const monitor = this.transportDrift?.get(kpi);
+    if (!monitor) return [];
+    const view = monitor.observe(value);
+    const last = this.transportDriftState.get(kpi) ?? false;
+    this.transportDriftState.set(kpi, view.drifting);
+    if (!view.drifting || last) return []; // 只在进入漂移的翻转沿打扰
+    return [
+      {
+        source: 'meta-cognition',
+        category: 'distribution-shape-drift',
+        severity: Math.min(0.95, 0.5 + view.severity * 0.2),
+        message: `KPI ${kpi} 分布形状漂移（${view.interpretation}）`,
+        suggestion:
+          view.kind === 'shape' || view.kind === 'both'
+            ? '均值水位未动但分布已变形：保形区间/置信序列的口径前提正在失效，优先排查上游数据源或模型行为变化，必要时重建校准集'
+            : '分布整体位移：结合因果旋钮排序实施干预，并观察 12.0 保证层的后续裁决',
+      },
+    ];
+  }
+
+  /** 17.0：各 KPI 的当前形状漂移视图（纯读取；未挂载返回 undefined） */
+  transportDriftView(kpi: string): TransportDriftView | undefined {
+    return this.transportDrift?.get(kpi)?.drift();
   }
 
   /**
@@ -440,6 +503,15 @@ export class MetaCognitionEngine {
     if (this.anytimeGuards) {
       insights.push(...this.checkGuarantee('successRate', snapshot.successRate));
       insights.push(...this.checkGuarantee('avgQuality', snapshot.avgQuality));
+    }
+
+    // 0.6 17.0：形状感知传输漂移（W₁ 口径；均值水位检测的盲区补位）
+    if (this.transportDrift) {
+      for (const [kpi, monitor] of this.transportDrift) {
+        const value = kpi === 'avgLatency' ? snapshot.avgLatency : kpi === 'cacheHitRate' ? snapshot.cacheHitRate : kpi === 'successRate' ? snapshot.successRate : snapshot.avgQuality;
+        if (monitor === undefined || !Number.isFinite(value)) continue;
+        insights.push(...this.checkTransportDrift(kpi, value));
+      }
     }
 
     // 1. z-score 异常检测（窗口足够时）
@@ -662,16 +734,34 @@ export class MetaCognitionEngine {
     // 规则回退（无因果证据时保持既有行为）
     if (!action) {
       if (kpi === 'successRate') {
-        // 成功率退化：降低质量阈值减少无效重试风暴，提升通过率
-        const relaxed = Math.max(0.5, target - 0.05);
-        if (relaxed < target) {
-          action = {
-            parameter: 'qualityThreshold',
-            from: target,
-            to: relaxed,
-            reason: `成功率 ${value.toFixed(2)} 低于目标 ${target}，放宽质量阈值减少重试风暴`,
-            timestamp: Date.now(),
-          };
+        // 成功率退化：降低质量阈值减少无效重试风暴，提升通过率。
+        // 注意 from/to 基线必须是「当前实际质量阈值」——若以成功率目标
+        // （默认 0.8）为基线，max(0.5, 0.8−0.05)=0.75 反而高于默认质量
+        // 阈值 0.7，名为放宽实则收紧
+        if (this.config.getQualityThreshold) {
+          const from = Math.min(0.95, Math.max(0.5, this.config.getQualityThreshold()));
+          const to = Math.max(0.5, Number((from - 0.05).toFixed(2)));
+          if (to < from) {
+            action = {
+              parameter: 'qualityThreshold',
+              from,
+              to,
+              reason: `成功率 ${value.toFixed(2)} 低于目标 ${target}，放宽质量阈值：当前 ${from.toFixed(2)} → ${to.toFixed(2)}，减少重试风暴`,
+              timestamp: Date.now(),
+            };
+          }
+        } else {
+          // 未注入当前阈值读取回调：保持旧行为（零漂移，既有验证口径不变）
+          const relaxed = Math.max(0.5, target - 0.05);
+          if (relaxed < target) {
+            action = {
+              parameter: 'qualityThreshold',
+              from: target,
+              to: relaxed,
+              reason: `成功率 ${value.toFixed(2)} 低于目标 ${target}，放宽质量阈值减少重试风暴`,
+              timestamp: Date.now(),
+            };
+          }
         }
       } else if (kpi === 'avgQuality') {
         // 质量退化：增加重试次数争取更高质量

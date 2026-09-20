@@ -345,6 +345,20 @@ export class SafetyGovernor {
     return { allowed: true };
   }
 
+  /**
+   * 22.0：预算剩余快照（只读——不消耗限流配额、不记审计、不推进任何状态）。
+   * 供预算路由内核（Bandits with Knapsacks）在每次模型选型时读取剩余资源；
+   * tokenBudget 与 costBudget 均为 0（不限预算）时返回 undefined
+   * （无预算约束即无路由依据，调度器据此走原路径）。
+   */
+  budgetSnapshot(): { tokensRemaining: number; costRemaining: number } | undefined {
+    if (this.config.tokenBudget <= 0 && this.config.costBudget <= 0) return undefined;
+    return {
+      tokensRemaining: Math.max(0, this.config.tokenBudget - this.totalTokensUsed),
+      costRemaining: Math.max(0, this.config.costBudget - this.totalCost),
+    };
+  }
+
   /** 启用 Kill Switch */
   engageKillSwitch(): void {
     this.killSwitchEngaged = true;

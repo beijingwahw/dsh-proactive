@@ -24,6 +24,7 @@
 
 import crypto from 'node:crypto';
 import type { Signal } from './sentinel.js';
+import { OpportunityStopper, type StoppingVerdict } from './core/optimal-stopping.js';
 
 /** 决策动作 */
 export type DecisionAction = 'execute' | 'defer' | 'dismiss' | 'ask-user';
@@ -144,9 +145,33 @@ export class DecisionEngine {
   /** 决策审计环形缓冲 */
   private audit: DecisionAuditEntry[] = [];
   private stats = { total: 0, ruleHits: 0, cacheHits: 0, strategistCalls: 0, heuristicFallbacks: 0 };
+  /** 19.0：机会停止器（挂载后 defer/execute 由继续价值阈值裁决） */
+  private stopper?: OpportunityStopper;
+  /** 19.0：defer 窗口内的预计剩余机会数（继续价值 V_{k−1} 的口径） */
+  private stopperHorizon = 3;
+  /** 19.0：停止器裁决审计（最近若干次） */
+  private stopperVerdicts: Array<{ signalType: string; at: number; act: boolean; value: number; threshold: number }> = [];
 
   constructor(config?: Partial<DecisionEngineConfig>) {
     this.config = { ...DEFAULT_DECISION_ENGINE_CONFIG, ...config };
+  }
+
+  /**
+   * 19.0：挂载最优停止内核（幂等；挂载后规则 C 的成本闸门从
+   * 「urgency < 0.3 且 cost > 5000 → defer」的魔数口径升级为
+   * 继续价值裁决：每类信号的紧急度流喂入经验分布，defer 窗口内
+   * 预计还有 horizon 次同类机会——当前紧急度 ≥ V_{horizon}（向后
+   * 归纳精确阈值）即执行（占坑数学最优），否则 defer（等待有价）。
+   * 不 attach 即零漂移（原魔数规则）。
+   */
+  attachOptimalStopper(options?: { horizon?: number; minSamples?: number }): void {
+    this.stopper = new OpportunityStopper({ minSamples: options?.minSamples });
+    this.stopperHorizon = Math.max(1, Math.floor(options?.horizon ?? 3));
+  }
+
+  /** 19.0：最近停止器裁决审计 */
+  getStopperVerdicts(limit = 10): Array<{ signalType: string; at: number; act: boolean; value: number; threshold: number }> {
+    return this.stopperVerdicts.slice(-limit);
   }
 
   /**
@@ -158,6 +183,16 @@ export class DecisionEngine {
   async decide(signals: Signal[], history: Map<string, SignalHistoryStats>): Promise<Map<string, Decision>> {
     const results = new Map<string, Decision>();
     const needStrategist: Signal[] = [];
+
+    // 19.0：本批信号的紧急度是「机会价值」的抽样——逐信号喂入
+    // 停止器经验分布（规则 C 的继续价值阈值由此积累）
+    if (this.stopper) {
+      for (const signal of signals) {
+        if (typeof signal.urgency === 'number' && Number.isFinite(signal.urgency)) {
+          this.stopper.note(signal.type, signal.urgency);
+        }
+      }
+    }
 
     for (const signal of signals) {
       const fingerprint = fingerprintOf(signal);
@@ -331,11 +366,27 @@ export class DecisionEngine {
     if (stats && stats.avgTokenCost > 0 && signal.urgency !== undefined) {
       const estimatedCost = stats.avgTokenCost;
       if (signal.urgency < 0.3 && estimatedCost > 5000) {
+        // 19.0：最优停止裁决——高成本信号是否值得现在占坑，由该类型
+        // 紧急度经验分布的继续价值阈值决定（魔数 defer 升级为数学 defer）
+        const stopperVerdict = this.assessOpportunity(signal.type, signal.urgency);
+        if (stopperVerdict?.act) {
+          return {
+            action: 'execute',
+            urgency: signal.urgency,
+            confidence: 0.75,
+            reason: `高成本但现值已过继续价值线：${stopperVerdict.interpretation}`,
+            source: 'rule',
+            estimatedCost,
+            decidedAt: now,
+          };
+        }
         return {
           action: 'defer',
           urgency: signal.urgency,
           confidence: 0.7,
-          reason: `高成本任务（约 ${estimatedCost} tokens）且紧急度低，延迟到空闲期`,
+          reason: stopperVerdict
+            ? `高成本任务（约 ${estimatedCost} tokens）且 ${stopperVerdict.interpretation}`
+            : `高成本任务（约 ${estimatedCost} tokens）且紧急度低，延迟到空闲期`,
           source: 'rule',
           deferMs: 5 * 60_000,
           estimatedCost,
@@ -345,6 +396,28 @@ export class DecisionEngine {
     }
 
     return null;
+  }
+
+  /**
+   * 19.0：机会价值评估（规则 C 内部调用）。
+   *
+   * 紧急度流已在 decide() 逐信号喂入停止器；此处评估当前抽值是否
+   * 越过继续价值。未挂载或经验不足（insufficient）返回 undefined
+   * ——回退原魔数口径（诚实弃权，零漂移）。
+   */
+  private assessOpportunity(signalType: string, urgency: number): StoppingVerdict | undefined {
+    if (!this.stopper) return undefined;
+    const verdict = this.stopper.assess(signalType, urgency, this.stopperHorizon);
+    if (verdict.basis !== 'backward-induction') return undefined;
+    this.stopperVerdicts.push({
+      signalType,
+      at: Date.now(),
+      act: verdict.act,
+      value: verdict.value,
+      threshold: verdict.threshold,
+    });
+    if (this.stopperVerdicts.length > 50) this.stopperVerdicts.shift();
+    return verdict;
   }
 
   /** 第 2 级：缓存查询（校验 TTL 与置信度） */

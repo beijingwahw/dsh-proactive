@@ -864,6 +864,9 @@ export class PolicyEvolver implements IPolicyEvolver {
         totalCandidatesEvaluated: this.totalCandidatesEvaluated,
         totalCycles: this.totalCycles,
         cycleReports: this.cycleReports.slice(-20),
+        // 策略 id 计数器一并落盘：重启后新策略 id 从恢复值续增，不与
+        // 恢复的种群/历史撞 id（loadPersisted 侧还会扫 id 后缀取 max 兜底）
+        policyCounter: this.policyCounter,
         savedAt: Date.now(),
       };
       const tmp = `${persistPath}.tmp.${process.pid}`;
@@ -888,6 +891,7 @@ export class PolicyEvolver implements IPolicyEvolver {
         canary?: CanaryState;
         totalCandidatesEvaluated?: number;
         totalCycles?: number;
+        policyCounter?: number;
       };
       if (parsed.currentPolicy?.params) {
         this.current = { ...parsed.currentPolicy, params: normalizePolicyParams(parsed.currentPolicy.params) };
@@ -898,6 +902,20 @@ export class PolicyEvolver implements IPolicyEvolver {
         this.canary = parsed.canary?.status === 'active' ? parsed.canary : undefined;
         this.totalCandidatesEvaluated = parsed.totalCandidatesEvaluated ?? 0;
         this.totalCycles = parsed.totalCycles ?? 0;
+        // 恢复策略 id 计数器：取持久化值与已恢复集合中出现过的
+        // `policy-N` 数字后缀最大值之 max——旧版持久化文件没有计数器
+        // 字段时，仍能从恢复的种群/部署历史/评估谱系兜底推出不撞 id 的起点
+        const persistedCounter =
+          typeof parsed.policyCounter === 'number' && Number.isFinite(parsed.policyCounter) && parsed.policyCounter > 0
+            ? Math.floor(parsed.policyCounter)
+            : 0;
+        let maxIdSuffix = 0;
+        for (const policy of [this.current, this.previousPolicy, ...this.deployedHistory, ...this.population]) {
+          if (!policy?.id) continue;
+          const match = /^policy-(\d+)$/.exec(policy.id);
+          if (match) maxIdSuffix = Math.max(maxIdSuffix, Number(match[1]));
+        }
+        this.policyCounter = Math.max(persistedCounter, maxIdSuffix);
         // 恢复后立即热切换到上次策略（无需重启即恢复进化成果）
         this.config.onDeploy?.(this.getCurrentPolicy());
       }

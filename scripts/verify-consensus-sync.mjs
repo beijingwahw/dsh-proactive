@@ -122,7 +122,9 @@ console.log('B sync 幂等持久化 + ack 回执 + 待推字节计量');
   ok(syncA.getStatus().peerClocks['node-b'] === batch.logicalClock, 'handleAck 回执后进度确认生效');
 
   syncA.stop(); syncB2.stop();
-  fs.rmSync(dir, { recursive: true, force: true });
+  // Windows 下 SQLite 句柄须显式释放, 否则目录删除 EPERM
+  try { memA.dispose(); memB.dispose(); } catch { /* 已释放 */ }
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 // ═══ C belief cancel 审计 + ledger gini 口径 ═══

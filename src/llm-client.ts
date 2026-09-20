@@ -17,6 +17,7 @@
  */
 
 import { AppError, NetworkError, TimeoutError } from './errors.js';
+import { RobustStream } from './core/robust-statistics.js';
 
 /** 聊天消息（OpenAI 兼容格式） */
 export interface ChatMessage {
@@ -75,6 +76,14 @@ export interface LLMClientConfig {
    * （经 ctx 获取的已配置客户端），本客户端仅保留并发控制/统计/重试外壳。
    */
   externalChat?: (modelId: string, messages: ChatMessage[], options: ChatOptions) => Promise<LLMResponse>;
+  /**
+   * 23.0 稳健延迟统计（可选）：配置后为每模型维护一条 RobustStream
+   * （样本量自适应切换 mean → median-of-means → Catoni，重尾延迟下
+   * 算术均值被极端值支配的问题被截断影响函数免疫），每次成功调用的
+   * 延迟（毫秒）喂入流；getModelStatuses 相应输出 robustAvgLatencyMs /
+   * robustLatencyMethod。未配置时两字段不出现、零开销（零漂移）。
+   */
+  robustLatency?: { alpha?: number; maxSamples?: number };
 }
 
 /** 单次调用选项 */
@@ -123,6 +132,13 @@ export interface ModelRuntimeStatus {
   totalTokensUsed: number;
   totalCost: number;
   taskScores: Record<string, number>;
+  /**
+   * 23.0 稳健平均延迟（毫秒，Catoni/MoM/均值按样本量自适应）；
+   * 仅当 LLMClient 配置了 robustLatency 时出现，否则键不存在（零漂移）。
+   */
+  robustAvgLatencyMs?: number;
+  /** 23.0 稳健估计方法（'mean' | 'mom' | 'catoni'；样本 < 8 时如实输出 'mean'） */
+  robustLatencyMethod?: string;
 }
 
 /** 模型调用错误（携带 HTTP 状态与可重试标记） */
@@ -176,6 +192,8 @@ export class LLMClient {
   private models = new Map<string, ModelState>();
   private fetchImpl: typeof fetch;
   private disposed = false;
+  /** 23.0：每模型稳健延迟流（仅配置 robustLatency 时创建） */
+  private readonly robustStreams = new Map<string, RobustStream>();
 
   constructor(config?: Partial<LLMClientConfig>) {
     this.config = { ...DEFAULT_LLM_CLIENT_CONFIG, ...config };
@@ -200,6 +218,8 @@ export class LLMClient {
       totalTokensUsed: existing?.totalTokensUsed ?? 0,
       totalCost: existing?.totalCost ?? 0,
     });
+    // 23.0：启用稳健延迟统计时随注册建流（已存在则保留样本，不因重注册清零）
+    if (this.config.robustLatency) this.robustStreamFor(model.id);
   }
 
   /**
@@ -270,22 +290,30 @@ export class LLMClient {
    * 获取所有模型的运行时状态（model_dashboard Tool 数据源）
    */
   getModelStatuses(): ModelRuntimeStatus[] {
-    return [...this.models.values()].map((s) => ({
-      id: s.config.id,
-      name: s.config.name ?? s.config.id,
-      endpoint: s.config.endpoint,
-      activeRequests: s.active,
-      queuedRequests: s.queue.length,
-      maxConcurrency: s.maxConcurrency,
-      totalCalls: s.totalCalls,
-      successCount: s.successCount,
-      failureCount: s.failureCount,
-      successRate: s.totalCalls > 0 ? s.successCount / s.totalCalls : 1,
-      avgLatency: s.totalCalls > 0 ? Math.round(s.totalLatency / s.totalCalls) : 0,
-      totalTokensUsed: s.totalTokensUsed,
-      totalCost: Number(s.totalCost.toFixed(6)),
-      taskScores: s.config.initialCapabilities?.taskScores ?? {},
-    }));
+    return [...this.models.values()].map((s) => {
+      // 23.0：稳健延迟读数（未配置 robustLatency 时为 undefined，
+      // 两个新字段不进入状态对象 —— 输出与升级前逐位一致，零漂移）
+      const robust = this.config.robustLatency ? this.robustStreamFor(s.config.id)?.read() : undefined;
+      return {
+        id: s.config.id,
+        name: s.config.name ?? s.config.id,
+        endpoint: s.config.endpoint,
+        activeRequests: s.active,
+        queuedRequests: s.queue.length,
+        maxConcurrency: s.maxConcurrency,
+        totalCalls: s.totalCalls,
+        successCount: s.successCount,
+        failureCount: s.failureCount,
+        successRate: s.totalCalls > 0 ? s.successCount / s.totalCalls : 1,
+        avgLatency: s.totalCalls > 0 ? Math.round(s.totalLatency / s.totalCalls) : 0,
+        totalTokensUsed: s.totalTokensUsed,
+        totalCost: Number(s.totalCost.toFixed(6)),
+        taskScores: s.config.initialCapabilities?.taskScores ?? {},
+        ...(robust
+          ? { robustAvgLatencyMs: Math.round(robust.robustMean), robustLatencyMethod: robust.method }
+          : {}),
+      };
+    });
   }
 
   /**
@@ -294,6 +322,7 @@ export class LLMClient {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.robustStreams.clear();
     for (const state of this.models.values()) {
       for (const waiter of state.queue.splice(0)) {
         waiter.reject(new LLMError('LLM 客户端已关闭，排队请求被取消'));
@@ -302,6 +331,25 @@ export class LLMClient {
   }
 
   // ─────────────────────────── 内部实现 ───────────────────────────
+
+  /**
+   * 23.0：取（或惰性创建）模型的稳健延迟流。
+   * 仅在配置 robustLatency 时返回流，否则返回 undefined（零开销路径）；
+   * dispose 后不再复活统计流（清空即终态）。
+   */
+  private robustStreamFor(modelId: string): RobustStream | undefined {
+    if (!this.config.robustLatency) return undefined;
+    let stream = this.robustStreams.get(modelId);
+    if (!stream) {
+      if (this.disposed) return undefined;
+      stream = new RobustStream({
+        alpha: this.config.robustLatency.alpha,
+        maxSamples: this.config.robustLatency.maxSamples,
+      });
+      this.robustStreams.set(modelId, stream);
+    }
+    return stream;
+  }
 
   /** 获取并发槽位（必要时排队） */
   private acquireSlot(state: ModelState): Promise<void> {
@@ -348,6 +396,9 @@ export class LLMClient {
         response.retries = attempt;
         state.totalTokensUsed += response.tokensUsed;
         state.totalCost += response.cost;
+        // 23.0：成功调用的本次延迟（毫秒）喂入稳健流
+        // （重试链路最终成功的那一次实测延迟；未配置时零开销）
+        this.robustStreamFor(state.config.id)?.observe(response.latency);
         this.config.onKeyOutcome?.(state.config.id, keyAttempt, true);
         return response;
       } catch (err) {
