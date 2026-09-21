@@ -20,6 +20,7 @@
  */
 
 import { coverageFromTokens, lazyGreedy } from './core/submodular.js';
+import { fairDomainBudget } from './core/fair-division.js';
 
 /** 知识盲区候选 */
 export interface KnowledgeGap {
@@ -298,6 +299,19 @@ export class CuriosityEngine {
 
   private submodularSelector?: { coverageStrength: number };
 
+  /**
+   * 44.0：挂载公平预算（幂等覆盖，挂载即生效）。
+   *
+   * 探索预算按域（taskType）加权极大极小分配（新颖度权重 + 注水算法，
+   * 词典序最优）：热门域可以多拿，但任何活跃域的相对份额不被压扁——
+   * 探索的覆盖有公平定理背书（多样性坍缩在预算层上锁）。未挂载零漂移。
+   */
+  attachFairBudget(): void {
+    this.fairBudget = true;
+  }
+
+  private fairBudget = false;
+
   /** 30.0：任务类型 → token 集（主题 = 共享 token；camelCase 与连字符统一拆分） */
   private static tokenize(taskType: string): string[] {
     return taskType
@@ -331,6 +345,61 @@ export class CuriosityEngine {
         noveltyScore: gap.noveltyScore,
         expectedGain: this.describeGain(gap),
       }));
+    }
+
+    // 44.0 公平预算路径：按域（任务家族 = 类型首 token，如 gen-* / review-*）
+    // 加权极大极小分配——热门家族可以多拿，但任何活跃家族的相对份额不被
+    // 压扁（整数保底：高权重家族优先各得 1，再按新颖度权重注水）；
+    // 家族内按新颖度取 top。未挂载时零漂移（原 top-k / 次模路径不变）。
+    if (this.fairBudget) {
+      const familyOf = (taskType: string) => taskType.split(/[-_\s]/)[0] || taskType;
+      const byDomain = new Map<string, KnowledgeGap[]>();
+      for (const gap of gaps) {
+        const family = familyOf(gap.taskType);
+        const bucket = byDomain.get(family) ?? [];
+        bucket.push(gap);
+        byDomain.set(family, bucket);
+      }
+      const shares = new Map(
+        fairDomainBudget(
+          [...byDomain.entries()].map(([id, list]) => ({
+            id,
+            demand: list.length,
+            weight: Math.max(1e-6, list.reduce((s, g) => s + g.noveltyScore, 0) / list.length),
+          })),
+          budget,
+        ).map((s) => [s.id, Math.floor(s.share)]),
+      );
+      const proposals: ExplorationProposal[] = [];
+      const domainsSorted = [...byDomain.entries()].sort((a, b) => shares.get(b[0])! - shares.get(a[0])!);
+      for (const [domain, list] of domainsSorted) {
+        const take = Math.min(list.length, shares.get(domain) ?? 0);
+        for (const gap of [...list].sort((a, b) => b.noveltyScore - a.noveltyScore).slice(0, take)) {
+          proposals.push({
+            taskType: gap.taskType,
+            description: this.describeExploration(gap),
+            noveltyScore: gap.noveltyScore,
+            expectedGain: this.describeGain(gap),
+          });
+        }
+      }
+      // 尾差补齐（floor 损失的名额按全局新颖度回填）
+      if (proposals.length < budget) {
+        const taken = new Set(proposals.map((p) => p.taskType + p.description));
+        for (const gap of [...gaps].sort((a, b) => b.noveltyScore - a.noveltyScore)) {
+          if (proposals.length >= budget) break;
+          const key = gap.taskType + this.describeExploration(gap);
+          if (taken.has(key)) continue;
+          taken.add(key);
+          proposals.push({
+            taskType: gap.taskType,
+            description: this.describeExploration(gap),
+            noveltyScore: gap.noveltyScore,
+            expectedGain: this.describeGain(gap),
+          });
+        }
+      }
+      return proposals.slice(0, budget);
     }
 
     // 30.0 次模路径：加权覆盖（主题 = 共享 token）惰性贪心

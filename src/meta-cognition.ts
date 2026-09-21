@@ -25,6 +25,8 @@ import {
 } from './core/anytime-evidence.js';
 import { TransportDriftMonitor, type TransportDriftView } from './core/optimal-transport.js';
 import { LocalLinearTrendFilter, type TrendFilterConfig, type TrendStepRead } from './core/kalman-filter.js';
+import { dynamicsRegime, type DynamicsAssessment, type DynamicsRegime } from './core/nonlinear-dynamics.js';
+import { multiScaleView } from './core/multiscale-wavelet.js';
 
 /** KPI 快照 */
 export interface KpiSnapshot {
@@ -278,6 +280,10 @@ export class MetaCognitionEngine {
   private transportDriftState = new Map<string, boolean>();
   /** 27.0：KPI 局部线性趋势滤波器（挂载后异常判定升级为 NIS 假设检验） */
   private kalmanFilters?: Map<string, LocalLinearTrendFilter>;
+  /** 38.0：KPI 动力学体质序列（attachChaosDiagnostics 后积累） */
+  private chaosSeries?: Map<string, number[]>;
+  /** 38.0：已确立的动力学体质（翻转沿洞察的去重状态） */
+  private chaosRegimeState = new Map<string, DynamicsRegime>();
   /** 27.0：各 KPI 的上次门控态（翻转沿触发洞察） */
   private kalmanGateState = new Map<string, boolean>();
   /** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
@@ -405,6 +411,107 @@ export class MetaCognitionEngine {
   /** 27.0：KPI 的当前滤波读数（纯读取；未挂载返回 undefined） */
   kalmanView(kpi: string): TrendStepRead | undefined {
     return this.kalmanFilters?.get(kpi)?.lastRead;
+  }
+
+  /**
+   * 38.0：挂载动力学体质诊断（幂等覆盖，挂载即生效）。
+   *
+   * 每个 KPI 序列积累满 minPoints（缺省 96）后做体质分类：混沌
+   * （λ₁ > 0，预测视野 ~1/λ₁ 步）、持续（H > 0.5+δ，趋势自我强化）、
+   * 反持续（H < 0.5−δ，均值回归）、随机漫步（无结构）。体质确立的
+   * 翻转沿产出洞察——**同一份 KPI，三种读法**：混沌序列上精细预测器
+   * 的置信应随视野收窄、持续序列的趋势洞察加权、反持续序列的「突破」
+   * 多半回归。未挂载零漂移。
+   */
+  attachChaosDiagnostics(options?: {
+    kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+    minPoints?: number;
+    lambdaThreshold?: number;
+    hurstDelta?: number;
+  }): void {
+    const kpis = options?.kpis ?? ['successRate', 'avgQuality', 'avgLatency', 'cacheHitRate'];
+    this.chaosMinPoints = Math.max(64, Math.floor(options?.minPoints ?? 96));
+    this.chaosOptions = { lambdaThreshold: options?.lambdaThreshold, hurstDelta: options?.hurstDelta };
+    this.chaosSeries = new Map();
+    this.chaosRegimeState = new Map();
+    for (const kpi of kpis) this.chaosSeries.set(kpi, []);
+  }
+
+  private chaosMinPoints = 96;
+  private chaosOptions: { lambdaThreshold?: number; hurstDelta?: number } = {};
+
+  /**
+   * 49.0：挂载多尺度小波视图（幂等覆盖，挂载即生效——纯读数口径）。
+   *
+   * KPI 序列经 Haar 小波分解为对数个正交尺度：最粗趋势（长期水平）、
+   * 中尺度细节（漂移带能量）、最细细节（瞬时突发）——单尺度异常检测
+   * 看不见的「慢漂移 vs 快突发」结构分离。waveletView 给出各尺度能量
+   * 落位；洞察消费留给上层（零漂移：仅新增读数）。
+   */
+  attachWaveletView(options?: { kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>; minPoints?: number }): void {
+    const kpis = options?.kpis ?? ['successRate', 'avgQuality', 'avgLatency', 'cacheHitRate'];
+    this.waveletMinPoints = Math.max(32, Math.floor(options?.minPoints ?? 64));
+    this.waveletSeries = new Map();
+    for (const kpi of kpis) this.waveletSeries.set(kpi, []);
+  }
+
+  private waveletSeries?: Map<string, number[]>;
+  private waveletMinPoints = 64;
+
+  /** 49.0：KPI 的多尺度读数（纯读取；未挂载/未满窗返回 undefined） */
+  waveletView(kpi: string): { trendLevel: number; burstShare: number; dominantScale: string; driftShare: number } | undefined {
+    const series = this.waveletSeries?.get(kpi);
+    if (!series || series.length < this.waveletMinPoints) return undefined;
+    return multiScaleView(series);
+  }
+
+  /** 49.0：序列喂入（observe 的 0.9 段调用；未挂载零开销） */
+  private feedWavelet(kpi: string, value: number): void {
+    const series = this.waveletSeries?.get(kpi);
+    if (!series || !Number.isFinite(value)) return;
+    series.push(value);
+    if (series.length > 256) series.splice(0, series.length - 256);
+  }
+
+  /** 38.0：KPI 的动力学体质读数（纯读取；未挂载/未满窗返回 undefined） */
+  chaosView(kpi: string): DynamicsAssessment | undefined {
+    const series = this.chaosSeries?.get(kpi);
+    if (!series || series.length < this.chaosMinPoints) return undefined;
+    return dynamicsRegime(series, this.chaosOptions);
+  }
+
+  /** 38.0：体质分类（满窗后每批快照评估；翻转沿产出洞察） */
+  private checkChaos(kpi: string, value: number): Insight[] {
+    const series = this.chaosSeries?.get(kpi);
+    if (!series || !Number.isFinite(value)) return [];
+    series.push(value);
+    if (series.length > 256) series.splice(0, series.length - 256);
+    if (series.length < this.chaosMinPoints) return [];
+    const assessment = dynamicsRegime(series, this.chaosOptions);
+    const last = this.chaosRegimeState.get(kpi);
+    this.chaosRegimeState.set(kpi, assessment.regime);
+    if (last === undefined || last === assessment.regime || assessment.regime === 'stochastic') return [];
+    const hints: Record<Exclude<DynamicsRegime, 'stochastic'>, { severity: number; message: string; suggestion: string }> = {
+      chaotic: {
+        severity: 0.7,
+        message: `KPI ${kpi} 动力学体质转为混沌（λ₁=${assessment.lyapunov?.toFixed(3)} nat/步 > 0）：误差指数放大，可用预测视野约 ${assessment.forecastHorizonSteps} 步`,
+        suggestion: '收窄 26.0 GP 校准与 2 号预测的信任视野至 ~1/λ₁ 步；混沌不是噪声——加大采样不解决敏感依赖，改用区间/包络口径而非点预测',
+      },
+      persistent: {
+        severity: 0.55,
+        message: `KPI ${kpi} 呈持续性（H=${assessment.hurst?.toFixed(2)} > 0.5）：趋势自我强化，动量口径成立`,
+        suggestion: '趋势洞察加权：上升沿的健康度下滑更可能是真退化（勿当突发噪声 dismissing）；回落确认需更长证据',
+      },
+      'mean-reverting': {
+        severity: 0.45,
+        message: `KPI ${kpi} 呈反持续性（H=${assessment.hurst?.toFixed(2)} < 0.5）：均值回归，单点「突破」多半回摆`,
+        suggestion: '突破类洞察降权：等待回归失败（连续越界）再升级；熔断/阈值口径可适度放宽瞬时抖动',
+      },
+    };
+    const hint = hints[assessment.regime];
+    return hint
+      ? [{ source: 'meta-cognition', category: 'dynamics-regime', taskType: undefined, severity: hint.severity, message: hint.message, suggestion: hint.suggestion }]
+      : [];
   }
 
   /** 27.0：NIS 门控检验（每批快照后调用；进入门控的翻转沿产出洞察） */
@@ -582,6 +689,21 @@ export class MetaCognitionEngine {
         const value = kpi === 'avgLatency' ? snapshot.avgLatency : kpi === 'cacheHitRate' ? snapshot.cacheHitRate : kpi === 'successRate' ? snapshot.successRate : snapshot.avgQuality;
         if (!Number.isFinite(value)) continue;
         insights.push(...this.checkKalman(kpi, value));
+      }
+    }
+
+    // 0.8 38.0：动力学体质分类（混沌/持续/反持续/随机——翻转沿洞察）
+    if (this.chaosSeries) {
+      for (const kpi of this.chaosSeries.keys()) {
+        const value = kpi === 'avgLatency' ? snapshot.avgLatency : kpi === 'cacheHitRate' ? snapshot.cacheHitRate : kpi === 'successRate' ? snapshot.successRate : snapshot.avgQuality;
+        insights.push(...this.checkChaos(kpi, value));
+      }
+    }
+
+    // 0.9 49.0：多尺度小波视图（序列喂入；纯读数，不产洞察——零打扰）
+    if (this.waveletSeries) {
+      for (const kpi of this.waveletSeries.keys()) {
+        this.feedWavelet(kpi, kpi === 'avgLatency' ? snapshot.avgLatency : kpi === 'cacheHitRate' ? snapshot.cacheHitRate : kpi === 'successRate' ? snapshot.successRate : snapshot.avgQuality);
       }
     }
 

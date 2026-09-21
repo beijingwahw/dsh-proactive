@@ -72,6 +72,8 @@ import { BwKRouter } from './core/bandit-knapsack.js';
 import { PrivacyAccountant, perturbNumbers } from './core/differential-privacy.js';
 import { CapacityPlanner, type CapacityPlan } from './core/capacity-planning.js';
 import { TailRiskMonitor, type TailRiskReport } from './core/extreme-value.js';
+import { SystemicRiskMonitor, type SystemicRiskAssessment } from './core/random-matrix.js';
+import { tandemNetwork, bottleneckInsight } from './core/queueing-network.js';
 import { renderSankeyHtml } from './symbiosis/observability.js';
 import { CuriosityEngine, type ExplorationProposal } from './curiosity-engine.js';
 import { SafetyGovernor } from './safety-governor.js';
@@ -602,6 +604,220 @@ export interface SchedulerConfig {
       enabled: boolean;
       /** 主题覆盖强度 c ∈ (0,1]（缺省 0.7） */
       coverageStrength?: number;
+    };
+    /**
+     * 31.0：对抗组合配置（调度权重的无悔学习口径）。
+     * enabled 时模型评分叠加 Fixed-Share Hedge 有界乘数（[0.25,4]）：
+     * 每次节点完成回报质量（成功 = 质量，失败 = 0），被对手打爆的模型
+     * 以每失败一轮 e^{−η} 的速度降权——比统计口径（Wilson 时间衰减）
+     * 快一个数量级；α 份额回灌保证漂移世界（模型能力翻转）可跟踪。
+     * 对事后最优固定模型遗憾 ≤ √(2T lnN)（对手无关）。缺省关闭（零漂移）。
+     */
+    hedgePortfolio?: {
+      enabled: boolean;
+      /** 学习率 η ∈ (0,1]（缺省 0.3） */
+      eta?: number;
+      /** Fixed-Share 回灌率 α ∈ [0,1)（缺省 0.05；0 = 经典 Hedge） */
+      alpha?: number;
+    };
+    /**
+     * 32.0：批内全局最优指派配置（匈牙利算法）。
+     * enabled 时同批动态选型节点（≥2 个且候选 ≥2）不再逐节点贪心，
+     * 而是构造「节点 × 候选」评分矩阵求**全局总收益最优**一对一指派
+     * （O(n³) 精确解 + 对偶证书）——最优模型不被同批节点重复超订。
+     * 计划指定/优化器推荐的节点不受影响（约束优先）。缺省关闭（零漂移）。
+     */
+    optimalAssignment?: {
+      enabled: boolean;
+      /** 每任务类型进入候选池的评分前 K（缺省 8） */
+      candidateCap?: number;
+    };
+    /**
+     * 33.0：随机矩阵配置（失败相关性的噪声清洗与系统性风险）。
+     * enabled 时心跳 2.8 段把各模型每期失败计数喂入滚动窗口，攒满后
+     * 相关矩阵经 Marchenko–Pastur 边界清洗：伪相关被噪声带吸收（不
+     * 误报），头号特征值显著超带且解释份额达标 → systemic-risk 洞察
+     * （共同因子暴露：同一上游/厂商的模型会同沉浮，热备冗余是幻觉）。
+     * 缺省关闭（零漂移）。
+     */
+    randomMatrix?: {
+      enabled: boolean;
+      /** 滚动窗口长度（心跳期数；缺省 32） */
+      window?: number;
+      /** 参与评估的最少活跃模型数（缺省 4） */
+      minModels?: number;
+      /** 信号判定倍数 λ₁ > factor × λ+（缺省 1.1） */
+      edgeFactor?: number;
+      /** 系统性洞察的解释份额门槛（缺省 0.35） */
+      systemicShare?: number;
+    };
+    /**
+     * 34.0：CVaR 超时预算配置（超时的最坏尾部定价）。
+     * enabled 时每模型超时 = margin × CVaR_α(该模型延迟史)（α 为置信
+     * 水平，缺省 0.95 即最坏 5% 尾），钳位 [floorMs, capMs]——「按最坏
+     * 尾部的期望定价」取代固定魔数：重尾模型自动获得更长预算、轻尾模型
+     * 不被一刀切。依赖 robustStatistics 启用（延迟样本流共用）；样本不足
+     * minSamples 回退全局缺省。缺省关闭。
+     */
+    cvarTimeouts?: {
+      enabled: boolean;
+      /** 置信水平 α（CVaR_α 取最坏 1−α 尾；缺省 0.95） */
+      alpha?: number;
+      /** 裕度乘数（缺省 1.5） */
+      margin?: number;
+      /** 样本下限（缺省 30） */
+      minSamples?: number;
+      /** 下限毫秒（缺省 5000） */
+      floorMs?: number;
+      /** 上限毫秒（缺省 300000） */
+      capMs?: number;
+    };
+    /**
+     * 35.0：并发反馈控制配置（并发的闭环 LQR 驾驭）。
+     * enabled 时 computeParallelism 从静态口径（总容量钳位）升级为闭环：
+     * 每次调用观测总利用率 → LQR 增益步（DARE 闭式解出的增益，Lyapunov
+     * 证书背书稳定）→ 新上限 [1,16]；死区抗抖振、钳位抗饱和。25.0 排队论
+     * 反解给的是静态目标，本内核让系统在非平稳负载下自动追踪它。缺省关闭。
+     */
+    concurrencyControl?: {
+      enabled: boolean;
+      /** 目标利用率 ∈ (0,1]（缺省 0.75） */
+      target?: number;
+      /** 标称被控增益 b（缺省 0.4） */
+      plantGain?: number;
+      /** 控制权重 r（缺省 4；越大越保守） */
+      r?: number;
+      /** 死区半宽（缺省 0.05） */
+      deadband?: number;
+    };
+    /**
+     * 37.0：信息瓶颈蒸馏定价配置（理解即压缩的算法化）。
+     * enabled 时知识蒸馏门槛从纯水位升维为水位 + 信息量双门：候选
+     * 样本（任务位型 × 成败）经 Blahut-Arimoto IB 压缩，保留率
+     * I(T;Y)/I(X;Y) 低于 retentionFloor → 样本同构，水位再高也只产出
+     * 重复知识，诚实跳过（below-information）。缺省关闭（零漂移）。
+     */
+    informationBottleneck?: {
+      enabled: boolean;
+      /** 压缩-相关权衡 β（缺省 5） */
+      beta?: number;
+      /** 保留率下限（缺省 0.4） */
+      retentionFloor?: number;
+    };
+    /**
+     * 38.0：动力学体质诊断配置（KPI 的混沌/持续/反持续分类）。
+     * enabled 时元认知对每个 KPI 序列积累窗口，满窗后做 Rosenstein
+     * Lyapunov + R/S Hurst 体质分类；体质确立的翻转沿产出洞察（混沌
+     * → 预测视野 ~1/λ₁ 步；持续 → 趋势加权；反持续 → 突破降权）。
+     * 缺省关闭（零漂移）。
+     */
+    chaosDiagnostics?: {
+      enabled: boolean;
+      /** 分类前最少样本点（缺省 96） */
+      minPoints?: number;
+      /** 混沌判定阈值 λ₁（缺省 0.05 nat/步） */
+      lambdaThreshold?: number;
+      /** Hurst 偏离半宽 δ（缺省 0.08） */
+      hurstDelta?: number;
+    };
+    /**
+     * 39.0：谱排序影响力配置（知识图的 PageRank 骨架）。
+     * enabled 时记忆图共现网络经 PageRank 幂迭代解出每条知识的结构
+     * 影响力：related() 联想序升维为「边权 × 邻居影响力」（与枢纽
+     * 共现者先被想起），topInfluential 输出知识骨架清单。缺省关闭。
+     */
+    spectralRanking?: {
+      enabled: boolean;
+      /** 阻尼系数（缺省 0.85） */
+      damping?: number;
+    };
+    /**
+     * 40.0：首达时间冷却定价配置（熔断恢复的概率口径）。
+     * enabled 时治理器记录失败时间戳；熔断打开沿按逆高斯首达模型定价
+     * 「以 target 概率确信失败强度已恢复」的最小冷却建议（μ̂ ≤ 0 的
+     * 结构性恶化诚实给出不可达）。建议口径，不改既有状态机时序。
+     * 缺省关闭（零记录零介入）。
+     */
+    firstPassageCooldown?: {
+      enabled: boolean;
+      /** 恢复置信目标（缺省 0.9） */
+      targetProb?: number;
+    };
+    /**
+     * 41.0：排队网络配置（心跳 2.9 段的串联瓶颈洞察）。
+     * enabled 时各模型作为独立 M/M/c 站、到达率按当前流量份额分摊，
+     * Erlang-C 口径解出瓶颈站（ρ 最大）——单站反解（25.0）看不到的
+     * 「哪一站钳制整条链路」成为可计算读数，接近饱和产出洞察。
+     * 缺省关闭（零漂移）。
+     */
+    queueingNetwork?: {
+      enabled: boolean;
+      /** 瓶颈站告警利用率阈值（缺省 0.85） */
+      rhoThreshold?: number;
+    };
+    /**
+     * 42.0：谱日历配置（到达节律的频谱解出）。
+     * enabled 时世界模型的热度因子从「预设为一天的小时直方图」升级为
+     * FFT 周期图 + Fisher g 检验：存在显著周期（任意周期——分钟回环/
+     * 昼夜/周节律）时切换为相位感知的谐波季节因子；不显著时逐位回退
+     * 原直方图口径。缺省关闭（零漂移）。
+     */
+    spectralCalendar?: {
+      enabled: boolean;
+      /** 小时分桶数（2 的幂最优；缺省 128） */
+      bins?: number;
+    };
+    /**
+     * 43.0：容量前沿配置（类型需求 × 模型容量的最大流诊断）。
+     * enabled 时执行批回写待执行需求，流网络上解 max-flow（可立即满足
+     * 的最大并发派发）与 min-cut（钳制者归因：类型在饿还是模型是独木
+     * 桥，割容量 = 流值证书）。纯诊断口径，不改变派发行为。缺省关闭。
+     */
+    capacityFrontier?: {
+      enabled: boolean;
+    };
+    /**
+     * 44.0：公平预算配置（探索预算的域级极大极小分配）。
+     * enabled 时探索预算按域（taskType）加权极大极小注水（新颖度权重）
+     * ——热门域可以多拿，但任何活跃域的相对份额不被压扁（词典序最优，
+     * Bertsekas–Gallager）。缺省关闭（零漂移——原 top-k / 次模路径）。
+     */
+    fairBudget?: {
+      enabled: boolean;
+    };
+    /**
+     * 45.0：OCBA 预算分配配置（基准瓶颈确认的最优预算）。
+     * enabled 时 runAll 报告附加 bottleneckFocus——以各场景延迟统计为
+     * 试点，按 OCBA（P(CS) 渐近最优）给出下一轮确认预算的最优分配。
+     * 纯报告口径。缺省关闭（零漂移）。
+     */
+    ocbaAllocator?: {
+      enabled: boolean;
+      /** 下一轮确认预算（缺省 200） */
+      confirmationBudget?: number;
+    };
+    /**
+     * 49.0：多尺度小波视图配置（元认知 KPI 的尺度透镜）。
+     * enabled 时 KPI 序列经 Haar 小波分解为对数个正交尺度——趋势水平/
+     * 漂移带能量/瞬时突发分离（单尺度异常检测看不见的结构）。纯读数
+     * 口径（waveletView），缺省关闭（零漂移）。
+     */
+    waveletView?: {
+      enabled: boolean;
+      /** 补全读数前最少样本点（缺省 64） */
+      minPoints?: number;
+    };
+    /**
+     * 50.0：潜因子补全配置（模型能力的冷启动外推）。
+     * enabled 时「模型 × 任务类型」能力矩阵经 ALS 低秩补全：未观测
+     * 条目由潜因子外推（Candès–Recht 恢复条件），新模型冷启动选型
+     * 从零样本升级为潜维度预测。纯诊断口径（coldStartEstimate），
+     * 缺省关闭（零漂移）。
+     */
+    latentFactors?: {
+      enabled: boolean;
+      /** 潜维数 r（缺省 3） */
+      rank?: number;
     };
     /** 目标分解器注入（测试离线模拟） */
     decomposer?: import('./goal-engine.js').GoalDecomposer;
@@ -1771,6 +1987,209 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     );
   }
 
+  // ── 31.0 对抗组合内核：调度权重的无悔学习 ──
+  // 质变基座：Wilson/UCB/Gittins 全部假设世界是平稳概率分布；多模型
+  // 现实是对抗 / 非平稳的（限流、静默降级、周节律）。Fixed-Share Hedge
+  // 叠加有界乘数（[0.25,4]）：对事后最优固定模型的遗憾 ≤ √(2T lnN)，
+  // 对手无论怎么出招都成立；α 回灌保证模型能力翻转可跟踪。
+  // 缺省关闭（零漂移——乘数恒 1）。
+  if (cfg.autonomy?.hedgePortfolio?.enabled === true) {
+    modelScheduler.attachHedgePortfolio({
+      eta: cfg.autonomy.hedgePortfolio.eta,
+      alpha: cfg.autonomy.hedgePortfolio.alpha,
+    });
+    logger.info(
+      '31.0 对抗组合内核已挂载：Fixed-Share Hedge（eta=%s, alpha=%s）',
+      cfg.autonomy.hedgePortfolio.eta ?? 0.3,
+      cfg.autonomy.hedgePortfolio.alpha ?? 0.05,
+    );
+  }
+
+  // ── 32.0 全局指派内核：批内选型从局部贪心到全局最优 ──
+  // 质变基座：同批节点逐个调用调度器 = 局部贪心，最优模型被重复超订、
+  // 次优闲置；匈牙利算法在「节点 × 候选」收益矩阵上求全局总收益最优
+  // 一对一指派（O(n³) 精确解，携带对偶证书）。约束节点（计划指定 /
+  // 优化器推荐）优先不动，只协调无约束节点。缺省关闭（零漂移——逐节点）。
+  if (cfg.autonomy?.optimalAssignment?.enabled === true) {
+    taskExecutor.attachOptimalAssignment({
+      candidateCap: cfg.autonomy.optimalAssignment.candidateCap,
+    });
+    logger.info(
+      '32.0 全局指派内核已挂载：批内匈牙利最优指派（candidateCap=%s）',
+      cfg.autonomy.optimalAssignment.candidateCap ?? 8,
+    );
+  }
+
+  // ── 34.0 分布鲁棒内核：超时预算的最坏尾部定价 ──
+  // 质变基座：固定超时魔数对重尾模型雪崩（一刀切的过紧）、对轻尾模型
+  // 浪费（过松保守）；margin × CVaR_α(延迟史) 让尾部形状直接进入价格。
+  // 样本不足时逐位回退全局缺省（零漂移）。缺省关闭。
+  if (cfg.autonomy?.cvarTimeouts?.enabled === true) {
+    llm.attachCvarTimeouts({
+      alpha: cfg.autonomy.cvarTimeouts.alpha,
+      margin: cfg.autonomy.cvarTimeouts.margin,
+      minSamples: cfg.autonomy.cvarTimeouts.minSamples,
+      floorMs: cfg.autonomy.cvarTimeouts.floorMs,
+      capMs: cfg.autonomy.cvarTimeouts.capMs,
+    });
+    logger.info(
+      '34.0 分布鲁棒内核已挂载：CVaR 超时预算（alpha=%s, margin=%s, minSamples=%s）',
+      cfg.autonomy.cvarTimeouts.alpha ?? 0.95,
+      cfg.autonomy.cvarTimeouts.margin ?? 1.5,
+      cfg.autonomy.cvarTimeouts.minSamples ?? 30,
+    );
+  }
+
+  // ── 35.0 反馈控制内核：并发上限的闭环驾驭 ──
+  // 质变基座：25.0 排队论反解出静态目标并发，但负载非平稳；LQR 闭环
+  // （DARE 闭式增益 + Lyapunov 稳定证书 + 死区抗抖振 + 钳位抗饱和）
+  // 让 computeParallelism 成为追踪目标的反馈控制器。缺省关闭（零漂移）。
+  if (cfg.autonomy?.concurrencyControl?.enabled === true) {
+    modelScheduler.attachConcurrencyController({
+      target: cfg.autonomy.concurrencyControl.target,
+      plantGain: cfg.autonomy.concurrencyControl.plantGain,
+      r: cfg.autonomy.concurrencyControl.r,
+      deadband: cfg.autonomy.concurrencyControl.deadband,
+    });
+    logger.info(
+      '35.0 反馈控制内核已挂载：并发闭环 LQR（target=%s, plantGain=%s）',
+      cfg.autonomy.concurrencyControl.target ?? 0.75,
+      cfg.autonomy.concurrencyControl.plantGain ?? 0.4,
+    );
+  }
+
+  // ── 37.0 信息瓶颈内核：蒸馏门槛从水位到信息量 ──
+  // 质变基座：水位计数只能保证「样本够多」，不能保证「样本不同质」；
+  // IB 保留率 I(T;Y)/I(X;Y)（Blahut-Arimoto 收敛）给「值得蒸馏的新
+  // 信息」定价——同构样本诚实跳过（below-information）。
+  // 缺省关闭（零漂移——原水位单门）。
+  if (cfg.autonomy?.informationBottleneck?.enabled === true) {
+    reflector.attachBottleneckDistiller({
+      beta: cfg.autonomy.informationBottleneck.beta,
+      retentionFloor: cfg.autonomy.informationBottleneck.retentionFloor,
+    });
+    logger.info(
+      '37.0 信息瓶颈内核已挂载：蒸馏信息定价（beta=%s, retentionFloor=%s）',
+      cfg.autonomy.informationBottleneck.beta ?? 5,
+      cfg.autonomy.informationBottleneck.retentionFloor ?? 0.4,
+    );
+  }
+
+  // ── 38.0 非线性动力学内核：KPI 的体质分类 ──
+  // 质变基座：异常检测都在问「现在正常吗」，没人问「这条序列是什么
+  // 体质」——混沌（λ₁>0，视野 ~1/λ₁）/ 持续（H>0.5，动量）/ 反持续
+  // （H<0.5，回归）。同一份 KPI，三种读法。缺省关闭（零漂移）。
+  if (cfg.autonomy?.chaosDiagnostics?.enabled === true) {
+    metaCognition.attachChaosDiagnostics({
+      minPoints: cfg.autonomy.chaosDiagnostics.minPoints,
+      lambdaThreshold: cfg.autonomy.chaosDiagnostics.lambdaThreshold,
+      hurstDelta: cfg.autonomy.chaosDiagnostics.hurstDelta,
+    });
+    logger.info(
+      '38.0 非线性动力学内核已挂载：KPI 体质分类（minPoints=%s, λ阈值=%s）',
+      cfg.autonomy.chaosDiagnostics.minPoints ?? 96,
+      cfg.autonomy.chaosDiagnostics.lambdaThreshold ?? 0.05,
+    );
+  }
+
+  // ── 39.0 谱排序内核：知识图的影响力骨架 ──
+  // 质变基座：联想检索按边权排序是局部口径；PageRank 把「被重要者
+  // 共现者重要」写成不动点（幂迭代线性收敛，质量守恒可逐位检查）——
+  // related() 升维为影响力加权，知识骨架成为蒸馏保骨去肉的依据。
+  // 缺省关闭（零漂移——原边权序）。
+  if (cfg.autonomy?.spectralRanking?.enabled === true) {
+    memoryGraph.attachInfluenceRanking({ damping: cfg.autonomy.spectralRanking.damping });
+    logger.info(
+      '39.0 谱排序内核已挂载：知识图 PageRank 骨架（damping=%s）',
+      cfg.autonomy.spectralRanking.damping ?? 0.85,
+    );
+  }
+
+  // ── 40.0 首达时间内核：熔断冷却的概率定价 ──
+  // 质变基座：冷却定值是魔数；失败间隔序列的漂移/波动喂入逆高斯
+  // 首达模型，「以 target 概率确信已恢复」的最小等待被解出来——
+  // 过早重试 = 高概率再次击穿，过晚 = 无谓损失，两者都有了价格。
+  // 建议口径（半开时序仍由状态机治理）。缺省关闭（零记录零介入）。
+  if (cfg.autonomy?.firstPassageCooldown?.enabled === true) {
+    governor.attachFirstPassageAdvisor({
+      targetProb: cfg.autonomy.firstPassageCooldown.targetProb,
+    });
+    logger.info(
+      '40.0 首达时间内核已挂载：熔断冷却定价（targetProb=%s）',
+      cfg.autonomy.firstPassageCooldown.targetProb ?? 0.9,
+    );
+  }
+
+  // ── 42.0 谱周期内核：到达节律从数据里解出来 ──
+  // 质变基座：时段热度是「周期被预设为一天」的小时直方图；FFT 周期图 +
+  // Fisher g 检验让周期成为数据问题（分钟回环/昼夜/周节律一视同仁），
+  // 显著时用相位感知的谐波季节因子。不显著时逐位回退原口径。
+  // 缺省关闭（零漂移）。
+  if (cfg.autonomy?.spectralCalendar?.enabled === true) {
+    worldModel.attachSpectralCalendar({ bins: cfg.autonomy.spectralCalendar.bins });
+    logger.info(
+      '42.0 谱周期内核已挂载：FFT 周期图 + Fisher g 节律检验（bins=%s）',
+      cfg.autonomy.spectralCalendar.bins ?? 128,
+    );
+  }
+
+  // ── 43.0 最大流内核：吞吐上限与瓶颈归因 ──
+  // 质变基座：可行并发不是各模型上限的简单求和，是流网络的值；
+  // min-cut 指认钳制者（类型在饿 / 模型独木桥），割容量 = 流值是证书。
+  // 纯诊断口径（执行批回写需求），缺省关闭（零漂移）。
+  if (cfg.autonomy?.capacityFrontier?.enabled === true) {
+    modelScheduler.attachCapacityFrontier();
+    logger.info('43.0 最大流内核已挂载：容量前沿诊断（max-flow / min-cut 归因）');
+  }
+
+  // ── 44.0 公平分配内核：探索预算的域级极大极小 ──
+  // 质变基座：新颖度 top-k 是赢者通吃（冷门域长期饿死）；加权注水保证
+  // 任何活跃域的相对份额不被压扁（词典序最优）——探索覆盖有公平定理。
+  // 缺省关闭（零漂移——原 top-k / 次模路径）。
+  if (cfg.autonomy?.fairBudget?.enabled === true) {
+    curiosity.attachFairBudget();
+    logger.info('44.0 公平分配内核已挂载：探索预算加权极大极小注水');
+  }
+
+  // ── 45.0 OCBA 预算分配内核：基准瓶颈确认的最优预算 ──
+  // 质变基座：均匀重跑浪费（差距大的场景早该停）；OCBA 让 P(正确选中
+  // 瓶颈) 的指数衰减率最优——每一步确认预算花在刀刃上。纯报告口径。
+  // 缺省关闭（零漂移）。
+  if (cfg.autonomy?.ocbaAllocator?.enabled === true) {
+    benchmark.attachOcbaAllocator({ confirmationBudget: cfg.autonomy.ocbaAllocator.confirmationBudget });
+    logger.info(
+      '45.0 OCBA 内核已挂载：基准瓶颈聚焦（confirmationBudget=%s）',
+      cfg.autonomy.ocbaAllocator.confirmationBudget ?? 200,
+    );
+  }
+
+  // ── 49.0 多尺度内核：KPI 的尺度透镜 ──
+  // 质变基座：单尺度异常检测分不清「慢漂移」与「快突发」；Haar 小波
+  // 把序列分解为对数个正交尺度（能量守恒 + 完美重构）。纯读数口径。
+  // 缺省关闭（零漂移）。
+  if (cfg.autonomy?.waveletView?.enabled === true) {
+    metaCognition.attachWaveletView({ minPoints: cfg.autonomy.waveletView.minPoints });
+    logger.info(
+      '49.0 多尺度内核已挂载：KPI 小波视图（minPoints=%s）',
+      cfg.autonomy.waveletView.minPoints ?? 64,
+    );
+  }
+
+  // ── 50.0 矩阵补全内核：冷启动能力的潜维度外推 ──
+  // 质变基座：新模型 taskScores 空白 → 只能瞎选；能力矩阵低秩（少数
+  // 潜维度决定）时，少量观测即可 ALS 补全全矩阵——冷启动选型从零
+  // 样本升级为潜维度预测。纯诊断口径（coldStartEstimate 按需读取）。
+  // 缺省关闭（零漂移）。
+  if (cfg.autonomy?.latentFactors?.enabled === true) {
+    modelScheduler.attachLatentFactors({ rank: cfg.autonomy.latentFactors.rank });
+    const report = modelScheduler.getLatentFactorReport();
+    logger.info(
+      '50.0 矩阵补全内核已挂载：能力潜因子（rank=%s, lowRankShare=%s）',
+      cfg.autonomy.latentFactors.rank ?? 3,
+      report ? report.lowRankShare.toFixed(2) : '—',
+    );
+  }
+
   /** KPI 采集器：从真实引擎状态聚合 KPI 快照 */
   const collectKpi = () => {
     const modelStatuses = llm.getModelStatuses();
@@ -2094,6 +2513,107 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     );
   }
 
+  // ── 33.0 随机矩阵内核：心跳 2.8 段的系统性风险评估 ──
+  // 质变基座：模型失败计数的样本相关矩阵，其大部分谱结构是纯噪声
+  // （Marchenko–Pastur 带）；RMT 清洗把伪相关吸收进噪声带（不误报），
+  // 头号特征值仍显著超带且解释份额达标 = 存在共同因子——「看起来
+  // 分散」的模型冗余（同厂商/同上游）是统计幻觉，热备会被一击串联。
+  // 各模型每期失败计数从 getModelStatuses 的差分提取（重置/无历史 =
+  // 该期缺席）；窗口攒满才评估（先验无知期零输出）。缺省关闭（零漂移）。
+  const rmtEnabled = cfg.autonomy?.randomMatrix?.enabled === true;
+  const systemicRiskMonitor = new SystemicRiskMonitor({
+    window: cfg.autonomy?.randomMatrix?.window,
+    minModels: cfg.autonomy?.randomMatrix?.minModels,
+    edgeFactor: cfg.autonomy?.randomMatrix?.edgeFactor,
+    systemicShare: cfg.autonomy?.randomMatrix?.systemicShare,
+  });
+  /** 各模型上期快照（失败计数差分的基准） */
+  const rmtLastSnapshot = new Map<string, { totalCalls: number; successCount: number }>();
+  /** 最近一次系统性风险评估产物（introspect 审计口径） */
+  let lastSystemicRisk: SystemicRiskAssessment | undefined;
+  const runSystemicRiskAssessment = (): Insight[] => {
+    if (!rmtEnabled) return [];
+    const counts: Record<string, number | null> = {};
+    for (const status of llm.getModelStatuses()) {
+      const prev = rmtLastSnapshot.get(status.id);
+      rmtLastSnapshot.set(status.id, { totalCalls: status.totalCalls, successCount: status.successCount });
+      if (!prev || status.totalCalls < prev.totalCalls) continue; // 无历史 / 计数重置：本期缺席
+      const deltaCalls = status.totalCalls - prev.totalCalls;
+      if (deltaCalls <= 0) continue; // 本期无活动：缺席（NaN 插补口径）
+      const deltaSuccess = Math.max(0, status.successCount - prev.successCount);
+      counts[status.id] = deltaCalls - deltaSuccess;
+    }
+    systemicRiskMonitor.observe(counts);
+    const assessment = systemicRiskMonitor.assess();
+    if (!assessment || !assessment.systemic) return [];
+    lastSystemicRisk = assessment;
+    const ids = systemicRiskMonitor.modelIds;
+    const exposed = assessment.topLoading
+      .slice(0, 3)
+      .map((l) => ids[l.index])
+      .filter((id): id is string => Boolean(id));
+    return [
+      {
+        source: 'meta-cognition',
+        category: 'systemic-risk',
+        taskType: undefined,
+        severity: Math.min(0.9, 0.5 + 0.4 * Math.min(1, assessment.topShare)),
+        message: `系统性风险：${assessment.models} 个模型的失败相关矩阵头号特征值 ${assessment.topEigenvalue.toFixed(2)} 显著超出 Marchenko–Pastur 噪声带 ${assessment.noiseEdge.toFixed(2)}（解释份额 ${(assessment.topShare * 100).toFixed(0)}%，共同因子暴露最深：${exposed.join(' / ') || '—'}）——这些模型会同沉浮，当前冗余是统计幻觉`,
+        suggestion: '把热备与分流的候选池按共同因子拆开（跨厂商/跨上游各留一席）；对暴露最深的模型降低关键任务的并发占比，防止一个上游故障串联击穿',
+      },
+    ];
+  };
+  if (rmtEnabled) {
+    logger.info(
+      '33.0 随机矩阵内核已启用：心跳 2.8 段 MP 清洗 + 系统性风险（window=%s, minModels=%s）',
+      cfg.autonomy?.randomMatrix?.window ?? 32,
+      cfg.autonomy?.randomMatrix?.minModels ?? 4,
+    );
+  }
+
+  // ── 41.0 排队网络内核：心跳 2.9 段的瓶颈站评估 ──
+  // 质变基座：25.0 单站反解看不到「哪一站钳制整条链路」。各模型作为
+  // 独立 M/M/c 站（Jackson 分流网络同属乘积形式——各站边际独立），
+  // 到达率 = 世界模型预测到达率 × 当前流量份额，μ = 稳健平均延迟的
+  // 倒数，c = maxConcurrency；Erlang-C 口径解瓶颈站（ρ 最大）。
+  // 缺省关闭（零漂移）；失败静默。
+  const queueingEnabled = cfg.autonomy?.queueingNetwork?.enabled === true;
+  const queueingRhoThreshold = cfg.autonomy?.queueingNetwork?.rhoThreshold ?? 0.85;
+  const runQueueingAssessment = (): Insight[] => {
+    if (!queueingEnabled) return [];
+    const statuses = llm.getModelStatuses().filter((s) => s.maxConcurrency > 0);
+    if (statuses.length === 0) return [];
+    const horizonMs = 5 * 60_000;
+    const predictedPerMs = worldModel.predictArrivals(horizonMs).reduce((s, p) => s + p.expectedCount, 0) / horizonMs;
+    if (!(predictedPerMs > 0)) return [];
+    const totalActive = statuses.reduce((s, st) => s + st.activeRequests, 0);
+    const stations = statuses.map((st) => ({
+      name: st.id,
+      lambdaPerMs: totalActive > 0 ? predictedPerMs * (st.activeRequests / totalActive) : predictedPerMs / statuses.length,
+      muPerMs: 1 / Math.max(1, st.robustAvgLatencyMs ?? st.avgLatency),
+      servers: st.maxConcurrency,
+    }));
+    const report = tandemNetwork(stations); // 分流 Jackson：各站独立 M/M(c) 边际（乘积形式）
+    const verdict = bottleneckInsight(report, queueingRhoThreshold);
+    if (!verdict) return [];
+    return [
+      {
+        source: 'meta-cognition',
+        category: 'capacity-flow',
+        taskType: undefined,
+        severity: verdict.severity,
+        message: verdict.message,
+        suggestion: verdict.suggestion,
+      },
+    ];
+  };
+  if (queueingEnabled) {
+    logger.info(
+      '41.0 排队网络内核已启用：心跳 2.9 段瓶颈站评估（rhoThreshold=%s）',
+      queueingRhoThreshold,
+    );
+  }
+
   const autonomyLoop = new AutonomyLoop({
     config: {
       ...cfg.autonomy?.loop,
@@ -2127,6 +2647,10 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     capacityAdvisor: capacityPlanner ? runCapacityPlanning : undefined,
     // 28.0 尾部风险桥接（心跳 2.7 段：延迟样本 → POT/GPD → 尾部外推洞察）
     tailRiskAdvisor: tailRiskEnabled ? runTailRiskAssessment : undefined,
+    // 33.0 系统性风险桥接（心跳 2.8 段：失败相关 → MP 清洗 → 共同因子洞察）
+    systemicRiskAdvisor: rmtEnabled ? runSystemicRiskAssessment : undefined,
+    // 41.0 排队网络桥接（心跳 2.9 段：模型站 M/M(c) × 流量份额 → 瓶颈站洞察）
+    networkAdvisor: queueingEnabled ? runQueueingAssessment : undefined,
     // 第三阶段（质级升级）：调度策略进化桥接
     // 每轮周期：① 喂数金丝雀（决策反馈真实成败/质量 → 自动回滚/晋升）
     // ② 刷新沙盒素材（任务集/校准表/模型快照与操作环同步）→ 触发进化周期
@@ -2614,7 +3138,7 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     name: 'query_memory',
     description: '查询长期记忆库（含蒸馏策略、教训、质量趋势、决策引擎统计）',
     parameters: {
-      query_type: { type: 'string', description: '查询类型', required: true, enum: ['overview', 'patterns', 'model-profile', 'feedback', 'strategies', 'lessons', 'trends', 'decision-stats', 'goals', 'health', 'evolution', 'autonomy-status', 'world-model', 'curiosity', 'governance', 'introspect', 'keys'] },
+      query_type: { type: 'string', description: '查询类型', required: true, enum: ['overview', 'patterns', 'model-profile', 'feedback', 'strategies', 'lessons', 'trends', 'decision-stats', 'goals', 'health', 'evolution', 'autonomy-status', 'world-model', 'curiosity', 'governance', 'introspect', 'keys', 'topology', 'influence'] },
       limit: { type: 'number', description: '返回条数上限，缺省 10' },
       task_type: { type: 'string', description: 'strategies/lessons 按任务类型过滤（可选）' },
     },
@@ -2659,6 +3183,16 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
           };
         case 'introspect':
           return { introspection: autonomyLoop.introspect() };
+        case 'topology':
+          // 36.0：知识地形（H₀ 持续同调——大陆/孤岛/合并带；孤岛 = 盲区的拓扑定义）
+          return { topography: memoryGraph.knowledgeTopography(typeof args.limit === 'number' && args.limit > 0 && args.limit < 1 ? args.limit : 0.2) };
+        case 'influence':
+          // 39.0：知识骨架（PageRank；未挂载时给出挂载提示）
+          return {
+            influential: memoryGraph.topInfluential(typeof args.limit === 'number' ? args.limit : 8),
+            attached: cfg.autonomy?.spectralRanking?.enabled === true,
+            hint: cfg.autonomy?.spectralRanking?.enabled === true ? undefined : 'autonomy.spectralRanking.enabled=true 后 related() 联想序升级为影响力加权',
+          };
         default:
           throw new ToolError(`未知 query_type: ${args.query_type}`);
       }
@@ -3446,6 +3980,46 @@ export * from './core/extreme-value.js';
 export * from './core/mcts.js';
 // ── 30.0 次模优化内核：加权覆盖 + 惰性贪心 CELF + 曲率修正保证 ──
 export * from './core/submodular.js';
+// ── 31.0 在线学习内核：Fixed-Share Hedge 对抗无悔 ──
+export * from './core/online-learning.js';
+// ── 32.0 全局指派内核：匈牙利算法 + 对偶最优性证书 ──
+export * from './core/optimal-assignment.js';
+// ── 33.0 随机矩阵内核：Marchenko–Pastur 清洗 + 系统性风险监视 ──
+export * from './core/random-matrix.js';
+// ── 34.0 分布鲁棒内核：CVaR + Wasserstein 球最坏化 ──
+export * from './core/robust-decisions.js';
+// ── 35.0 反馈控制内核：DARE 闭式 + Lyapunov 稳定证书 ──
+export * from './core/feedback-control.js';
+// ── 36.0 持续同调内核：H₀ 持续图 + 瓶颈距离（知识的形状） ──
+export * from './core/persistent-homology.js';
+// ── 37.0 信息瓶颈内核：Blahut-Arimoto（蒸馏的信息论定价） ──
+export * from './core/information-bottleneck.js';
+// ── 38.0 非线性动力学内核：Lyapunov + Hurst（体质分类） ──
+export * from './core/nonlinear-dynamics.js';
+// ── 39.0 谱排序内核：PageRank 幂迭代（知识图影响力） ──
+export * from './core/spectral-ranking.js';
+// ── 40.0 首达时间内核：反射原理 + 逆高斯（恢复的概率定价） ──
+export * from './core/first-passage.js';
+// ── 41.0 排队网络内核：Jackson 乘积形式 + 瓶颈站 ──
+export * from './core/queueing-network.js';
+// ── 42.0 谱周期内核：FFT 周期图 + Fisher g 检验 ──
+export * from './core/spectral-periodicity.js';
+// ── 43.0 最大流内核：Edmonds-Karp + 最小割证书 ──
+export * from './core/max-flow.js';
+// ── 44.0 公平分配内核：极大极小注水 + 加权口径 ──
+export * from './core/fair-division.js';
+// ── 45.0 预算分配内核：OCBA 最优计算预算 ──
+export * from './core/budget-allocation.js';
+// ── 46.0 法定人数内核：quorum 交叉 + 拜占庭可行性 ──
+export * from './core/quorum-systems.js';
+// ── 47.0 无冲突复制内核：CRDT 三定律收敛 ──
+export * from './core/crdt.js';
+// ── 48.0 秘密共享内核：Shamir 阈值 + 随机性审计 ──
+export * from './core/secret-sharing.js';
+// ── 49.0 多尺度内核：Haar 小波分解 ──
+export * from './core/multiscale-wavelet.js';
+// ── 50.0 矩阵补全内核：ALS 低秩潜因子 ──
+export * from './core/matrix-completion.js';
 // 4.0 弹性内核：熔断器 / 指数退避 / 错误分型（可靠执行共享组件）
 export {
   CircuitBreaker,

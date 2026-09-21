@@ -13,6 +13,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { h0Persistence, topographyInsight, type TopographyReport } from '../core/persistent-homology.js';
+import { pageRank, topInfluential, type PageRankResult } from '../core/spectral-ranking.js';
 
 export interface MemoryNode {
   id: string;
@@ -59,6 +61,8 @@ export class MemoryGraph {
   private edges = new Map<string, MemoryEdge>();
   private topics = new Map<string, TopicNode>();
   private persistPath: string;
+  /** 39.0：影响力排序（attachInfluenceRanking 后 related() 按 边权×邻居影响力 排序） */
+  private influence?: PageRankResult;
 
   constructor(persistPath: string) {
     this.persistPath = persistPath;
@@ -90,17 +94,67 @@ export class MemoryGraph {
     return edge;
   }
 
-  /** 图联想：按边权重返回相邻节点 id（混合检索的联想增强） */
+  /** 图联想：按边权重返回相邻节点 id（混合检索的联想增强）
+   *
+   * 39.0：挂载影响力排序后，联想序从「边权」升维为「边权 × 邻居影响力」
+   * （与枢纽共现的记忆先被想起）；未挂载时与原边权序逐位一致（零漂移）。
+   */
   related(id: string, limit = 5): string[] {
     const neighbors: Array<{ id: string; weight: number }> = [];
     for (const edge of this.edges.values()) {
       if (edge.source === id) neighbors.push({ id: edge.target, weight: edge.weight });
       else if (edge.target === id) neighbors.push({ id: edge.source, weight: edge.weight });
     }
+    if (this.influence) {
+      const idx = new Map(this.influence.ids.map((nid, i) => [nid, i]));
+      for (const n of neighbors) {
+        const i = idx.get(n.id);
+        n.weight *= i === undefined ? 1 : this.influence.scores[i] * this.influence.ids.length; // 归一化到均值 1
+      }
+    }
     return neighbors
       .sort((a, b) => b.weight - a.weight)
       .slice(0, limit)
       .map((n) => n.id);
+  }
+
+  /**
+   * 39.0：挂载谱排序影响力（幂等覆盖，挂载即生效）。
+   *
+   * PageRank 幂迭代（阻尼 0.85，质量守恒 Σ=1）在共现网络上解出每条
+   * 知识的结构影响力——「被重要者共现者重要」。topInfluential 输出
+   * 知识骨架（蒸馏保骨去肉的依据）；related() 切换影响力加权口径。
+   * 未挂载零漂移。
+   */
+  attachInfluenceRanking(options?: { damping?: number }): void {
+    const ids = [...this.nodes.keys()];
+    const idx = new Map(ids.map((id, i) => [id, i]));
+    const weights = ids.map(() => ids.map(() => 0));
+    for (const edge of this.edges.values()) {
+      const i = idx.get(edge.source);
+      const j = idx.get(edge.target);
+      if (i === undefined || j === undefined) continue;
+      weights[i][j] = edge.weight;
+      weights[j][i] = edge.weight;
+    }
+    this.influence = pageRank(ids, weights, { damping: options?.damping });
+  }
+
+  /** 39.0：知识骨架清单（未挂载返回空数组） */
+  topInfluential(k = 8): Array<{ id: string; score: number }> {
+    return this.influence ? topInfluential(this.influence, k) : [];
+  }
+
+  /**
+   * 36.0：知识地形（H₀ 持续同调；纯分析，无副作用）。
+   *
+   * 共现权重视为相似度、阈值从 1 向 floor 扫描：跨尺度持久的分量 =
+   * 稳定知识大陆；永不合并的分量 = 知识孤岛（盲区的拓扑定义——
+   * 与任何主题都不共现的记忆，正是好奇心该去的地方）。
+   */
+  knowledgeTopography(floor = 0.2): TopographyReport & { summary: string } {
+    const report = h0Persistence([...this.nodes.keys()], [...this.edges.values()].map((e) => ({ source: e.source, target: e.target, weight: e.weight })), floor);
+    return { ...report, summary: topographyInsight(report) };
   }
 
   /** 将模式挂到主题树（根主题 = taskType） */

@@ -39,6 +39,10 @@ import {
 import type { EFEAction, EFEEvaluation, FreeEnergyEngine } from './core/free-energy.js';
 import type { ArmIndex, GittinsSnapshot, IndexArm, IndexScheduler } from './core/index-scheduling.js';
 import type { BwKRouter, BwKVerdict } from './core/bandit-knapsack.js';
+import { Hedge, hedgeMultiplier, type HedgeStats } from './core/online-learning.js';
+import { FeedbackController, type FeedbackControllerConfig, type ControlStep } from './core/feedback-control.js';
+import { capacityFrontier, type CapacityFrontier } from './core/max-flow.js';
+import { completeMatrix, completedEntry, type CompletionReport } from './core/matrix-completion.js';
 
 /** 模型调度配置 */
 export interface ModelSchedulerConfig {
@@ -126,6 +130,20 @@ export class ModelScheduler {
   private bwKBudgetProvider?: () => { tokensRemaining: number; costRemaining: number } | undefined;
   /** 22.0：最近一次路由裁决（诊断口径；getAttachedDiagnostics 消费） */
   private lastBwKVerdict?: BwKVerdict;
+  /** 31.0：对抗组合（Fixed-Share Hedge；未挂载零漂移） */
+  private hedge?: Hedge;
+  /** 31.0：专家下标 ↔ 模型 id 映射（挂载时刻的注册模型快照） */
+  private hedgeModelIds: string[] = [];
+  /** 35.0：并发反馈控制器（未挂载零漂移——静态口径） */
+  private concurrencyController?: FeedbackController;
+  /** 43.0：容量前沿挂载标志（未挂载零记录零介入） */
+  private capacityFrontierEnabled = false;
+  /** 43.0：最近一次容量前沿（max-flow 值 + min-cut 归因；诊断口径） */
+  private lastCapacityFrontier?: CapacityFrontier;
+  /** 50.0：潜因子挂载标志（未挂载零介入——纯诊断口径） */
+  private latentFactorsEnabled = false;
+  /** 50.0：最近一次矩阵补全报告（冷启动能力预测的原料） */
+  private lastCompletion?: CompletionReport;
 
   constructor(params: { llm: LLMClient; memory: LongTermMemory; config?: ModelSchedulerConfig }) {
     this.llm = params.llm;
@@ -211,12 +229,175 @@ export class ModelScheduler {
     this.bwKBudgetProvider = budgetProvider;
   }
 
-  /** 21.0/22.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
-  getAttachedDiagnostics(): { indexScheduling?: GittinsSnapshot; lastBwK?: BwKVerdict } {
-    const diagnostics: { indexScheduling?: GittinsSnapshot; lastBwK?: BwKVerdict } = {};
+  /** 21.0/22.0/31.0/35.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
+  getAttachedDiagnostics(): { indexScheduling?: GittinsSnapshot; lastBwK?: BwKVerdict; hedge?: HedgeStats; concurrencyControl?: ControlStep } {
+    const diagnostics: { indexScheduling?: GittinsSnapshot; lastBwK?: BwKVerdict; hedge?: HedgeStats; concurrencyControl?: ControlStep } = {};
     if (this.indexScheduler) diagnostics.indexScheduling = this.indexScheduler.getTable().snapshot();
     if (this.lastBwKVerdict) diagnostics.lastBwK = this.lastBwKVerdict;
+    if (this.hedge) diagnostics.hedge = this.hedge.stats();
+    if (this.lastControlStep) diagnostics.concurrencyControl = this.lastControlStep;
     return diagnostics;
+  }
+
+  /**
+   * 31.0：挂载对抗组合（Fixed-Share Hedge，幂等覆盖，挂载即生效）。
+   *
+   * 专家 = 挂载时刻的注册模型快照；执行侧每节点完成时经
+   * reportHedgeOutcome(modelId, reward∈[0,1]) 回报质量。权重经
+   * hedgeMultiplierOf 以有界乘数（[0.25, 4]）作用于利用端评分——
+   * 统计学习口径（Wilson/UCB/Gittins）之上叠加**对抗口径**：无论世界
+   * 怎么漂移（限流、静默降级），对事后最优固定模型的遗憾 ≤ √(2T lnN)。
+   * 未挂载时乘数恒 1（评分逐位零漂移）。
+   */
+  attachHedgePortfolio(options?: { eta?: number; alpha?: number }): void {
+    this.hedgeModelIds = this.llm.getModelStatuses().map((s) => s.id);
+    if (this.hedgeModelIds.length === 0) {
+      this.hedge = undefined;
+      return;
+    }
+    this.hedge = new Hedge({ experts: this.hedgeModelIds.length, eta: options?.eta, alpha: options?.alpha });
+  }
+
+  /**
+   * 31.0：执行结果回报（reward = 成功质量 ∈ [0,1]，失败 = 0；未挂载为空操作）。
+   *
+   * 部分反馈口径：本轮仅被指派模型有观测（掩码更新——未被指派的专家
+   * 权重不动，只受 Fixed-Share 回灌微调）。对手把某模型打爆时，其权重
+   * 以每失败一轮 e^{−η} 的速度衰减——比统计口径（Wilson 时间衰减）快
+   * 一个数量级的对抗性降权。
+   */
+  reportHedgeOutcome(modelId: string, reward: number): void {
+    if (!this.hedge) return;
+    const idx = this.hedgeModelIds.indexOf(modelId);
+    if (idx < 0) return;
+    this.hedge.reportSingle(idx, reward);
+  }
+
+  /** 31.0：对抗组合对模型的有界评分乘数（未挂载恒 1；零漂移） */
+  hedgeMultiplierOf(modelId: string): number {
+    if (!this.hedge) return 1;
+    const idx = this.hedgeModelIds.indexOf(modelId);
+    if (idx < 0) return 1;
+    return hedgeMultiplier(this.hedge.weights(), idx);
+  }
+
+  /**
+   * 35.0：挂载并发反馈控制器（幂等覆盖，挂载即生效）。
+   *
+   * computeParallelism 从静态口径（总并发容量钳位）升级为闭环：每次
+   * 被调用即一步反馈（观测当前总利用率 → LQR 增益 → 新上限），目标
+   * 利用率缺省 0.75。稳定性由 DARE/Lyapunov 证书背书（35.0 内核），
+   * 死区抗抖振、输出钳位即抗饱和。未挂载时与原静态口径逐位一致。
+   */
+  attachConcurrencyController(options?: FeedbackControllerConfig): void {
+    this.concurrencyController = new FeedbackController({ target: 0.75, plantGain: 0.4, minOutput: 1, maxOutput: 16, ...options });
+  }
+
+  /** 35.0：最近一次控制步（诊断口径） */
+  private lastControlStep?: ControlStep;
+
+  /**
+   * 43.0：挂载容量前沿（幂等覆盖，挂载即生效——纯诊断口径）。
+   *
+   * 「类型需求 × 模型容量」流网络（源→类型（需求）→模型（评分>0 可达
+   * 边）→汇（maxConcurrency））上解 Edmonds-Karp 最大流 = 可立即满足
+   * 的最大并发派发；最小割指认钳制者（类型在饿还是模型是独木桥）——
+   * 割容量 = 流值（Ford-Fulkerson 证书）。执行器每批回写待执行需求；
+   * 不改变任何派发行为（零漂移），吞吐上限与瓶颈归因经
+   * getAttachedDiagnostics / query_memory capacity 可读。
+   */
+  attachCapacityFrontier(): void {
+    this.capacityFrontierEnabled = true;
+  }
+
+  /** 43.0：执行批回写待执行需求（未挂载为空操作；类型计数 × 候选容量 → 流前沿） */
+  updateCapacityFrontier(demands: ReadonlyArray<{ type: string; count: number }>): void {
+    if (!this.capacityFrontierEnabled || demands.length === 0) return;
+    const models = this.llm.getModelStatuses().map((s) => ({ id: s.id, capacity: s.maxConcurrency }));
+    if (models.length === 0) return;
+    this.lastCapacityFrontier = capacityFrontier(
+      demands,
+      models,
+      (taskType, modelId) => {
+        const status = this.llm.getModelStatuses().find((s) => s.id === modelId);
+        if (!status) return false;
+        const score = status.taskScores[taskType] ?? status.taskScores['general'];
+        return score === undefined || score > 0;
+      },
+    );
+  }
+
+  /**
+   * 50.0：挂载潜因子补全（幂等覆盖，挂载即生效——纯诊断口径）。
+   *
+   * 「模型 × 任务类型」能力矩阵经 ALS 低秩补全（rank 缺省 3）：观测
+   * 条目（各模型 taskScores 已有值的部分）拟合 U·Vᵀ，未观测条目由
+   * 潜因子外推——新模型的冷启动选型从零样本瞎选升级为潜维度预测
+   * （Candès–Recht 恢复条件背书）。lowRankShare 读出低秩假设的成色；
+   * 不改变任何评分路径（零漂移），coldStartEstimate 按需读取。
+   */
+  attachLatentFactors(options?: { rank?: number }): void {
+    this.latentFactorsEnabled = true;
+    this.latentRank = Math.max(1, Math.min(6, Math.floor(options?.rank ?? 3)));
+    this.refreshLatentFactors();
+  }
+
+  private latentRank = 3;
+
+  /** 50.0：重算能力矩阵补全（观测 = 各模型 taskScores 的非空条目，行=模型 列=任务类型并集） */
+  private refreshLatentFactors(): void {
+    const statuses = this.llm.getModelStatuses();
+    const modelIds = statuses.map((s) => s.id);
+    const taskTypes = new Set<string>();
+    for (const s of statuses) for (const t of Object.keys(s.taskScores)) taskTypes.add(t);
+    const types = [...taskTypes];
+    const observed: Array<{ i: number; j: number; value: number }> = [];
+    statuses.forEach((s, i) => {
+      for (const [t, v] of Object.entries(s.taskScores)) {
+        const j = types.indexOf(t);
+        if (j >= 0 && Number.isFinite(v)) observed.push({ i, j, value: v });
+      }
+    });
+    this.latentTypeIndex = new Map(types.map((t, j) => [t, j]));
+    this.latentModelIndex = new Map(modelIds.map((id, i) => [id, i]));
+    if (observed.length < 4 || modelIds.length < 2 || types.length < 2) {
+      this.lastCompletion = undefined;
+      return;
+    }
+    this.lastCompletion = completeMatrix(observed, modelIds.length, types.length, { rank: this.latentRank });
+  }
+
+  private latentTypeIndex = new Map<string, number>();
+  private latentModelIndex = new Map<string, number>();
+
+  /**
+   * 50.0：冷启动能力预测（观测未覆盖的 model×taskType 条目由潜因子
+   * 外推；未挂载/未覆盖返回 undefined——诚实降级）
+   */
+  coldStartEstimate(modelId: string, taskType: string): number | undefined {
+    if (!this.lastCompletion) return undefined;
+    const i = this.latentModelIndex.get(modelId);
+    const j = this.latentTypeIndex.get(taskType) ?? this.latentTypeIndex.get('general');
+    if (i === undefined || j === undefined) return undefined;
+    return completedEntry(this.lastCompletion, i, j);
+  }
+
+  /** 50.0：补全报告快照（纯读取） */
+  getLatentFactorReport(): { rank: number; trainRmse: number; observedRatio: number; lowRankShare: number; converged: boolean } | undefined {
+    return this.lastCompletion
+      ? {
+          rank: this.latentRank,
+          trainRmse: this.lastCompletion.trainRmse,
+          observedRatio: this.lastCompletion.observedRatio,
+          lowRankShare: this.lastCompletion.lowRankShare,
+          converged: this.lastCompletion.converged,
+        }
+      : undefined;
+  }
+
+  /** 43.0：最近一次容量前沿（纯读取；未挂载/未回写返回 undefined） */
+  getCapacityFrontier(): CapacityFrontier | undefined {
+    return this.lastCapacityFrontier ? { ...this.lastCapacityFrontier, bindingConstraints: [...this.lastCapacityFrontier.bindingConstraints] } : undefined;
   }
 
   /** 模型的当前经济乘数（无信号 = 中性 1；economicFeedbackEnabled 关闭时恒为 1） */
@@ -268,7 +449,8 @@ export class ModelScheduler {
     });
     // B 路线：共生经济乘数作用于利用端（UCB 探索加成不乘——信息价值
     // 高于短期经济；关闭/无信号时恒为 1，评分与原逻辑逐位一致）
-    return base * this.economicMultiplierOf(status.id);
+    // 31.0：对抗组合乘数叠加同位（有界 [0.25,4]；未挂载恒 1，零漂移）
+    return base * this.economicMultiplierOf(status.id) * this.hedgeMultiplierOf(status.id);
   }
 
   /**
@@ -599,12 +781,37 @@ export class ModelScheduler {
   /**
    * 动态并行度：依据已注册模型的总并发容量计算同层最大并行数
    * （避免同层节点数超过模型并发容量导致全部排队）
+   *
+   * 35.0：挂载反馈控制器后升级为闭环口径——每次调用即一步反馈
+   * （观测总利用率 activeRequests / 总容量 → LQR 增益步 → 新上限，
+   * 死区抗抖振、钳位 [1,16] 抗饱和，稳定性由 Lyapunov 证书背书）。
+   * 未挂载时与原静态口径逐位一致（零漂移）。
    */
   computeParallelism(): number {
-    const totalConcurrency = this.llm
-      .getModelStatuses()
-      .reduce((sum, s) => sum + s.maxConcurrency, 0);
+    const statuses = this.llm.getModelStatuses();
+    const totalConcurrency = statuses.reduce((sum, s) => sum + s.maxConcurrency, 0);
+    if (this.concurrencyController) {
+      const active = statuses.reduce((sum, s) => sum + s.activeRequests, 0);
+      const utilization = totalConcurrency > 0 ? active / totalConcurrency : 0;
+      this.lastControlStep = this.concurrencyController.step(utilization);
+      return Math.round(this.lastControlStep.output);
+    }
     // 至少 1，上限 16（防止异常配置导致过度并行）
     return Math.max(1, Math.min(16, totalConcurrency || 4));
+  }
+
+  /**
+   * 32.0：候选评分公开口径（批量全局指派的收益矩阵原料）。
+   *
+   * 与 assignModelWithInsight 同一评分路径（含 UCB/EFE 加成与经济/
+   * 对抗乘数），返回 (id, total) 降序排列——供执行侧构造批内收益矩阵，
+   * 匈牙利算法在「同一批节点 × 全体候选」上求全局最优指派。
+   */
+  rankCandidateScores(taskType: string, context?: SchedulerTaskContext, exclude: string[] = []): Array<{ id: string; score: number }> {
+    const avoid = new Set(exclude);
+    const statuses = this.llm.getModelStatuses().filter((s) => !avoid.has(s.id));
+    if (statuses.length === 0) return [];
+    const scored = this.scoreCandidates(taskType, context, statuses);
+    return scored.map((s) => ({ id: s.id, score: s.total })).sort((a, b) => b.score - a.score);
   }
 }

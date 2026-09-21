@@ -22,6 +22,7 @@
  * - 时间序列窗口有界（每类型最多保留 N 个到达时间戳），内存可控
  */
 import { GpSeriesCalibrator, type ConstructorOptionsGpSeries } from './core/gaussian-process.js';
+import { seasonalFactor } from './core/spectral-periodicity.js';
 
 /** 单类型信号的到达统计 */
 export interface ArrivalStats {
@@ -297,7 +298,12 @@ export class WorldModel {
       const expected = ratePerMs * horizonMs * trendFactor;
 
       // 时段热度修正：目标时段相对全天均值的权重
-      const hourFactor = this.hourFactor(entry, now + horizonMs / 2);
+      // 42.0：挂载谱日历后，小时直方图（周期被预设为一天）升级为
+      // 从到达史解出的频谱——Fisher g 显著时用谐波重构的季节因子
+      // （相位感知，可捕捉非昼夜节律）；不显著时回退原直方图口径。
+      const hourFactor = this.spectralCalendar
+        ? (this.spectralFactorOf(entry, now + horizonMs / 2) ?? this.hourFactor(entry, now + horizonMs / 2))
+        : this.hourFactor(entry, now + horizonMs / 2);
       const adjustedRaw = expected * hourFactor;
 
       const confidence = this.calibrationConfidence(type);
@@ -499,10 +505,62 @@ export class WorldModel {
   }
 
   /** 时段热度因子：目标时段计数 / 全天均值 */
+  /**
+   * 42.0：挂载谱日历（幂等覆盖，挂载即生效）。
+   *
+   * 时段热度从「预设为一天的小时直方图」升级为谱分析：到达时间戳按
+   * 小时分桶为时间序列，FFT 周期图 + Fisher g 检验判定是否存在显著
+   * 周期（任意周期——分钟回环/小时批处理/昼夜/周节律）；显著时
+   * predictArrivals 的热度因子切换为谐波重构的季节因子（相位感知），
+   * 不显著时逐位回退原直方图口径。未挂载零漂移。
+   */
+  attachSpectralCalendar(options?: { bins?: number }): void {
+    this.spectralCalendar = { bins: Math.max(32, Math.floor(options?.bins ?? 128)) };
+  }
+
+  /** 42.0：谱日历配置（未挂载 undefined） */
+  private spectralCalendar?: { bins: number };
+
+  /** 42.0：谱季节因子（显著周期时数值；不显著 / 样本不足 → undefined 回退） */
+  private spectralFactorOf(entry: ArrivalStats, targetTimestamp: number): number | undefined {
+    const bins = this.spectralCalendar?.bins ?? 128;
+    if (entry.timestamps.length < 16) return undefined;
+    const hourMs = 3_600_000;
+    const newest = entry.timestamps[entry.timestamps.length - 1];
+    const baseHour = Math.floor(newest / hourMs);
+    const counts = new Array<number>(bins).fill(0);
+    let firstCovered = -1;
+    for (const t of entry.timestamps) {
+      const hourIndex = Math.floor(t / hourMs) - (baseHour - bins + 1);
+      if (hourIndex >= 0 && hourIndex < bins) {
+        counts[hourIndex] += 1;
+        if (firstCovered < 0 || hourIndex < firstCovered) firstCovered = hourIndex;
+      }
+    }
+    if (firstCovered < 0) return undefined;
+    // 裁剪到覆盖段（前导零空洞会注入伪低频能量）
+    const covered = counts.slice(firstCovered);
+    const phase = ((Math.floor(targetTimestamp / hourMs) - (baseHour - bins + 1) - firstCovered) % covered.length + covered.length) % covered.length;
+    const seasonal = seasonalFactor(covered, phase);
+    this.lastSpectral = {
+      bins,
+      samples: entry.timestamps.length,
+      significant: seasonal.significant,
+      periodHours: seasonal.period,
+    };
+    return seasonal.significant ? seasonal.factor : undefined;
+  }
+
+  /** 42.0：谱日历状态（纯读取；未挂载/未评估时 undefined） */
+  getSpectralCalendarStatus(): { bins: number; samples: number; significant: boolean; periodHours: number | undefined } | undefined {
+    return this.lastSpectral ? { ...this.lastSpectral } : undefined;
+  }
+
+  private lastSpectral?: { bins: number; samples: number; significant: boolean; periodHours: number | undefined };
+
   private hourFactor(entry: ArrivalStats, targetTimestamp: number): number {
     const total = entry.hourHistogram.reduce((a, b) => a + b, 0);
-    if (total === 0) return 1;
-    const hour = new Date(targetTimestamp).getHours();
+    if (total === 0) return 1;    const hour = new Date(targetTimestamp).getHours();
     const mean = total / 24;
     if (mean === 0) return 1;
     // 限制因子范围，避免冷启动时段过度放大

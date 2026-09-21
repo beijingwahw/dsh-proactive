@@ -23,6 +23,7 @@
  */
 
 import crypto from 'node:crypto';
+import { GCounter } from '../core/crdt.js';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -822,5 +823,53 @@ export class DistributedSync {
     } catch {
       /* 状态持久化失败不阻塞同步流程 */
     }
+  }
+
+  // ─────────────── 47.0 CRDT 收敛通道（缺省零介入） ───────────────
+
+  /** 47.0：跨节点收敛计数器（G-Counter；按通道隔离） */
+  private crdtCounters = new Map<string, GCounter>();
+
+  /**
+   * 47.0：CRDT 收敛通道（幂等挂载，挂载即生效——纯增量口径）。
+   *
+   * 网络分区 / 乱序 / 重复送达下的状态收敛从协议希望升级为合并算子
+   * 的代数性质（join-semilattice 三律 ⟹ 强最终一致性，Shapiro 2011）：
+   * 本地递增 incrementCrdtCounter，远端状态经 mergeCrdtState 合入，
+   * crdtState 读取——任何消息顺序都收敛到同一读数。
+   */
+  attachCrdtChannel(channels: ReadonlyArray<string>): void {
+    for (const c of channels) if (!this.crdtCounters.has(c)) this.crdtCounters.set(c, new GCounter());
+  }
+
+  /** 47.0：本地递增（通道不存在时惰性创建） */
+  incrementCrdtCounter(channel: string, by = 1): void {
+    let counter = this.crdtCounters.get(channel);
+    if (!counter) {
+      counter = new GCounter();
+      this.crdtCounters.set(channel, counter);
+    }
+    counter.increment(this.localNodeId, by);
+  }
+
+  /** 47.0：合入远端 CRDT 状态（交换/幂等——重复合入无害） */
+  mergeCrdtState(remote: Record<string, Record<string, number>>): void {
+    for (const [channel, counts] of Object.entries(remote)) {
+      let counter = this.crdtCounters.get(channel);
+      if (!counter) {
+        counter = new GCounter();
+        this.crdtCounters.set(channel, counter);
+      }
+      const other = new GCounter();
+      for (const [node, v] of Object.entries(counts)) other.increment(node, v);
+      counter.merge(other);
+    }
+  }
+
+  /** 47.0：CRDT 状态快照（可序列化 gossip 载荷） */
+  crdtState(): Record<string, Record<string, number>> {
+    const out: Record<string, Record<string, number>> = {};
+    for (const [channel, counter] of this.crdtCounters) out[channel] = counter.state();
+    return out;
   }
 }

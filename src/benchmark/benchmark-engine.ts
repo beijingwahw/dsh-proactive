@@ -24,6 +24,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { AppError, TimeoutError } from '../errors.js';
+import { ocbaAllocate } from '../core/budget-allocation.js';
 import { LongTermMemory } from '../memory/long-term-memory.js';
 import type { CryptoEngine } from '../security/crypto-engine.js';
 import { Sentinel } from '../sentinel.js';
@@ -115,6 +116,12 @@ export interface BenchmarkReport {
   }>;
   overallPassed: boolean;
   totalDuration: number;
+  /** 45.0：OCBA 瓶颈聚焦（attachOcbaAllocator 后附加——下一轮确认预算的最优分配） */
+  bottleneckFocus?: {
+    candidate: string | undefined;
+    rationale: string | undefined;
+    allocation: Array<{ name: string; count: number }>;
+  };
 }
 
 /** 内置场景上下文 */
@@ -620,10 +627,44 @@ export class BenchmarkEngine {
       if (!passed) report.overallPassed = false;
     }
 
+    // 45.0：OCBA 瓶颈聚焦（挂载时附加）——下一轮基准预算「砸给谁」
+    // 从均匀升级为最优计算预算分配：差距大的场景早停，不确定是否最差
+    // 的场景多跑（P(CS) 指数衰减率最优，Glynn–Juneja）。纯报告口径。
+    if (this.ocbaAllocator && report.scenarios.length >= 2) {
+      // 瓶颈确认口径：找出「最大均值延迟」的场景——biggerIsBetter=true
+      //（确认对象 = 最大值），σ 由 p95−均值差近似
+      const plan = ocbaAllocate(
+        report.scenarios.map((s) => ({ name: s.name, mean: s.stats.avgLatency, std: Math.sqrt(Math.max(1e-6, s.stats.p95Latency - s.stats.avgLatency)) })),
+        this.ocbaAllocator.confirmationBudget,
+        { biggerIsBetter: true },
+      );
+      const worst = report.scenarios[plan.best];
+      report.bottleneckFocus = {
+        candidate: worst ? worst.name : undefined,
+        rationale: worst
+          ? `延迟最高场景 ${worst.name}（均值 ${Math.round(worst.stats.avgLatency)}ms）——下一轮确认预算 ${this.ocbaAllocator.confirmationBudget} 次 OCBA 分配：${report.scenarios.map((s, i) => `${s.name}:${plan.counts[i]}`).join(' / ')}`
+          : undefined,
+        allocation: report.scenarios.map((s, i) => ({ name: s.name, count: plan.counts[i] })),
+      };
+    }
+
     report.totalDuration = Date.now() - startedAt;
     this.saveReport(report);
     return report;
   }
+
+  /**
+   * 45.0：挂载 OCBA 预算分配器（幂等覆盖，挂载即生效——纯报告附加）。
+   *
+   * runAll 结束时以各场景延迟统计为试点，给出「确认瓶颈子系统」的
+   * OCBA 最优重跑预算分配（P(CS) 渐近最优）附在报告 bottleneckFocus；
+   * 不改变场景执行本身（零漂移）。
+   */
+  attachOcbaAllocator(options?: { confirmationBudget?: number }): void {
+    this.ocbaAllocator = { confirmationBudget: Math.max(10, Math.floor(options?.confirmationBudget ?? 200)) };
+  }
+
+  private ocbaAllocator?: { confirmationBudget: number };
 
   /** 加载全部历史报告（按时间倒序） */
   loadReports(): BenchmarkReport[] {

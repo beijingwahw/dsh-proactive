@@ -16,6 +16,7 @@
  */
 
 import crypto from 'node:crypto';
+import { shamirSplit, shamirCombine, entropyAudit } from '../core/secret-sharing.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CryptoError } from '../errors.js';
@@ -273,6 +274,29 @@ export class CryptoEngine {
    */
   static generateKey(): string {
     return crypto.randomBytes(KEY_LENGTH).toString('hex');
+  }
+
+  // ─────────────── 48.0 秘密共享 + 随机性审计（增量口径，零漂移） ───────────────
+
+  /**
+   * 48.0：主密钥阈值分形（Shamir，n 份中任意 t 份可重建、t−1 份
+   * 信息论零泄露）。份额应分存于不同介质/保管人；本方法不落盘。
+   */
+  shardKey(keyHex: string, shares: number, threshold: number): Array<{ x: number; y: string }> {
+    return shamirSplit(keyHex, shares, threshold, () => crypto.randomBytes(4).readUInt32BE(0) / 4294967296);
+  }
+
+  /** 48.0：份额重建（任意 ≥ 阈值份；Lagrange 插值） */
+  combineKeyShares(shareList: ReadonlyArray<{ x: number; y: string }>): string {
+    return shamirCombine(shareList);
+  }
+
+  /**
+   * 48.0：密钥原料随机性审计（频数 + 游程检验，NIST SP 800-22 口径）——
+   * 「密钥的原料合格吗」从信任变成检查（|z| ≤ 3 通过）。
+   */
+  auditKeyEntropy(keyHex: string): { bytes: number; oneRatio: number; frequencyChi: number; runsZ: number; passed: boolean } {
+    return entropyAudit([...Buffer.from(keyHex, 'hex')]);
   }
 
   /**

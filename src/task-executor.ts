@@ -30,6 +30,7 @@ import type { ReflectionEngine } from './reflection-engine.js';
 import type { Signal } from './sentinel.js';
 import { ExecutionError, type CascadeHandler, type ExecutionPlan, type NodeResult, type NodeRunner, type PlanExecutionResult, type PlanNode } from './types.js';
 import { CircuitBreakerRegistry, abortableSleep, backoffDelayMs, classifyError } from './core/resilience.js';
+import { assignBatch } from './core/optimal-assignment.js';
 
 /** 任务执行器配置 */
 export interface TaskExecutorConfig {
@@ -83,6 +84,10 @@ export class TaskExecutor {
     exploration: boolean;
     success: boolean;
   }> = [];
+  /** 32.0：批内全局最优指派（匈牙利算法；未挂载时逐节点选型原样） */
+  private batchAssignmentEnabled = false;
+  /** 32.0：批内指派的候选池上限（每任务类型取评分前 K） */
+  private batchCandidateCap = 8;
 
   constructor(params: {
     config: TaskExecutorConfig;
@@ -116,6 +121,89 @@ export class TaskExecutor {
    */
   updateConfig(patch: Partial<TaskExecutorConfig>): void {
     this.config = { ...this.config, ...patch };
+  }
+
+  /**
+   * 32.0：挂载批内全局最优指派（幂等，挂载即生效）。
+   *
+   * 挂载后每个执行批（同层就绪节点 × 并发上限切片）中的**动态选型节点**
+   * 不再逐个调用调度器（局部贪心），而是构造「节点 × 候选模型」收益
+   * 矩阵（与逐节点路径同一评分口径），经匈牙利算法求**全局总收益最优**
+   * 的一对一指派（O(n³) 精确解，携带对偶证书）——最优模型不再被同批
+   * 节点重复超订，次优模型不再闲置。计划指定 / 优化器推荐的节点不受
+   * 影响（约束优先，只对无约束节点做全局协调）。未挂载时逐位零漂移。
+   */
+  attachOptimalAssignment(options?: { candidateCap?: number }): void {
+    this.batchAssignmentEnabled = true;
+    if (options?.candidateCap && options.candidateCap >= 1) this.batchCandidateCap = Math.floor(options.candidateCap);
+  }
+
+  /** 32.0：批内指派断开（诊断/回退口径） */
+  detachOptimalAssignment(): void {
+    this.batchAssignmentEnabled = false;
+  }
+
+  /**
+   * 32.0：为执行批计算全局指派（节点 id → 模型 id；无指派必要的批返回 undefined）。
+   *
+   * 只有批内「动态选型节点」（无计划指定模型、无可执行推荐模型）≥ 2 且
+   * 候选模型 ≥ 2 时才升级为全局口径；被约束节点占用的模型从候选池剔除
+   * （一对一语义）。返回的 map 缺席 = 该节点走原动态路径（诚实降级）。
+   */
+  private planBatchAssignment(
+    chunk: PlanNode[],
+    recommendedModels: Record<string, string> | undefined,
+    avoidModels: string[],
+  ): Map<string, string> | undefined {
+    const avoidSet = new Set(avoidModels);
+    const takenByConstraint = new Set<string>();
+    /** 节点的约束模型（指定/推荐且可用）——有约束的节点不参与全局协调 */
+    const constrained = new Map<string, string>();
+    for (const node of chunk) {
+      let planned = node.modelId;
+      if (planned && (avoidSet.has(planned) || !this.modelExecutable(planned))) planned = undefined;
+      if (planned) {
+        constrained.set(node.id, planned);
+        takenByConstraint.add(planned);
+        continue;
+      }
+      let preferred = recommendedModels?.[node.type];
+      if (preferred && (avoidSet.has(preferred) || !this.modelExecutable(preferred))) preferred = undefined;
+      if (preferred) {
+        constrained.set(node.id, preferred);
+        takenByConstraint.add(preferred);
+      }
+    }
+    const dynamicNodes = chunk.filter((node) => !constrained.has(node.id));
+    if (dynamicNodes.length < 2) return undefined;
+
+    // 候选池：各动态节点任务类型的评分前 K 之并集，剔除被约束占用与规避
+    const scoresByType = new Map<string, Map<string, number>>();
+    for (const node of dynamicNodes) {
+      if (scoresByType.has(node.type)) continue;
+      const ranked = this.modelScheduler.rankCandidateScores(node.type, undefined, [...avoidSet]);
+      const map = new Map<string, number>();
+      for (const entry of ranked.slice(0, this.batchCandidateCap)) map.set(entry.id, entry.score);
+      scoresByType.set(node.type, map);
+    }
+    const candidateIds: string[] = [];
+    for (const map of scoresByType.values()) {
+      for (const id of map.keys()) {
+        if (!candidateIds.includes(id) && !takenByConstraint.has(id) && this.modelExecutable(id)) candidateIds.push(id);
+      }
+    }
+    if (candidateIds.length < 2) return undefined;
+
+    // 收益矩阵（节点 × 候选）：缺评分（该类型评分池未含此候选）给保守 0
+    const profit: number[][] = dynamicNodes.map((node) =>
+      candidateIds.map((id) => scoresByType.get(node.type)?.get(id) ?? 0),
+    );
+    const { modelOfNode } = assignBatch(profit);
+    const assignment = new Map<string, string>();
+    modelOfNode.forEach((candidateIdx, nodeIdx) => {
+      if (candidateIdx >= 0) assignment.set(dynamicNodes[nodeIdx].id, candidateIds[candidateIdx]);
+    });
+    return assignment.size > 0 ? assignment : undefined;
   }
 
   /**
@@ -208,14 +296,39 @@ export class TaskExecutor {
     try {
       const layers = this.topologicalLayers(plan.nodes);
       const parallelism = this.modelScheduler.computeParallelism();
+      // 43.0：计划级待执行需求回写容量前沿（未挂载为空操作——纯诊断；
+      // 计划级口径：整份待执行需求，批级会被末批小样本覆盖）
+      this.modelScheduler.updateCapacityFrontier(
+        plan.nodes.reduce<Array<{ type: string; count: number }>>((acc, node) => {
+          const found = acc.find((a) => a.type === node.type);
+          if (found) found.count += 1;
+          else acc.push({ type: node.type, count: 1 });
+          return acc;
+        }, []),
+      );
       for (const layer of layers) {
         if (controller.signal.aborted) break;
         // 动态并行度：分层内分批执行，每批不超过 parallelism
         for (let i = 0; i < layer.length; i += parallelism) {
           if (controller.signal.aborted) break;
           const chunk = layer.slice(i, i + parallelism);
+          // 32.0：批内动态选型节点全局最优指派（未挂载 / 无协调必要时 undefined）
+          const batchAssignment = this.batchAssignmentEnabled
+            ? this.planBatchAssignment(chunk, recommendedModels, options?.avoidModels ?? [])
+            : undefined;
           const layerResults = await Promise.all(
-            chunk.map((node) => this.executeNode(planId, node, signal, outputs, controller.signal, recommendedModels, options?.avoidModels ?? [])),
+            chunk.map((node) =>
+              this.executeNode(
+                planId,
+                node,
+                signal,
+                outputs,
+                controller.signal,
+                recommendedModels,
+                options?.avoidModels ?? [],
+                batchAssignment?.get(node.id),
+              ),
+            ),
           );
           for (const result of layerResults) {
             nodeResults.push(result);
@@ -279,6 +392,8 @@ export class TaskExecutor {
     abortSignal: AbortSignal,
     recommendedModels?: Record<string, string>,
     avoidModels: string[] = [],
+    /** 32.0：批内全局指派的模型（可用且未被规避时短路动态选型） */
+    forcedModel?: string,
   ): Promise<NodeResult> {
     const context: Record<string, string> = {};
     for (const dep of node.dependsOn) {
@@ -294,9 +409,13 @@ export class TaskExecutor {
     if (preferred && (avoidSet.has(preferred) || !this.modelExecutable(preferred))) preferred = undefined;
     let plannedModel = node.modelId;
     if (plannedModel && (avoidSet.has(plannedModel) || !this.modelExecutable(plannedModel))) plannedModel = undefined;
+    // 32.0：批内全局指派优先于逐节点动态评分（约束（指定/推荐）仍最高）
+    const forced = forcedModel && !avoidSet.has(forcedModel) && this.modelExecutable(forcedModel) ? forcedModel : undefined;
     const assignment = plannedModel
       ? this.modelScheduler.modelInsight(node.type, plannedModel)
-      : this.modelScheduler.assignModelWithInsight(node.type, preferred, undefined, { avoidModels });
+      : forced
+        ? this.modelScheduler.modelInsight(node.type, forced)
+        : this.modelScheduler.assignModelWithInsight(node.type, preferred, undefined, { avoidModels });
     let modelId = assignment.modelId;
     this.decisionInsights.push({
       nodeId: node.id,
@@ -362,6 +481,7 @@ export class TaskExecutor {
           this.broadcast({ type: 'node-complete', planId, nodeId: node.id, latency: Date.now() - nodeStartedAt, quality: verdict.quality, attempt });
           this.broadcast({ type: 'node-reflect', planId, nodeId: node.id, verdict: 'pass', reason: verdict.reason || `质量 ${verdict.quality.toFixed(2)} ≥ 阈值 ${threshold.toFixed(2)}` });
           this.decisionInsights[insightIndex]!.success = true; // 2.0：校准回填（预测 vs 实际）
+          this.modelScheduler.reportHedgeOutcome(modelId, verdict.quality); // 31.0：对抗组合部分反馈（未挂载为空操作）
 
           // 级联触发（仅质量达标时）
           this.triggerCascade(node, signal, output);
@@ -443,6 +563,7 @@ export class TaskExecutor {
       }
     }
 
+    this.modelScheduler.reportHedgeOutcome(modelId, 0); // 31.0：最终失败的部分反馈（未挂载为空操作）
     return {
       nodeId: node.id,
       modelId,

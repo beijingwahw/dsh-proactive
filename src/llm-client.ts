@@ -18,6 +18,7 @@
 
 import { AppError, NetworkError, TimeoutError } from './errors.js';
 import { RobustStream } from './core/robust-statistics.js';
+import { robustTimeout } from './core/robust-decisions.js';
 
 /** 聊天消息（OpenAI 兼容格式） */
 export interface ChatMessage {
@@ -360,6 +361,35 @@ export class LLMClient {
     return this.robustStreams.get(modelId)?.toSamples();
   }
 
+  /**
+   * 34.0：挂载 CVaR 超时预算（幂等覆盖，挂载即生效）。
+   *
+   * 每模型超时从固定魔数升级为 margin × CVaR_α(该模型延迟史)——按
+   * 「最坏尾部的期望」定价：重尾模型自动获得更长预算、轻尾模型不被
+   * 一刀切。依赖 robustLatency 启用（延迟样本与其共用）；样本不足
+   * minSamples 时该模型回退全局缺省超时（零漂移）。
+   */
+  attachCvarTimeouts(options?: import('./core/robust-decisions.js').RobustTimeoutConfig): void {
+    this.cvarTimeoutConfig = {
+      alpha: options?.alpha ?? 0.95,
+      margin: options?.margin ?? 1.5,
+      minSamples: options?.minSamples ?? 30,
+      floorMs: options?.floorMs ?? 5000,
+      capMs: options?.capMs ?? 300_000,
+    };
+  }
+
+  /** 34.0：CVaR 超时配置（未挂载 undefined） */
+  private cvarTimeoutConfig?: import('./core/robust-decisions.js').RobustTimeoutConfig;
+
+  /** 34.0：模型的 CVaR 超时预算（未挂载 / 样本不足 → undefined 回退缺省） */
+  getCvarTimeout(modelId: string): number | undefined {
+    if (!this.cvarTimeoutConfig) return undefined;
+    const samples = this.getLatencySamples(modelId);
+    if (!samples) return undefined;
+    return robustTimeout(samples, this.cvarTimeoutConfig);
+  }
+
   /** 获取并发槽位（必要时排队） */
   private acquireSlot(state: ModelState): Promise<void> {
     if (state.active < state.maxConcurrency) {
@@ -435,7 +465,9 @@ export class LLMClient {
   /** 单次 HTTP 调用（含超时控制；keyAttempt 用于多密钥轮换） */
   private async chatOnce(state: ModelState, messages: ChatMessage[], options: ChatOptions, keyAttempt = 0): Promise<LLMResponse> {
     const { config } = state;
-    const timeout = options.timeout ?? this.config.timeout;
+    // 34.0：模型级 CVaR 超时预算优先（按该模型延迟史的尾部定价；
+    // 未挂载 / 样本不足时逐位回退全局缺省——零漂移）
+    const timeout = options.timeout ?? this.getCvarTimeout(config.id) ?? this.config.timeout;
     const url = buildCompletionsUrl(config.endpoint);
     const startedAt = Date.now();
 

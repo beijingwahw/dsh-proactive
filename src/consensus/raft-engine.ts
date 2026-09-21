@@ -22,6 +22,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { raftSafetyAudit } from '../core/quorum-systems.js';
 import http from 'node:http';
 import path from 'node:path';
 import { NetworkError } from '../errors.js';
@@ -792,6 +793,17 @@ export class RaftEngine {
     } catch {
       /* 损坏状态从零开始（安全性由任期机制保证） */
     }
+  }
+
+  /**
+   * 46.0：法定人数安全审计（纯读取，零漂移）。
+   *
+   * 多数派交叉 / 容错上界 / 拜占庭可行性 / 负载——共识安全性从
+   * 「被相信」升级为「被检查」（多数派两两相交是 Raft 安全性的
+   * 根基，46.0 内核的闭式口径）。
+   */
+  quorumAudit(): { nodes: number; quorumSize: number; minIntersection: number; crashFaultTolerance: number; byzantineTolerance: number; load: number; verdict: string } {
+    return raftSafetyAudit(this.config.cluster.length);
   }
 
   /** 持久化状态（原子写入） */

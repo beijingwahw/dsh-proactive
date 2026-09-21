@@ -47,6 +47,7 @@ import {
   type SafetySpec,
   type ViolationReport,
 } from './core/runtime-verification.js';
+import { firstPassageCooldown } from './core/first-passage.js';
 
 /** 治理动作类型 */
 export type GovernedAction = 'autonomous-execute' | 'exploration' | 'goal-dispatch' | 'strategy-evolution';
@@ -141,6 +142,12 @@ export class SafetyGovernor {
   private circuitState: CircuitState = 'closed';
   private consecutiveFailures = 0;
   private circuitOpenedAt = 0;
+  /** 40.0：失败时间戳（attachFirstPassageAdvisor 后记录；首达定价原料） */
+  private failureTimestamps: number[] = [];
+  /** 40.0：首达冷却配置（未挂载 undefined——零记录零介入） */
+  private firstPassage?: { targetProb: number };
+  /** 40.0：最近一次首达定价读数（breaker 打开时刷新） */
+  private lastFirstPassage?: { recommendedCooldownMs: number; expectedRecoverMs: number; mu: number; sigma: number; targetProb: number };
   /** 4.0：半开试探互斥（探测在途时其余动作继续拒绝） */
   private halfOpenProbeInFlight = false;
   /** Kill Switch */
@@ -287,13 +294,48 @@ export class SafetyGovernor {
   }
 
   /**
+   * 40.0：挂载首达时间冷却定价（幂等覆盖，挂载即生效）。
+   *
+   * 熔断打开时的冷却从配置魔数升维为概率定价：观察到的相邻失败间隔
+   * （恢复方向的漂移 μ̂ 与波动 σ̂）喂入逆高斯首达模型，二分解出
+   * 「P(失败强度恢复 ≤ cooldown) ≥ targetProb」的最小冷却。μ̂ ≤ 0
+   * （结构性恶化）时诚实给出 undefined——再等也不会自己好。定价为
+   * 建议口径（半开转换时序仍由既有状态机治理）；未挂载零记录零介入。
+   */
+  attachFirstPassageAdvisor(options?: { targetProb?: number }): void {
+    this.firstPassage = { targetProb: Math.min(0.99, Math.max(0.5, options?.targetProb ?? 0.9)) };
+  }
+
+  /** 40.0：最近一次首达定价读数（纯读取；未挂载/未打开过熔断返回 undefined） */
+  firstPassageView(): { recommendedCooldownMs: number; expectedRecoverMs: number; mu: number; sigma: number; targetProb: number } | undefined {
+    return this.lastFirstPassage ? { ...this.lastFirstPassage } : undefined;
+  }
+
+  /** 40.0：从失败间隔序列做首达定价（breaker 打开沿调用） */
+  private assessFirstPassage(): void {
+    if (!this.firstPassage || this.failureTimestamps.length < 4) return;
+    const intervals: number[] = [];
+    for (let i = 1; i < this.failureTimestamps.length; i += 1) {
+      intervals.push(Math.max(1, this.failureTimestamps[i]! - this.failureTimestamps[i - 1]!));
+    }
+    const estimate = firstPassageCooldown(intervals, { targetProb: this.firstPassage.targetProb });
+    if (!estimate || estimate.recommendedCooldown === undefined) return;
+    this.lastFirstPassage = {
+      recommendedCooldownMs: estimate.recommendedCooldown,
+      expectedRecoverMs: estimate.expectedTime ?? estimate.recommendedCooldown,
+      mu: estimate.mu,
+      sigma: estimate.sigma,
+      targetProb: this.firstPassage.targetProb,
+    };
+  }
+
+  /**
    * 回写动作结果（驱动熔断器与预算统计）
    * @param success 动作是否成功
    * @param tokensUsed 本次消耗 token
    * @param cost 本次成本
    */
-  recordOutcome(success: boolean, tokensUsed = 0, cost = 0): void {
-    this.totalTokensUsed += tokensUsed;
+  recordOutcome(success: boolean, tokensUsed = 0, cost = 0): void {    this.totalTokensUsed += tokensUsed;
     this.totalCost += cost;
 
     if (success) {
@@ -306,6 +348,8 @@ export class SafetyGovernor {
       }
     } else {
       this.consecutiveFailures += 1;
+      if (this.firstPassage) this.failureTimestamps.push(Date.now());
+      if (this.failureTimestamps.length > 64) this.failureTimestamps.splice(0, this.failureTimestamps.length - 64);
       this.emit('action-failed', { consecutiveFailures: this.consecutiveFailures });
       // 半开试探失败 → 重新熔断；连续失败超阈值 → 熔断
       if (this.circuitState === 'half-open') {
@@ -316,6 +360,9 @@ export class SafetyGovernor {
       } else if (this.consecutiveFailures >= this.config.circuitFailureThreshold && this.circuitState !== 'open') {
         this.circuitState = 'open';
         this.circuitOpenedAt = Date.now();
+        // 40.0：熔断打开即做首达定价——冷却不再是一刀切魔数，而是
+        // 「以 target 概率确信失败强度已恢复」的最小等待（逆高斯口径）
+        this.assessFirstPassage();
         this.emit('breaker-opened', { via: `consecutive-failures-${this.consecutiveFailures}` });
       }
     }

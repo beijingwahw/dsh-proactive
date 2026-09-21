@@ -32,6 +32,7 @@ import { buildPatternFingerprint } from './memory/long-term-memory.js';
 import type { MemoryGraph } from './memory/memory-graph.js';
 import type { ChangeEntry, ChangePayload } from './sync/distributed-sync.js';
 import type { Signal } from './sentinel.js';
+import { distillRetention } from './core/information-bottleneck.js';
 
 /** 反思器配置 */
 export interface ReflectorConfig {
@@ -113,6 +114,10 @@ export class Reflector implements IReflector {
   private onMemoryChange?: (type: ChangeEntry['type'], fingerprint: string, payload: ChangePayload) => void;
   /** 蒸馏进行中标志（阈值自动触发的防抖，避免并发重复蒸馏） */
   private distilling = false;
+  /** 37.0：信息瓶颈蒸馏定价（attachBottleneckDistiller 后生效；未挂载零漂移） */
+  private bottleneck?: { beta: number; retentionFloor: number };
+  /** 37.0：最近一次瓶颈定价读数（审计口径） */
+  private lastBottleneck?: { retention: number; iXY: number; clusters: number; sampleCount: number };
   /** 2.0：校准滑动窗口（Brier 残差滚动统计） */
   private calibrationWindow: Array<{ predicted: number; actual: 0 | 1 }> = [];
 
@@ -408,8 +413,28 @@ export class Reflector implements IReflector {
    * @param options.force 强制蒸馏（Tool 按需调用 / 首次蒸馏时使用）
    * @returns 蒸馏报告（含本次产出的语义/程序记忆与兼容策略）
    */
-  async distillKnowledge(options?: { force?: boolean }): Promise<DistillationReport> {
-    const now = Date.now();
+  /**
+   * 37.0：挂载信息瓶颈蒸馏定价（幂等覆盖，挂载即生效）。
+   *
+   * 蒸馏门槛从纯水位（样本计数）升维为水位 + 信息量双门：X = 任务位型
+   * （类型 × 质量档 × 延迟档），Y = 成败；Blahut–Arimoto IB 压缩后的
+   * 保留率 retention = I(T;Y)/I(X;Y) < retentionFloor 时，样本与既有
+   * 知识同构——水位再高也只产出重复知识，诚实跳过（below-information）。
+   * 未挂载零漂移（原水位单门）。
+   */
+  attachBottleneckDistiller(options?: { beta?: number; retentionFloor?: number }): void {
+    this.bottleneck = {
+      beta: options?.beta ?? 5,
+      retentionFloor: Math.min(0.99, Math.max(0.01, options?.retentionFloor ?? 0.4)),
+    };
+  }
+
+  /** 37.0：最近一次瓶颈定价读数（未挂载/未评估时 undefined） */
+  getBottleneckView(): { retention: number; iXY: number; clusters: number; sampleCount: number } | undefined {
+    return this.lastBottleneck ? { ...this.lastBottleneck } : undefined;
+  }
+
+  async distillKnowledge(options?: { force?: boolean }): Promise<DistillationReport> {    const now = Date.now();
     const minConfidence = this.config.distillMinConfidence ?? 0.6;
     const minSuccesses = this.config.distillMinSuccesses ?? 3;
     const affinityThreshold = this.config.distillModelAffinityThreshold ?? 0.6;
@@ -432,6 +457,43 @@ export class Reflector implements IReflector {
           skipReason: 'below-threshold',
         };
         return skippedReport;
+      }
+      // ── 0.5 信息瓶颈门控（37.0）：水位达标但信息量不足 → 依然不蒸馏 ──
+      // X = 任务位型（类型 × 质量档），Y = 成败结果；IB 压缩后的保留率
+      // retention = I(T;Y)/I(X;Y) 是「这批样本携带多少值得蒸馏的新信息」
+      // 的定价——同构样本水位再高也只产出重复知识（数据处理不等式的
+      // 应用面）。未挂载 / 样本不足时本段零介入。
+      if (this.bottleneck) {
+        const patterns = this.memory.getAllTaskPatterns();
+        const samples = patterns.flatMap((p) => {
+          const total = p.successfulPlans.length + p.failureRecords.length;
+          if (total === 0) return [];
+          const qualityBucket = p.avgQualityScore >= 0.8 ? 'high-q' : p.avgQualityScore >= 0.6 ? 'mid-q' : 'low-q';
+          const latencyBucket = p.avgExecutionTime >= 30_000 ? 'slow' : 'fast';
+          const outcomes: Array<{ features: string[]; success: boolean }> = [];
+          for (let k = 0; k < Math.min(total, 5); k += 1) {
+            outcomes.push({ features: [p.taskSummary.slice(0, 12), qualityBucket, latencyBucket], success: k < p.successfulPlans.length });
+          }
+          return outcomes;
+        });
+        if (samples.length >= 8) {
+          const report = distillRetention(samples, { beta: this.bottleneck.beta });
+          this.lastBottleneck = { retention: report.retention, iXY: report.iXY, clusters: report.clusters, sampleCount: report.sampleCount };
+          // 双门：绝对信息量（I(X;Y) < 0.05 nat——批次本身近乎无信息，
+          // 此时的保留率是噪声过拟合）或保留率不足（同构于既有知识）
+          if (report.iXY < 0.05 || report.retention < this.bottleneck.retentionFloor) {
+            return {
+              distilledAt: now,
+              sourceEpisodicCount: 0,
+              semanticMemories: [],
+              proceduralMemories: [],
+              strategies: [],
+              summary: `跳过蒸馏：水位已达但信息瓶颈保留率 ${report.retention.toFixed(3)} < ${this.bottleneck.retentionFloor}（I(X;Y)=${report.iXY.toFixed(3)} nat，${report.sampleCount} 样本同构——值得蒸馏的新信息不足）`,
+              skipped: true,
+              skipReason: 'below-information',
+            };
+          }
+        }
       }
     }
 

@@ -96,6 +96,25 @@ export interface SymbiosisBridgeHook {
 export type CapacityAdvisor = () => Insight[] | void;
 /** 28.0：尾部风险顾问（心跳 2.7 段消费，缺省零改动） */
 export type TailRiskAdvisor = () => Insight[] | void;
+/**
+ * 33.0：系统性风险顾问（心跳 2.8 段消费，缺省零改动）。
+ *
+ * 由 index.ts 桥接到 SystemicRiskMonitor：每轮心跳喂入各模型本期
+ * 失败计数，窗口攒满后相关矩阵经 Marchenko–Pastur 清洗——伪相关被
+ * 噪声带吸收（不误报），真实共同因子（λ₁ 显著超带 + 解释份额达标）
+ * 产出 systemic-risk 洞察（同一上游/厂商的模型同沉浮，热备是幻觉）。
+ * 失败由调用侧静默隔离，不阻断主链路。
+ */
+export type SystemicRiskAdvisor = () => Insight[] | void;
+/**
+ * 41.0：排队网络顾问（心跳 2.9 段消费，缺省零改动）。
+ *
+ * 由 index.ts 桥接到 tandemNetwork：各模型作为独立 M/M/c 站、到达率
+ * 按当前流量份额分摊，Erlang-C 口径解出瓶颈站（ρ 最大）与端到端
+ * 逗留——瓶颈站接近饱和（ρ ≥ 0.85）或不可稳定时产出 capacity-flow
+ * 洞察（Jackson 乘积形式背书）。失败由调用侧静默隔离。
+ */
+export type QueueingNetworkAdvisor = () => Insight[] | void;
 /** 自主心跳配置 */
 export interface AutonomyLoopConfig {
   /** 心跳间隔（毫秒） */
@@ -172,6 +191,10 @@ export class AutonomyLoop {
   private capacityAdvisor?: CapacityAdvisor;
   /** 28.0：尾部风险顾问（可选注入；心跳 2.7 段消费，缺省零改动） */
   private tailRiskAdvisor?: TailRiskAdvisor;
+  /** 33.0：系统性风险顾问（可选注入；心跳 2.8 段消费，缺省零改动） */
+  private systemicRiskAdvisor?: SystemicRiskAdvisor;
+  /** 41.0：排队网络顾问（可选注入；心跳 2.9 段消费，缺省零改动） */
+  private networkAdvisor?: QueueingNetworkAdvisor;
   // 可选自主组件（向后兼容）
   private worldModel?: WorldModel;
   private curiosity?: CuriosityEngine;
@@ -207,6 +230,10 @@ export class AutonomyLoop {
     capacityAdvisor?: CapacityAdvisor;
     /** 28.0：尾部风险顾问（可选，缺省不启用） */
     tailRiskAdvisor?: TailRiskAdvisor;
+    /** 33.0：系统性风险顾问（可选，缺省不启用） */
+    systemicRiskAdvisor?: SystemicRiskAdvisor;
+    /** 41.0：排队网络顾问（可选，缺省不启用） */
+    networkAdvisor?: QueueingNetworkAdvisor;
     worldModel?: WorldModel;
     curiosity?: CuriosityEngine;
     governor?: SafetyGovernor;
@@ -226,6 +253,8 @@ export class AutonomyLoop {
     this.symbiosis = params.symbiosis;
     this.capacityAdvisor = params.capacityAdvisor;
     this.tailRiskAdvisor = params.tailRiskAdvisor;
+    this.systemicRiskAdvisor = params.systemicRiskAdvisor;
+    this.networkAdvisor = params.networkAdvisor;
     this.worldModel = params.worldModel;
     this.curiosity = params.curiosity;
     this.governor = params.governor;
@@ -379,6 +408,37 @@ export class AutonomyLoop {
       }
     } catch {
       /* 尾部评估失败不阻断 */
+    }
+
+    // ── 2.8 系统性风险评估（33.0）：失败相关性 → MP 清洗 → 共同因子洞察 ──
+    // 样本相关矩阵的大多数谱结构是纯噪声（Marchenko–Pastur 带）；
+    // 清洗后头号特征值仍显著超带 = 存在共同因子（同厂商/同上游）——
+    // 「看起来分散」的模型冗余是统计幻觉。未注入顾问时零改动；
+    // 失败静默（系统性评估不阻断主链路）。
+    try {
+      if (this.systemicRiskAdvisor) {
+        const systemicInsights = this.systemicRiskAdvisor();
+        if (systemicInsights && systemicInsights.length > 0) {
+          insights.push(...systemicInsights);
+        }
+      }
+    } catch {
+      /* 系统性评估失败不阻断 */
+    }
+
+    // ── 2.9 排队网络评估（41.0）：模型站 M/M/c × 流量份额 → 瓶颈站洞察 ──
+    // 单站反解（25.0）只看一台排队机；串联视角下瓶颈站（ρ 最大）才是
+    // 吞吐的钳制者——其他站再快也无济于事。未注入顾问时零改动；
+    // 失败静默（网络评估不阻断主链路）。
+    try {
+      if (this.networkAdvisor) {
+        const networkInsights = this.networkAdvisor();
+        if (networkInsights && networkInsights.length > 0) {
+          insights.push(...networkInsights);
+        }
+      }
+    } catch {
+      /* 排队网络评估失败不阻断 */
     }
 
     // ── 3. 汇总反思教训洞察（去重已消化的教训） ──
