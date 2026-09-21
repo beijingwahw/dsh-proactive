@@ -5,7 +5,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-339933?logo=nodedotjs&logoColor=white)](#installation)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-8250df)](https://github.com/topics/dsh-plugin)
 
-> **Proactive Intelligence scheduling plugin** — a multi-model collaborative scheduling system for the DeepSeek Harness (DSH) ecosystem: it perceives, decides, and evolves on its own, with a built-in **Scientist / Theorist dual mind**, a **cognitive energy symbiosis economy**, and **twenty-eight phase-change kernels (evidence → geometry-topology / genesis / prophet layers: anytime-valid / conformal / optimal transport / information geometry / sheaf consensus / Gittins / robust statistics / differential privacy / capacity planning / Gaussian process / Kalman filtering / extreme value theory / Monte-Carlo tree search / submodular optimization)**.
+> **Proactive Intelligence scheduling plugin** — a multi-model collaborative scheduling system for the DeepSeek Harness (DSH) ecosystem: it perceives, decides, and evolves on its own, with a built-in **Scientist / Theorist dual mind**, a **cognitive energy symbiosis economy**, and **forty-eight phase-change kernels (evidence → geometry-topology / genesis / prophet / equilibrium / awakening / flux / fabric layers: anytime-valid / conformal / optimal transport / information geometry / sheaf consensus / Gittins / robust statistics / differential privacy / capacity planning / Gaussian process / Kalman filtering / extreme value theory / Monte-Carlo tree search / submodular optimization / adversarial no-regret learning / Hungarian global assignment / random matrix / CVaR distributional robustness / LQR feedback control / persistent homology / information bottleneck / nonlinear dynamics / PageRank spectral ranking / first passage / Jackson queueing networks / FFT spectral periodicity / max-flow / max-min fairness / OCBA budget allocation / quorum intersection / CRDT convergence / Shamir secret sharing / Haar wavelets / low-rank matrix completion)**.
 >
 > English | [中文](./README.md)
 
@@ -33,7 +33,7 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 │  Operational: signal→decide→execute→reflect 10-step pipeline │
 │  Evolution: policy evolver + sandbox + canary (policy/)      │
 │  Meta outer: self-model → conservative tune → rollback (meta/)│
-├─ Kernel Stack (core/) — twenty-eight kernels, 3.0 → 30.0 ──┤
+├─ Kernel Stack (core/) — forty-eight kernels, 3.0 → 50.0 ──┤
 │  Evidence 3.0  Resilience 4.0  Causal 5.0  Free-Energy 6.0   │
 │  Deliberation 7.0  Metareasoning 8.0  Abstraction 9.0        │
 │  Scientist 10.0  Theorist 11.0                               │
@@ -45,6 +45,14 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 │  Robust Stats 23.0  Diff-Privacy 24.0  Capacity 25.0          │
 │  Gaussian Process 26.0  Kalman 27.0  Extreme Value 28.0       │
 │  MCTS 29.0  Submodular 30.0            (prophet layer)        │
+│  No-Regret 31.0  Assignment 32.0  Random Matrix 33.0          │
+│  CVaR Robustness 34.0  LQR Feedback 35.0 (equilibrium layer)  │
+│  Persistence 36.0  Info-Bottleneck 37.0  Dynamics 38.0        │
+│  Spectral Ranking 39.0  First Passage 40.0 (awakening layer)  │
+│  Queueing 41.0  Spectral 42.0  Max-Flow 43.0 (flux layer)     │
+│  Fair Division 44.0  OCBA 45.0 (flux layer)                   │
+│  Quorum 46.0  CRDT 47.0  Shamir 48.0 (fabric layer)           │
+│  Haar Wavelet 49.0  Matrix Completion 50.0 (fabric)            │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -86,7 +94,47 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 - **Monte-Carlo-tree-search kernel** ([core/mcts.ts](./src/core/mcts.ts)): UCT + discounted returns — **the allocation of search budget itself becomes a sequential decision**. Transition edges sample Bernoulli outcomes from Beta posteriors, UCB1 balances exploit/explore, node-local returns backpropagate without depth bias, and any exhausted iteration/time budget reads out immediately (anytime property); the deliberation engine's `searchMcts` cross-checks beam search under one shared report format
 - **Submodular-optimization kernel** ([core/submodular.ts](./src/core/submodular.ts)): weighted coverage + lazy greedy (CELF) — **exploration-budget allocation gets its first approximation-ratio guarantee** (≥ (1−1/e)·OPT, Nemhauser–Wolsey–Fisher). Knowledge items are themes of their own with similar items partially covering them: a redundant second pick's marginal decays to (1−c)·w, complementary blind spots get picked first; a curvature refinement tightens the guarantee to (1−e^−c)/c·OPT
 
-### Kernel Stack (core/, 3.0 → 30.0)
+### Equilibrium Layer (31.0 → 35.0)
+
+> The prophet layer predicts the world's future; **the equilibrium layer admits the world fights back** — adversaries, global constraints, noise, worst cases, and feedback instability. Five mathematical pillars lift scheduling from "predictive optimality" to "adversarial equilibrium".
+
+- **Online-learning kernel** ([core/online-learning.ts](./src/core/online-learning.ts)): Fixed-Share Hedge — **no regret no matter how the adversary plays**. Every statistical learner in the system (Wilson / UCB / Gittins) assumes a stationary distribution; this kernel layers an adversarial view on top: model scores gain a bounded Hedge multiplier ([0.25, 4]), regret against the best fixed model in hindsight is ≤ √(2T lnN) (Freund–Schapire, distribution-free); the α share keeps weights trackable when model capabilities flip (Herbster–Warmuth), and a model under attack loses weight at e^{−η} per failure — an order of magnitude faster than statistical decay
+- **Global-assignment kernel** ([core/optimal-assignment.ts](./src/core/optimal-assignment.ts)): Hungarian algorithm (Jonker–Volgenant, O(n³)) — **batch model selection goes from local greedy to global optimum**. Dynamically-assigned nodes in one execution batch form a node × candidate profit matrix solved exactly as a linear sum assignment: the best model is no longer double-booked by same-batch nodes; a **dual certificate** (u_i + v_j ≤ c_ij + complementary slackness + zero gap) makes optimality checkable digit by digit rather than claimed (same proof-carrying philosophy as 15.0)
+- **Random-matrix kernel** ([core/random-matrix.ts](./src/core/random-matrix.ts)): Marchenko–Pastur noise edge + eigenvalue cleansing — **correlation upgrades from statistical illusion to falsifiable structural claim**. Most of the spectral structure of an empirical model-failure correlation matrix is pure noise (the MP band); cyclic Jacobi eigendecomposition + Laloux/Bouchaud cleansing absorbs pseudo-correlation into the band (no false alarms), while a top eigenvalue far above the edge with sufficient explained share yields a systemic-risk insight: models sharing a vendor/upstream sink together, and "seemingly diversified" hot spares are an illusion
+- **Distributionally-robust kernel** ([core/robust-decisions.ts](./src/core/robust-decisions.ts)): CVaR + Wasserstein balls — **the worst case gets a closed-form price**. Per-model timeout = margin × CVaR_α(latency history) (exact Rockafellar–Uryasev form, backed by the four coherence axioms): heavy-tailed models automatically earn longer budgets, light-tailed ones are no longer clipped by one-size-fits-all; the Wasserstein-1 robust mean is an algebraic identity of Kantorovich–Rubinstein duality (sup = E + ε), and worst-case exceedance inside the ball has an exact finite-sample algorithm
+- **Feedback-control kernel** ([core/feedback-control.ts](./src/core/feedback-control.ts)): discrete LQR + Lyapunov certificate — **closed-loop steering of the concurrency ceiling**. The 25.0 queueing inversion produces a static target; this kernel turns computeParallelism into a feedback controller tracking it: the gain comes from the DARE closed form (cross-checked digit-for-digit against fixed-point iteration), and every closed-loop step's stability is *proven* by a Lyapunov function (V(e_{k+1}) − V(e_k) = −(qe² + ru²) to machine precision); deadband anti-chatter and clamping anti-windup retire AIMD-style heuristic tuning
+
+### Awakening Layer (36.0 → 40.0)
+
+> The equilibrium layer plays against the world; **the awakening layer sees its own shape** — the topology of knowledge, the information price of distillation, the dynamical constitution of KPIs, influence emerging from structure, and the probabilistic price of recovery. Five mathematical pillars turn "self-awareness" from a reporting format into computable mathematics.
+
+- **Persistent-homology kernel** ([core/persistent-homology.ts](./src/core/persistent-homology.ts)): H₀ persistence diagram + bottleneck distance — **the shape of knowledge across scales**. Co-occurrence weights as similarity, threshold sweep reveals continents (stable knowledge clusters) and islands (memories co-occurring with nothing — the topological definition of a blind spot); the bottleneck distance carries the Cohen-Steiner–Edelsbrunner–Harer stability theorem (input perturbation δ ⟹ landscape drift ≤ δ). A new `topology` action on `query_memory` reads the knowledge landscape on demand
+- **Information-bottleneck kernel** ([core/information-bottleneck.ts](./src/core/information-bottleneck.ts)): Blahut–Arimoto / Tishby — **the information-theoretic price of distillation**. With X = task signatures and Y = outcomes, the IB-optimal retention I(T;Y)/I(X;Y) prices "how much distillable new information this batch carries": homogeneous batches (retention below floor or I(X;Y) < 0.05 nat) are honestly skipped — any watermark only yields duplicate knowledge; the data-processing inequality bounds retention ≤ 1 (three deterministic restarts escape hard-assignment freezes)
+- **Nonlinear-dynamics kernel** ([core/nonlinear-dynamics.ts](./src/core/nonlinear-dynamics.ts)): Rosenstein Lyapunov + R/S Hurst — **constitutional classification of KPIs**. Chaotic (λ₁ > 0, with a nearest-neighbor predictability gate that rejects white-noise pseudo-chaos) → forecast horizon ~1/λ₁ steps; persistent (H > 0.5) → trend weighting; anti-persistent (H < 0.5) → breakout discounting; the logistic map's λ₁ = ln2 is the analytic anchor
+- **Spectral-ranking kernel** ([core/spectral-ranking.ts](./src/core/spectral-ranking.ts)): PageRank power iteration — **influence emerges from the structure of the knowledge graph**. "Co-occurring with the important makes you important" as a fixed point, linear convergence with mass conservation checkable digit by digit; related() upgrades to edge-weight × neighbor-influence, topInfluential outputs the knowledge skeleton (the keep-the-bones basis for distillation); the exact uniformity of a ring graph is the verification anchor
+- **First-passage kernel** ([core/first-passage.ts](./src/core/first-passage.ts)): reflection principle + inverse Gaussian + gambler's ruin — **the probabilistic price of circuit-breaker recovery**. Drift/volatility of failure intervals feed a first-passage model that solves the minimal cooldown such that "confident recovery at target probability"; μ̂ ≤ 0 structural deterioration honestly reports unreachable; the Brownian reflection identity is cross-checked against 20,000 simulated paths
+
+### Flux Layer (41.0 → 45.0)
+
+> The prophet foresees, the equilibrium layer plays, the awakening layer sees itself; **the flux layer turns throughput, periodicity, fairness, and budgets into objects of flow mathematics** — five classic questions, five theorem-backed answers: where the bottleneck station is, what the rhythm is, who caps the ceiling, how slots divide, and where confirmation budget goes.
+
+- **Queueing-network kernel** ([core/queueing-network.ts](./src/core/queueing-network.ts)): Jackson product form + Erlang-C — **the bottleneck station becomes computable**. 25.0 inverts single-station concurrency; 41.0 treats each model as an independent M/M(c) station (product-form marginals) and heartbeat phase 2.9 solves for the highest-rho station — the constraint "no other station being faster helps". Verified: a 120k-event tandem M/M/1 simulation against the analytic sojourn 8/3 and near-zero marginal correlation
+- **Spectral-periodicity kernel** ([core/spectral-periodicity.ts](./src/core/spectral-periodicity.ts)): FFT periodogram + Fisher g test — **rhythm is solved from the data**. Hour-of-day heat is a histogram with the period preset to one day; radix-2 FFT plus Fisher's exact g distribution turns any period (minute loops / diurnal / weekly) into a hypothesis test, with a phase-aware harmonic seasonal factor taking over prediction when significant. Verified: FFT round-trip identity, Parseval, injected-period recovery, white noise insignificant
+- **Max-flow kernel** ([core/max-flow.ts](./src/core/max-flow.ts)): Edmonds-Karp + min-cut certificate — **throughput ceiling and its constrainer, computed together**. On the type-demand x model-capacity flow network, max-flow is the largest immediately-satisfiable dispatch and min-cut names the constrainer (starved types vs bridge models); cut capacity = flow value is the Ford-Fulkerson certificate (same proof-carrying philosophy as 15.0/32.0). Verified: 200 random graphs against brute-force min cuts
+- **Fair-division kernel** ([core/fair-division.ts](./src/core/fair-division.ts)): weighted max-min water-filling — **no one starves, as a theorem**. Exploration budgets per task family upgrade from novelty winner-take-all to progressive filling (Bertsekas-Gallager lexicographic optimality + integer guarantees): hot families may take more, but no active family's relative share gets crushed. Verified: the textbook water-filling solution [4/3, 4/3, 4/3, 1] and the fairness-dominance audit
+- **Budget-allocation kernel** ([core/budget-allocation.ts](./src/core/budget-allocation.ts)): OCBA optimal computing budget — **every step of bottleneck-hunting lands on the blade**. Benchmark re-run budgets upgrade from uniform to the Chen et al. closed form (n_i proportional to (sigma_i/delta_i)^2), optimal in the exponential decay rate of P(correct selection) (Glynn-Juneja); reports gain bottleneckFocus. Verified: Monte Carlo P(CS) OCBA >= uniform
+
+### Fabric Layer (46.0 → 50.0)
+
+> The flux layer turns throughput into flow mathematics; **the fabric layer weaves the system's underlying fabric** — the intersection of consensus, the convergence of replicas, the sharding of secrets, the decomposition of scales, and the latent dimensions of capability. Five pillars land on the last five un-upgraded modules.
+
+- **Quorum kernel** ([core/quorum-systems.ts](./src/core/quorum-systems.ts)): quorum intersection + Byzantine 3f+1 bound — **consensus safety is checked, not believed**. The majority minimum-intersection closed form 2q−n matches brute-force enumeration digit for digit; Raft's `quorumAudit()` reports intersection/fault-tolerance/load on real cluster configs; n <= 3f honestly infeasible (non-existence theorem)
+- **CRDT kernel** ([core/crdt.ts](./src/core/crdt.ts)): the three merge laws — **replica convergence as an algebraic property**. G-Counter/OR-Set/LWW merges satisfy commutativity/associativity/idempotence, hence byte-identical convergence after out-of-order + duplicated gossip (Shapiro's strong eventual consistency); the DistributedSync CRDT channel verified across two real instances
+- **Secret-sharing kernel** ([core/secret-sharing.ts](./src/core/secret-sharing.ts)): Shamir threshold + randomness audit — **trust is sharded, keys are tested**. Any t shares reconstruct exactly (enumerated); t−1 shares leak nothing information-theoretically (reconstruction values equiprobable); CryptoEngine's `shardKey/combineKeyShares` shards real keys; NIST frequency + runs audits test key material
+- **Multiscale kernel** ([core/multiscale-wavelet.ts](./src/core/multiscale-wavelet.ts)): Haar wavelets — **slow drifts and fast bursts separate across scales**. Orthogonal decomposition (perfect reconstruction + Parseval energy conservation to machine precision) yields trend level / drift-band energy / instantaneous burst readings; exposed via meta-cognition's `waveletView`
+- **Matrix-completion kernel** ([core/matrix-completion.ts](./src/core/matrix-completion.ts)): ALS low-rank factors — **cold-start capability emerges from latent dimensions**. The partially-observed model-x-task ability matrix is completed by alternating least squares (Candès–Recht recovery conditions); unmeasured types are extrapolated from latent factors; the scheduler's `coldStartEstimate` upgrades new-model selection from zero-shot guessing to latent-dimension prediction
+
+### Kernel Stack (core/, 3.0 → 50.0)
 | Kernel | Version | In one line |
 |------|------|--------|
 | evidence.ts | 3.0 | Unified evidence language: Wilson bounds / time decay / evidence ranking, spread across all memory layers |
@@ -117,6 +165,26 @@ The system has three tiers: the **kernel stack** (a substrate of minds sharing o
 | extreme-value.ts | 28.0 | Extreme value theory: POT/GPD tail extrapolation + Hill estimation + risk measures (see above) |
 | mcts.ts | 29.0 | Monte-Carlo tree search: UCT + discounted returns + anytime readout (see above) |
 | submodular.ts | 30.0 | Submodular optimization: weighted coverage + CELF lazy greedy + curvature-refined guarantee (see above) |
+| online-learning.ts | 31.0 | Online learning: Fixed-Share Hedge, adversary-free regret ≤ √(2T lnN) (see above) |
+| optimal-assignment.ts | 32.0 | Global assignment: Hungarian O(n³) exact solution + dual optimality certificate (see above) |
+| random-matrix.ts | 33.0 | Random matrix: Marchenko–Pastur cleansing + systemic-risk monitoring (see above) |
+| robust-decisions.ts | 34.0 | Distributional robustness: exact CVaR + Wasserstein KR duality (see above) |
+| feedback-control.ts | 35.0 | Feedback control: DARE closed-form gain + Lyapunov stability certificate (see above) |
+| persistent-homology.ts | 36.0 | Persistent homology: H₀ diagram + bottleneck-distance stability (see above) |
+| information-bottleneck.ts | 37.0 | Information bottleneck: Blahut-Arimoto, distillation retention pricing (see above) |
+| nonlinear-dynamics.ts | 38.0 | Nonlinear dynamics: Lyapunov + Hurst constitution classification (see above) |
+| spectral-ranking.ts | 39.0 | Spectral ranking: PageRank power iteration + knowledge skeleton (see above) |
+| first-passage.ts | 40.0 | First passage: reflection principle + inverse-Gaussian cooldown pricing (see above) |
+| queueing-network.ts | 41.0 | Queueing networks: Jackson product form + bottleneck station (heartbeat phase 2.9) |
+| spectral-periodicity.ts | 42.0 | Spectral periodicity: FFT periodogram + Fisher g test (spectral calendar) |
+| max-flow.ts | 43.0 | Max flow: Edmonds-Karp + min-cut certificate (capacity frontier) |
+| fair-division.ts | 44.0 | Fair division: weighted max-min water-filling (exploration family budgets) |
+| budget-allocation.ts | 45.0 | OCBA: optimal computing budget allocation (benchmark bottleneck focus) |
+| quorum-systems.ts | 46.0 | Quorums: intersection + Byzantine 3f+1 bound (Raft safety audit) |
+| crdt.ts | 47.0 | CRDT: G-Counter/OR-Set/LWW convergence laws (sync channel) |
+| secret-sharing.ts | 48.0 | Secret sharing: Shamir threshold + entropy audit (key sharding) |
+| multiscale-wavelet.ts | 49.0 | Wavelets: Haar multi-scale decomposition (KPI scale lens) |
+| matrix-completion.ts | 50.0 | Matrix completion: ALS low-rank factors (cold-start extrapolation) |
 
 ### Cognitive Energy Symbiosis Economy (symbiosis/)
 - **Energy ledger** (ledger.ts): cognitive energy cannot be forged — global conservation via double-entry bookkeeping, every transfer sha256-chained for audit and replay, a Gini coefficient measures ecosystem health
@@ -153,7 +221,7 @@ Each heartbeat runs an 11-step orchestration ([autonomy-loop.ts](./src/autonomy-
 
 1. **Meta-cognition observation** — collect KPIs, surface anomaly insights
 2. **1.5 Symbiosis heartbeat** — inject KPIs into the energy economy + belief market
-3. **World-model foresight** — predict signal arrivals, capture rising trends
+3. **World-model foresight** — predict signal arrivals, capture rising trends; phase 2.5 capacity planning (25.0) inverts the minimum concurrency, phase 2.7 tail-risk assessment (28.0) extrapolates p99.9 via POT/GPD, and phase 2.8 systemic-risk assessment (33.0) detects common-factor exposure by cleansing the failure-correlation matrix through the Marchenko–Pastur band
 4. **Merge reflection lessons** — consolidate lessons from the reflection engine, skipping digested ones
 5. **Goal generation** — auto-create improvement goals from insights and decompose subtasks
 6. **Subtask dispatch** — inject into execution after safety governance review
@@ -196,7 +264,7 @@ pnpm build
 - **Multi-key failover**: when several candidate keys exist for a vendor, auth failures (401/403) or quota exhaustion (429) automatically rotate to the next candidate key, upgraded with **health-aware routing** — keys are selected by success/failure statistics, with a 1-minute cooldown for 429 and a 5-minute cooldown for 401/403, auto-recovering on success; users can reorder key usage via the `manage_keys` tool (persisted across restarts); startup logs report each model's key sources (never the key values), and runtime key health is inspectable via `query_memory keys`;
 - For a single vendor only, use the per-vendor patches under `patches/domestic-models/`; regenerate with `pnpm generate:patches`.
 
-All runtime options (sentinel / encryption / sync / consensus / hot reload / tenants / autonomy loop `autonomy` / host fusion `hostFusion`) are likewise built into [cordis.patch.yml](./cordis.patch.yml) and need no changes; symbiosis options live under `autonomy.symbiosis` (futarchy voting, energy feedback, etc., off by default). Guarantee-layer kernel options 12.0-16.0 and geometry/topology-layer options 17.0-20.0 are also off by default (zero drift): `autonomy.anytimeEvidence` (α / reference watermark), `autonomy.conformal` (α / calibration capacity / threshold risk & confidence), `autonomy.qualityDiversity` (explore rate), `autonomy.runtimeVerification` (additional `specs`), `autonomy.optimalTransport` (monitored KPIs / windows / threshold quantile), `autonomy.informationGeometry` (KL budget / step scale), `autonomy.optimalStopping` (opportunity horizon / min samples), `autonomy.sheafConsensus` (obstruction misfit tolerance).
+All runtime options (sentinel / encryption / sync / consensus / hot reload / tenants / autonomy loop `autonomy` / host fusion `hostFusion`) are likewise built into [cordis.patch.yml](./cordis.patch.yml) and need no changes; symbiosis options live under `autonomy.symbiosis` (futarchy voting, energy feedback, etc., off by default). Guarantee-layer kernel options 12.0-16.0 and geometry/topology-layer options 17.0-20.0 are also off by default (zero drift): `autonomy.anytimeEvidence` (α / reference watermark), `autonomy.conformal` (α / calibration capacity / threshold risk & confidence), `autonomy.qualityDiversity` (explore rate), `autonomy.runtimeVerification` (additional `specs`), `autonomy.optimalTransport` (monitored KPIs / windows / threshold quantile), `autonomy.informationGeometry` (KL budget / step scale), `autonomy.optimalStopping` (opportunity horizon / min samples), `autonomy.sheafConsensus` (obstruction misfit tolerance); equilibrium-layer options 31.0-35.0 are likewise off by default (zero drift): `autonomy.hedgePortfolio` (learning rate η / share α), `autonomy.optimalAssignment` (candidate cap), `autonomy.randomMatrix` (window / min models / edge factor / share threshold), `autonomy.cvarTimeouts` (confidence α / margin / min samples), `autonomy.concurrencyControl` (target utilization / plant gain / control weight / deadband); awakening-layer options 37.0-40.0 are likewise off by default (zero drift): `autonomy.informationBottleneck` (β / retention floor), `autonomy.chaosDiagnostics` (min points / λ threshold / Hurst delta), `autonomy.spectralRanking` (damping), `autonomy.firstPassageCooldown` (recovery confidence target); flux-layer options 41.0-45.0 are likewise off by default (zero drift): `autonomy.queueingNetwork` (bottleneck rho threshold), `autonomy.spectralCalendar` (hourly bins), `autonomy.capacityFrontier`, `autonomy.fairBudget`, `autonomy.ocbaAllocator` (confirmation budget); fabric-layer options 49.0-50.0 are likewise off by default (zero drift): `autonomy.waveletView` (min points), `autonomy.latentFactors` (rank); fabric 46.0-48.0 are engine read-only methods (Raft `quorumAudit` / Sync CRDT channel / CryptoEngine `shardKey`) with no runtime switch; 36.0 persistent homology is queried on demand via the `topology` action of `query_memory` (zero drift).
 
 ## Tool Catalog (18 + sheaf consensus Tool, off by default)
 
@@ -230,7 +298,7 @@ Other common operations:
 - `manage_autonomy`: `start` / `stop` / `tick` / `kill-switch` / `revive` / `reset-circuit`
 - `query_memory`: `world-model` / `curiosity` / `governance` / `patterns` / `lessons` / `keys`, etc.
 
-## Offline Verification (35, zero API keys)
+## Offline Verification (43, zero API keys)
 
 Every kernel and subsystem has an offline end-to-end verification script (`node scripts/verify-*.mjs`):
 
@@ -245,6 +313,14 @@ node scripts/verify-frontier-kernels.mjs # Geometry & topology 17.0-20.0: analyt
 node scripts/verify-frontier-wiring.mjs # Geometry & topology wiring: real engines end-to-end (drift insight / natural mutation / mathematical defer)
 node scripts/verify-prophet-kernels.mjs # Prophet layer 26.0-30.0: GP interpolation / EI-vs-MC / Riccati closed form / POT analytic quantile / UCT convergence / CELF-vs-brute-force
 node scripts/verify-prophet-wiring.mjs  # Prophet wiring: real engines end-to-end (GP calibration / NIS-gate insight / latency samples to tail extrapolation / UCT cross-check / complementary blind spots)
+node scripts/verify-equilibrium-kernels.mjs # Equilibrium layer 31.0-35.0: adversarial regret bounds / Hungarian-vs-brute-force + dual certificates / MP-edge matching / CVaR-vs-RU / DARE closed form / machine-precision Lyapunov
+node scripts/verify-equilibrium-wiring.mjs  # Equilibrium wiring: real engines end-to-end (adversarial demotion & comeback / batch one-to-one / common-factor insight / heavy-tail timeout pricing / closed-loop concurrency)
+node scripts/verify-awakening-kernels.mjs  # Awakening layer 36.0-40.0: continents & islands + bottleneck stability / IB-DPI + β frontier / logistic λ₁=ln2 + Hurst constitutions / exact ring uniformity / reflection vs 20k paths
+node scripts/verify-awakening-wiring.mjs   # Awakening wiring: real engines end-to-end (knowledge topography / distillation information gate / chaos-regime flip insight / hub influence / breaker cooldown pricing)
+node scripts/verify-flux-kernels.mjs     # Flux layer 41.0-45.0: tandem M/M/1 simulation vs analytic + Jackson independence / FFT identities + Parseval + period recovery / max-flow vs brute-force min-cut + certificates / textbook water-filling + fairness audit / OCBA-vs-uniform P(CS)
+node scripts/verify-flux-wiring.mjs      # Flux wiring: real engines end-to-end (spectral calendar diurnal detection / capacity-frontier writeback / family fairness anti-starvation / OCBA bottleneck focus)
+node scripts/verify-fabric-kernels.mjs   # Fabric layer 46.0-50.0: quorum closed-form vs brute-force + 3f+1 bound / CRDT permutation convergence + add-win / Shamir threshold reconstruction + zero leakage / wavelet perfect reconstruction + Parseval / low-rank recovery
+node scripts/verify-fabric-wiring.mjs    # Fabric wiring: real engines end-to-end (Raft safety audit / two-instance CRDT convergence / key sharding reconstruction / wavelet burst capture / cold-start latent extrapolation)
 ```
 
 | Group | Scripts |
@@ -255,6 +331,10 @@ node scripts/verify-prophet-wiring.mjs  # Prophet wiring: real engines end-to-en
 | Geometry & topology layer 17.0-20.0 | verify-frontier-kernels · verify-frontier-wiring |
 | Genesis layer 21.0-25.0 | verify-genesis-kernels · verify-genesis-wiring |
 | Prophet layer 26.0-30.0 | verify-prophet-kernels · verify-prophet-wiring |
+| Equilibrium layer 31.0-35.0 | verify-equilibrium-kernels · verify-equilibrium-wiring |
+| Awakening layer 36.0-40.0 | verify-awakening-kernels · verify-awakening-wiring |
+| Flux layer 41.0-45.0 | verify-flux-kernels · verify-flux-wiring |
+| Fabric layer 46.0-50.0 | verify-fabric-kernels · verify-fabric-wiring |
 | Symbiosis economy | verify-symbiosis · verify-symbiosis-bridge · verify-belief-market · verify-futarchy · verify-energy-feedback · verify-full-agents · verify-observability |
 | Learning & evolution | verify-self-evolution · verify-self-evolution-v2 · verify-knowledge-distillation · verify-policy-evolution · verify-meta-cognition · verify-meta-cognition-v2 · verify-meta-edge · verify-consensus-sync |
 
@@ -287,7 +367,7 @@ Config section `hostFusion`: `enabled` / `observeToolResults` / `governToolCalls
 ├── cordis.patch.yml              # Bundle config layer (dsh.bundle.patch target, all domestic models, zero keys)
 ├── symbiosis-sankey-demo.html    # Cognitive-ecosystem energy-flow Sankey panorama (zero-dependency, self-contained)
 ├── patches/domestic-models/      # Optional per-vendor patches (9 vendors + all-domestic.yml)
-├── scripts/                      # Patch generator + 35 offline verification scripts
+├── scripts/                      # Patch generator + 43 offline verification scripts
 └── src/
     ├── index.ts                  # Plugin entry: 10-step pipeline orchestration + 18 tool registrations
     ├── types.ts / errors.ts      # Shared type layer / unified error hierarchy (stable machine-readable codes)
@@ -310,7 +390,7 @@ Config section `hostFusion`: `enabled` / `observeToolResults` / `governToolCalls
     ├── autonomy-loop.ts          # Autonomy loop: 11-step heartbeat orchestration
     ├── host-fusion.ts            # Host fusion layer: whole-host observability + safety governance
     ├── dsh-host.ts               # DSH host integration: LLM client / model catalog / key injection
-    ├── core/                     # Kernel stack: fourteen kernels from evidence 3.0 to shapley 16.0
+    ├── core/                     # Kernel stack: forty-eight kernels from evidence 3.0 to matrix-completion 50.0
     ├── meta/                     # Meta-cognition layer: self-model + meta-controller (dual-loop outer ring)
     ├── policy/                   # Policy evolver + sandbox: population evolution / canary deployment
     ├── symbiosis/                # Cognitive energy symbiosis: ledger / market / belief market / agents / runtime / Sankey

@@ -59,6 +59,141 @@ var TimeoutError = class extends AppError {
 	}
 };
 //#endregion
+//#region src/core/secret-sharing.ts
+/**
+* 48.0 秘密共享内核 —— Shamir 阈值 + 随机性审计：信任被分形，密钥被检验
+*
+* 动机: 主密钥单点保管 = 单点沦陷即全失。Shamir 秘密共享（1979）把
+* 秘密拆成 n 份、任意 t 份可重建、t−1 份**信息论零泄露**:
+*
+*   秘密 = 域 GF(p) 上 t−1 次多项式 f 的常数项，份额 = f(x_i)。
+*   重建 = t 个点上的 Lagrange 插值（任意 t 个点唯一确定 f ⟹ f(0)
+*   唯一）；t−1 个点对 f(0) 的每种猜测都存在唯一一致的多项式——
+*   **完备保密**（不是计算难度，是信息论意义：t−1 份与秘密统计独立）。
+*
+*   随机性审计（NIST SP 800-22 的两个核心检验）:
+*   - 频数检验: 1 的占比偏离 1/2 的 |χ| 口径（渐近 N(0,1)）
+*   - 游程检验: 游程数偏离期望（同值段切换次数的 χ² 口径）
+*   好的 PRNG 通过、偏置源被拒绝——「密钥的原料合格吗」可检查。
+*
+*   验证锚点: 任意 t 份子集重建成功（枚举）、t−1 份子集重建出
+*   随机等可能值（零泄露的实验读数）、Lagrange 恒等式、
+*   均匀字节通过审计 / 偏置字节被拒。
+*
+* 零漂移: 纯函数内核（引擎按需使用），未挂载零介入。
+*/
+const PRIME = 2n ** 127n - 1n;
+function modField(x) {
+	const r = x % PRIME;
+	return r < 0n ? r + PRIME : r;
+}
+function inverse(a) {
+	let result = 1n;
+	let base = modField(a);
+	let exp = PRIME - 2n;
+	while (exp > 0n) {
+		if (exp & 1n) result = result * base % PRIME;
+		base = base * base % PRIME;
+		exp >>= 1n;
+	}
+	return result;
+}
+/** Shamir 拆分：secret（UTF-8）→ n 份，阈值 t ≤ n 重建 */
+function shamirSplit(secret, n, threshold, rng) {
+	const parts = Math.max(2, Math.min(n, 255));
+	const t = Math.max(2, Math.min(threshold, parts));
+	if (!rng) {
+		let s = 2654435769;
+		rng = () => {
+			s = (Math.imul(s ^ s >>> 15, 1 | s) | 0) >>> 0;
+			return (s ^ s >>> 13) / 4294967296;
+		};
+	}
+	const bytes = Buffer.from(secret, "utf-8");
+	const coefficients = [];
+	const chunk = bytes.length + 15 >> 4;
+	for (let c = 0; c < chunk; c += 1) {
+		const slice = bytes.subarray(c * 16, c * 16 + 16);
+		const coeffs = [BigInt(`0x${Buffer.from(slice).toString("hex") || "0"}`)];
+		for (let k = 1; k < t; k += 1) {
+			let v = 0n;
+			for (let b = 0; b < 16; b += 1) v = v << 8n | BigInt(Math.floor(rng() * 256) & 255);
+			coeffs.push(v % PRIME);
+		}
+		coefficients.push(coeffs.map(modField));
+	}
+	const shares = [];
+	for (let x = 1; x <= parts; x += 1) {
+		const ys = coefficients.map((coeffs) => {
+			let acc = 0n;
+			for (let k = coeffs.length - 1; k >= 0; k -= 1) acc = (acc * BigInt(x) + coeffs[k]) % PRIME;
+			return acc;
+		});
+		shares.push({
+			x,
+			y: ys.map((v) => v.toString(16).padStart(32, "0")).join("")
+		});
+	}
+	return shares;
+}
+/** Shamir 重建：任意 ≥ 阈值份额 → 秘密（Lagrange 插值 f(0)） */
+function shamirCombine(shares) {
+	if (shares.length < 2) throw new Error("shamirCombine: 至少 2 份");
+	const blocks = shares[0].y.length / 32;
+	const chunks = [];
+	for (let b = 0; b < blocks; b += 1) {
+		let secret = 0n;
+		for (let i = 0; i < shares.length; i += 1) {
+			const xi = BigInt(shares[i].x);
+			const yi = BigInt(`0x${shares[i].y.substr(b * 32, 32)}`);
+			let num = 1n;
+			let den = 1n;
+			for (let j = 0; j < shares.length; j += 1) {
+				if (i === j) continue;
+				const xj = BigInt(shares[j].x);
+				num = num * xj % PRIME;
+				den = den * modField(xj - xi) % PRIME;
+			}
+			const weight = num * inverse(den) % PRIME;
+			secret = (secret + yi * weight) % PRIME;
+		}
+		const hex = secret.toString(16).padStart(32, "0");
+		chunks.push(Buffer.from(hex.slice(-32), "hex"));
+	}
+	const trimmed = chunks.map((c) => {
+		let start = 0;
+		while (start < c.length && c[start] === 0) start += 1;
+		return c.subarray(start);
+	});
+	return Buffer.concat(trimmed).toString("utf-8");
+}
+/** 随机性审计（频数 + 游程检验；NIST SP 800-22 口径） */
+function entropyAudit(bytes) {
+	const n = bytes.length * 8;
+	if (n < 64) throw new Error("entropyAudit: 至少 8 字节");
+	let ones = 0;
+	let switches = 0;
+	let prev = -1;
+	for (const byte of bytes) for (let b = 7; b >= 0; b -= 1) {
+		const bit = byte >> b & 1;
+		ones += bit;
+		if (prev >= 0 && bit !== prev) switches += 1;
+		prev = bit;
+	}
+	const oneRatio = ones / n;
+	const frequencyChi = (ones - n / 2) / (Math.sqrt(n) / 2);
+	const runs = switches + 1;
+	const runsZ = (switches - n / 2 + 1) / Math.sqrt((n - 1) / 2);
+	return {
+		bytes: bytes.length,
+		oneRatio,
+		frequencyChi,
+		runs,
+		runsZ,
+		passed: Math.abs(frequencyChi) <= 3 && Math.abs(runsZ) <= 3
+	};
+}
+//#endregion
 //#region src/security/crypto-engine.ts
 /**
 * crypto-engine.ts — 加密引擎（基础层，无内部依赖）
@@ -289,6 +424,24 @@ var CryptoEngine = class {
 	*/
 	static generateKey() {
 		return crypto.randomBytes(KEY_LENGTH).toString("hex");
+	}
+	/**
+	* 48.0：主密钥阈值分形（Shamir，n 份中任意 t 份可重建、t−1 份
+	* 信息论零泄露）。份额应分存于不同介质/保管人；本方法不落盘。
+	*/
+	shardKey(keyHex, shares, threshold) {
+		return shamirSplit(keyHex, shares, threshold, () => crypto.randomBytes(4).readUInt32BE(0) / 4294967296);
+	}
+	/** 48.0：份额重建（任意 ≥ 阈值份；Lagrange 插值） */
+	combineKeyShares(shareList) {
+		return shamirCombine(shareList);
+	}
+	/**
+	* 48.0：密钥原料随机性审计（频数 + 游程检验，NIST SP 800-22 口径）——
+	* 「密钥的原料合格吗」从信任变成检查（|z| ≤ 3 通过）。
+	*/
+	auditKeyEntropy(keyHex) {
+		return entropyAudit([...Buffer.from(keyHex, "hex")]);
 	}
 	/**
 	* 获取指定版本密钥的指纹（SHA-256 前 16 位 hex），用于安全展示与比对
@@ -2487,6 +2640,247 @@ var LongTermMemory = class {
 	}
 };
 //#endregion
+//#region src/core/persistent-homology.ts
+/** 并查集（带分量大小） */
+var DisjointSet = class {
+	parent = /* @__PURE__ */ new Map();
+	size = /* @__PURE__ */ new Map();
+	add(x) {
+		if (!this.parent.has(x)) {
+			this.parent.set(x, x);
+			this.size.set(x, 1);
+		}
+	}
+	find(x) {
+		let root = x;
+		while (this.parent.get(root) !== root) root = this.parent.get(root);
+		let cur = x;
+		while (this.parent.get(cur) !== cur) {
+			const next = this.parent.get(cur);
+			this.parent.set(cur, root);
+			cur = next;
+		}
+		return root;
+	}
+	/** 合并：返回 [存活根, 被吞并根]（按大小挂大树上；同大小字典序稳定） */
+	union(a, b) {
+		const ra = this.find(a);
+		const rb = this.find(b);
+		if (ra === rb) return void 0;
+		const sa = this.size.get(ra);
+		const sb = this.size.get(rb);
+		const [survivor, absorbed] = sa > sb || sa === sb && ra < rb ? [ra, rb] : [rb, ra];
+		this.parent.set(absorbed, survivor);
+		this.size.set(survivor, sa + sb);
+		return [survivor, absorbed];
+	}
+	sizeOf(x) {
+		return this.size.get(this.find(x)) ?? 1;
+	}
+};
+/**
+* H₀ 持续同调（相似度口径：阈值 ε 从 1 降到 floor）。
+*
+* nodes: 参与节点 id；edges: {source, target, weight ∈ (0,1]}（相似度）。
+* essential 类 = 阈值降到 floor 仍独活的分量（含完全孤立的节点）。
+*/
+function h0Persistence(nodes, edges, floor = 0) {
+	const ds = new DisjointSet();
+	for (const id of nodes) ds.add(id);
+	const sorted = [...edges].sort((a, b) => b.weight - a.weight);
+	const merges = [];
+	const diagram = [];
+	for (const edge of sorted) {
+		if (edge.weight <= floor) continue;
+		const union = ds.union(edge.source, edge.target);
+		if (!union) continue;
+		const [survivor, absorbedRoot] = union;
+		merges.push({
+			epsilon: edge.weight,
+			absorbedSize: ds.sizeOf(survivor),
+			survivor
+		});
+		diagram.push({
+			birth: 1,
+			death: edge.weight
+		});
+	}
+	const components = /* @__PURE__ */ new Map();
+	for (const id of nodes) {
+		const root = ds.find(id);
+		const bucket = components.get(root) ?? [];
+		bucket.push(id);
+		components.set(root, bucket);
+	}
+	const islands = [...components.values()].map((members) => ({ members })).sort((a, b) => b.members.length - a.members.length);
+	const deaths = diagram.map((d) => d.death).sort((a, b) => a - b);
+	const quantile = (p) => {
+		if (deaths.length === 0) return 0;
+		const idx = Math.min(deaths.length - 1, Math.max(0, Math.ceil(p * deaths.length) - 1));
+		return deaths[idx];
+	};
+	return {
+		nodes: nodes.length,
+		islands,
+		merges,
+		diagram,
+		landscape: {
+			p50: quantile(.5),
+			p90: quantile(.9),
+			continentCount: islands.length
+		}
+	};
+}
+/**
+* 瓶颈距离（L∞ 匹配口径，含对角线）。
+*
+* ε-匹配可行性：A_i ↔ B_j（‖·‖∞ ≤ ε）或 A_i ↔ 对角线（distToDiag ≤ ε），
+* B_j 同理可留对角线。二分候选 ε（成对距离 ∪ 对角距离），增广路判可行。
+* 稳定性定理（Cohen-Steiner et al.）: 输入扰动 δ → 瓶颈距离 ≤ δ。
+*/
+function bottleneckDistance(pointsA, pointsB) {
+	if (pointsA.length === 0 && pointsB.length === 0) return 0;
+	const diag = (p) => Math.abs(p.death - p.birth) / 2;
+	const dist = (p, q) => Math.max(Math.abs(p.birth - q.birth), Math.abs(p.death - q.death));
+	const candidates = /* @__PURE__ */ new Set();
+	for (const a of pointsA) {
+		candidates.add(diag(a));
+		for (const b of pointsB) candidates.add(dist(a, b));
+	}
+	for (const b of pointsB) candidates.add(diag(b));
+	const sorted = [...candidates].sort((x, y) => x - y);
+	const feasible = (eps) => {
+		const mustA = [];
+		for (let i = 0; i < pointsA.length; i += 1) if (diag(pointsA[i]) > eps) mustA.push(i);
+		const mustB = [];
+		for (let j = 0; j < pointsB.length; j += 1) if (diag(pointsB[j]) > eps) mustB.push(j);
+		if (mustA.length > pointsB.length || mustB.length > pointsA.length) return false;
+		const domains = mustA.map((i) => ({
+			i,
+			cands: Array.from({ length: pointsB.length }, (_, j) => j).filter((j) => dist(pointsA[i], pointsB[j]) <= eps)
+		})).sort((a, b) => a.cands.length - b.cands.length);
+		if (domains.some((d) => d.cands.length === 0)) return false;
+		const usedB = /* @__PURE__ */ new Set();
+		let budget = 2e5;
+		const remainingMustBCoverable = () => {
+			const freeA = [];
+			for (let i = 0; i < pointsA.length; i += 1) if (!mustA.includes(i)) freeA.push(i);
+			const matchOfA = /* @__PURE__ */ new Map();
+			const tryMatch = (j, visited) => {
+				for (const i of freeA) {
+					if (visited.has(i)) continue;
+					if (dist(pointsA[i], pointsB[j]) > eps) continue;
+					visited.add(i);
+					const held = matchOfA.get(i);
+					if (held === void 0 || tryMatch(held, visited)) {
+						matchOfA.set(i, j);
+						return true;
+					}
+				}
+				return false;
+			};
+			for (const j of mustB) {
+				if (usedB.has(j)) continue;
+				if (!tryMatch(j, /* @__PURE__ */ new Set())) return false;
+			}
+			return true;
+		};
+		const rec = (k) => {
+			if (budget <= 0) return true;
+			if (k === domains.length) return remainingMustBCoverable();
+			const domain = domains[k];
+			for (const j of domain.cands) {
+				if (usedB.has(j)) continue;
+				budget -= 1;
+				usedB.add(j);
+				if (rec(k + 1)) return true;
+				usedB.delete(j);
+			}
+			return false;
+		};
+		return rec(0);
+	};
+	let lo = 0;
+	let hi = sorted.length - 1;
+	let best = sorted[hi] ?? 0;
+	while (lo <= hi) {
+		const mid = Math.floor((lo + hi) / 2);
+		if (feasible(sorted[mid])) {
+			best = sorted[mid];
+			hi = mid - 1;
+		} else lo = mid + 1;
+	}
+	return best;
+}
+/** 知识地形摘要（36.0 接线口径：孤岛 = 盲区的拓扑定义） */
+function topographyInsight(report) {
+	const bigIslands = report.islands.filter((isl) => isl.members.length >= 2).length;
+	const lonely = report.nodes - report.islands.reduce((s, isl) => s + isl.members.length, 0);
+	return `${report.nodes} 节点 · 大陆 ${bigIslands} 块（成员 ≥2）· 孤岛成员 ${report.islands.filter((i) => i.members.length === 1).length} 个 · 合并带 p50=${report.landscape.p50.toFixed(2)}/p90=${report.landscape.p90.toFixed(2)}${lonely > 0 ? ` · 未入图 ${lonely}` : ""}`;
+}
+//#endregion
+//#region src/core/spectral-ranking.ts
+/**
+* 加权 PageRank（无向图：对称权重矩阵按行归一）。
+*
+* ids 与 weights（|ids|×|ids|，非负）由调用方给出；悬挂节点（全零行）
+* 的质量均匀重分配（守恒）。空图安全返回。
+*/
+function pageRank(ids, weights, options) {
+	const n = ids.length;
+	if (n === 0) return {
+		ids: [],
+		scores: [],
+		iterations: 0,
+		converged: true
+	};
+	const d = Math.min(.999, Math.max(0, options?.damping ?? .85));
+	const tol = options?.tol ?? 1e-10;
+	const maxIterations = options?.maxIterations ?? 200;
+	const rowSum = weights.map((row) => row.reduce((s, v) => s + Math.max(0, v), 0));
+	const dangling = rowSum.map((s) => s <= 1e-12);
+	const transition = weights.map((row, i) => {
+		const s = rowSum[i];
+		if (s <= 1e-12) return Array.from({ length: n }, () => 1 / n);
+		return row.map((v) => Math.max(0, v) / s);
+	});
+	let r = Array.from({ length: n }, () => 1 / n);
+	let converged = false;
+	let iterations = 0;
+	for (iterations = 1; iterations <= maxIterations; iterations += 1) {
+		let danglingMass = 0;
+		for (let i = 0; i < n; i += 1) if (dangling[i]) danglingMass += r[i];
+		const next = Array.from({ length: n }, () => (1 - d) / n + d * danglingMass / n);
+		for (let j = 0; j < n; j += 1) {
+			let col = 0;
+			for (let i = 0; i < n; i += 1) col += r[i] * transition[i][j];
+			next[j] += d * col;
+		}
+		let delta = 0;
+		for (let i = 0; i < n; i += 1) delta += Math.abs(next[i] - r[i]);
+		r = next;
+		if (delta <= tol) {
+			converged = true;
+			break;
+		}
+	}
+	const total = r.reduce((s, x) => s + x, 0);
+	if (total > 0) r = r.map((x) => x / total);
+	return {
+		ids: [...ids],
+		scores: r,
+		iterations,
+		converged
+	};
+}
+/** 按 PageRank 降序的前 k 节点（39.0 接线口径：知识骨架清单） */
+function topInfluential(result, k) {
+	return result.ids.map((id, i) => ({
+		id,
+		score: result.scores[i]
+	})).sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : 1)).slice(0, Math.max(0, k));
+}
+//#endregion
 //#region src/memory/memory-graph.ts
 /**
 * memory-graph.ts — 记忆网络与主题树（自主学习建议 2：自定义数据结构序列化）
@@ -2505,6 +2899,8 @@ var MemoryGraph = class {
 	edges = /* @__PURE__ */ new Map();
 	topics = /* @__PURE__ */ new Map();
 	persistPath;
+	/** 39.0：影响力排序（attachInfluenceRanking 后 related() 按 边权×邻居影响力 排序） */
+	influence;
 	constructor(persistPath) {
 		this.persistPath = persistPath;
 		this.load();
@@ -2540,7 +2936,11 @@ var MemoryGraph = class {
 		edge.lastAt = Date.now();
 		return edge;
 	}
-	/** 图联想：按边权重返回相邻节点 id（混合检索的联想增强） */
+	/** 图联想：按边权重返回相邻节点 id（混合检索的联想增强）
+	*
+	* 39.0：挂载影响力排序后，联想序从「边权」升维为「边权 × 邻居影响力」
+	* （与枢纽共现的记忆先被想起）；未挂载时与原边权序逐位一致（零漂移）。
+	*/
 	related(id, limit = 5) {
 		const neighbors = [];
 		for (const edge of this.edges.values()) if (edge.source === id) neighbors.push({
@@ -2551,7 +2951,57 @@ var MemoryGraph = class {
 			id: edge.source,
 			weight: edge.weight
 		});
+		if (this.influence) {
+			const idx = new Map(this.influence.ids.map((nid, i) => [nid, i]));
+			for (const n of neighbors) {
+				const i = idx.get(n.id);
+				n.weight *= i === void 0 ? 1 : this.influence.scores[i] * this.influence.ids.length;
+			}
+		}
 		return neighbors.sort((a, b) => b.weight - a.weight).slice(0, limit).map((n) => n.id);
+	}
+	/**
+	* 39.0：挂载谱排序影响力（幂等覆盖，挂载即生效）。
+	*
+	* PageRank 幂迭代（阻尼 0.85，质量守恒 Σ=1）在共现网络上解出每条
+	* 知识的结构影响力——「被重要者共现者重要」。topInfluential 输出
+	* 知识骨架（蒸馏保骨去肉的依据）；related() 切换影响力加权口径。
+	* 未挂载零漂移。
+	*/
+	attachInfluenceRanking(options) {
+		const ids = [...this.nodes.keys()];
+		const idx = new Map(ids.map((id, i) => [id, i]));
+		const weights = ids.map(() => ids.map(() => 0));
+		for (const edge of this.edges.values()) {
+			const i = idx.get(edge.source);
+			const j = idx.get(edge.target);
+			if (i === void 0 || j === void 0) continue;
+			weights[i][j] = edge.weight;
+			weights[j][i] = edge.weight;
+		}
+		this.influence = pageRank(ids, weights, { damping: options?.damping });
+	}
+	/** 39.0：知识骨架清单（未挂载返回空数组） */
+	topInfluential(k = 8) {
+		return this.influence ? topInfluential(this.influence, k) : [];
+	}
+	/**
+	* 36.0：知识地形（H₀ 持续同调；纯分析，无副作用）。
+	*
+	* 共现权重视为相似度、阈值从 1 向 floor 扫描：跨尺度持久的分量 =
+	* 稳定知识大陆；永不合并的分量 = 知识孤岛（盲区的拓扑定义——
+	* 与任何主题都不共现的记忆，正是好奇心该去的地方）。
+	*/
+	knowledgeTopography(floor = .2) {
+		const report = h0Persistence([...this.nodes.keys()], [...this.edges.values()].map((e) => ({
+			source: e.source,
+			target: e.target,
+			weight: e.weight
+		})), floor);
+		return {
+			...report,
+			summary: topographyInsight(report)
+		};
 	}
 	/** 将模式挂到主题树（根主题 = taskType） */
 	attachTopic(patternId, topicName, parentTopic) {
@@ -3715,6 +4165,114 @@ var TenantManager = class {
 	}
 };
 //#endregion
+//#region src/core/budget-allocation.ts
+/**
+* OCBA 迭代分配（Chen et al. 2000）。
+*
+* candidates: 试点统计；budget: 总样本预算；biggerIsBetter: 均值大者优
+* （缺省 true——如吞吐；false 用于延迟类越小越优）。
+* 试点 std ≤ 0 时给最小噪声下限（方差为零的候选按公式退化，防除零）。
+*/
+function ocbaAllocate(candidates, budget, options) {
+	const bigger = options?.biggerIsBetter ?? true;
+	const minSamples = options?.minSamples ?? 2;
+	const k = candidates.length;
+	if (k === 0 || budget < k * minSamples) {
+		const per = k === 0 ? 0 : Math.floor(budget / Math.max(1, k));
+		return {
+			counts: Array.from({ length: k }, () => per),
+			best: 0,
+			gaps: Array.from({ length: k }, () => 0),
+			total: per * k
+		};
+	}
+	const eps = 1e-9;
+	const sigma = candidates.map((c) => Math.max(1e-6, Math.abs(c.std)));
+	let best = 0;
+	for (let i = 1; i < k; i += 1) if (bigger ? candidates[i].mean > candidates[best].mean : candidates[i].mean < candidates[best].mean) best = i;
+	const gaps = candidates.map((c, i) => {
+		if (i === best) return 0;
+		return Math.max(eps, Math.abs(c.mean - candidates[best].mean));
+	});
+	const ratio = candidates.map((_, i) => i === best ? 0 : (sigma[i] / gaps[i]) ** 2);
+	let counts = ratio.map((r) => r * minSamples + minSamples);
+	for (let iter = 0; iter < 50; iter += 1) {
+		let sumSq = 0;
+		for (let i = 0; i < k; i += 1) if (i !== best) sumSq += (counts[i] / sigma[i]) ** 2;
+		const bestRatio = sigma[best] * Math.sqrt(Math.max(0, sumSq));
+		const totalRatio = ratio.reduce((s, r, i) => s + (i === best ? bestRatio : r), 0);
+		if (!(totalRatio > 0)) break;
+		const next = ratio.map((r, i) => (i === best ? bestRatio : r) / totalRatio * budget);
+		let delta = 0;
+		for (let i = 0; i < k; i += 1) delta = Math.max(delta, Math.abs(next[i] - counts[i]));
+		counts = next;
+		if (delta <= 1e-9 * budget) break;
+	}
+	const floored = counts.map((c) => Math.max(minSamples, Math.floor(c)));
+	let assigned = floored.reduce((a, b) => a + b, 0);
+	const order = counts.map((c, i) => ({
+		i,
+		frac: c - Math.floor(c)
+	})).sort((a, b) => b.frac - a.frac);
+	let oi = 0;
+	while (assigned < budget && order.length > 0) {
+		floored[order[oi % order.length].i] += 1;
+		assigned += 1;
+		oi += 1;
+	}
+	let over = assigned - budget;
+	let guard = 0;
+	while (over > 0 && guard < 1e4) {
+		const idx = floored.findIndex((c) => c > minSamples);
+		if (idx < 0) break;
+		floored[idx] -= 1;
+		over -= 1;
+		guard += 1;
+	}
+	return {
+		counts: floored,
+		best,
+		gaps,
+		total: floored.reduce((a, b) => a + b, 0)
+	};
+}
+/**
+* Monte Carlo P(CS) 对照（验证锚点）: 按给定分配重复模拟「采样 → 选
+* 经验最优」的正确概率。用于断言 OCBA 分配的 P(CS) ≥ 均匀分配。
+*/
+function monteCarloCorrectSelection(trueMeans, trueStds, counts, biggerIsBetter, reps = 2e3, seed = 20261012) {
+	let s = seed >>> 0;
+	const rnd = () => {
+		s = s + 1831565813 | 0;
+		let t = Math.imul(s ^ s >>> 15, 1 | s);
+		t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+	const gauss = () => {
+		const u = Math.max(1e-12, rnd());
+		return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rnd());
+	};
+	let trueBest = 0;
+	for (let i = 1; i < trueMeans.length; i += 1) if (biggerIsBetter ? trueMeans[i] > trueMeans[trueBest] : trueMeans[i] < trueMeans[trueBest]) trueBest = i;
+	let correct = 0;
+	for (let r = 0; r < reps; r += 1) {
+		let bestIdx = 0;
+		let bestStat = biggerIsBetter ? -Infinity : Infinity;
+		for (let i = 0; i < trueMeans.length; i += 1) {
+			const n = Math.max(1, counts[i]);
+			let sum = 0;
+			for (let j = 0; j < n; j += 1) sum += trueMeans[i] + trueStds[i] * gauss();
+			const stat = sum / n;
+			if (biggerIsBetter && stat > bestStat || !biggerIsBetter && stat < bestStat) {
+				bestStat = stat;
+				bestIdx = i;
+			}
+		}
+		if (bestIdx === trueBest) correct += 1;
+	}
+	return correct / reps;
+}
+//#endregion
 //#region src/sentinel.ts
 /**
 * sentinel.ts — 信号感知哨兵（集成层，执行链路第 1~2 步）
@@ -4100,6 +4658,161 @@ var Sentinel = class {
 		this.pollTimers.push(timer);
 	}
 };
+//#endregion
+//#region src/core/crdt.ts
+/**
+* 47.0 无冲突复制内核 —— CRDT 三定律：副本收敛是代数性质
+*
+* 动机: 分布式同步的合并语义若不满足代数定律，副本在网络分区/乱序
+* 送达下发散且不可检测。CRDT（Shapiro et al. 2011）把「收敛」从协议
+* 希望变成**合并算子的代数性质**:
+*
+*   强最终一致性定理: 合并 ⋃ 满足交换/结合/幂等三律（join-semilattice）
+*   ⟹ 任意乱序/重复送达的消息流之后，所有活跃副本状态相等——
+*   不需要共识、不需要协调、不需要可信信道。
+*
+*   - G-Counter: 每节点只加自己的分量，合并 = 逐分量 max
+*   - OR-Set (add-win): 元素带唯一标签，add 打标签 / remove 摘标签，
+*     合并 = 标签并集；并发 add+remove 中 add 胜（语义选择，非歧义）
+*   - LWW-Register: 时间戳偏序 + 节点 id 平局仲裁（全序保证合并唯一）
+*
+*   验证锚点: 随机操作流的任意置换应用 → 状态逐位相等（收敛定理的
+*   有限样本验证）；三律逐位检查。
+*
+* 零漂移: 纯数据结构内核（引擎按需使用），未挂载零介入。
+*/
+/** G-Counter（增长计数器；merge = 逐分量 max） */
+var GCounter = class GCounter {
+	counts = /* @__PURE__ */ new Map();
+	increment(nodeId, by = 1) {
+		this.counts.set(nodeId, (this.counts.get(nodeId) ?? 0) + Math.max(0, Math.floor(by)));
+	}
+	value() {
+		let sum = 0;
+		for (const v of this.counts.values()) sum += v;
+		return sum;
+	}
+	state() {
+		return Object.fromEntries(this.counts);
+	}
+	merge(other) {
+		for (const [k, v] of other.counts) this.counts.set(k, Math.max(this.counts.get(k) ?? 0, v));
+	}
+	clone() {
+		const c = new GCounter();
+		c.merge(this);
+		return c;
+	}
+};
+/** OR-Set（add-win 观察者集；标签唯一 → 并发 add 胜 remove） */
+var ORSet = class ORSet {
+	added = /* @__PURE__ */ new Map();
+	removed = /* @__PURE__ */ new Map();
+	add(element, tag) {
+		const t = tag ?? `${element}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+		const bucket = this.added.get(element) ?? /* @__PURE__ */ new Set();
+		bucket.add(t);
+		this.added.set(element, bucket);
+	}
+	remove(element) {
+		const tags = this.added.get(element);
+		if (!tags) return;
+		this.removed.set(element, /* @__PURE__ */ new Set([...this.removed.get(element) ?? [], ...tags]));
+	}
+	has(element) {
+		return [...this.added.get(element) ?? []].filter((t) => !(this.removed.get(element) ?? /* @__PURE__ */ new Set()).has(t)).length > 0;
+	}
+	elements() {
+		return [...this.added.keys()].filter((e) => this.has(e));
+	}
+	merge(other) {
+		for (const [e, tags] of other.added) {
+			const bucket = this.added.get(e) ?? /* @__PURE__ */ new Set();
+			for (const t of tags) bucket.add(t);
+			this.added.set(e, bucket);
+		}
+		for (const [e, tags] of other.removed) {
+			const bucket = this.removed.get(e) ?? /* @__PURE__ */ new Set();
+			for (const t of tags) bucket.add(t);
+			this.removed.set(e, bucket);
+		}
+	}
+	clone() {
+		const s = new ORSet();
+		s.merge(this);
+		return s;
+	}
+};
+/** LWW-Register（时间戳 + 节点 id 仲裁的全序最后写胜） */
+var LWWRegister = class {
+	nodeId;
+	value;
+	stamp = -1;
+	writer = "";
+	constructor(nodeId) {
+		this.nodeId = nodeId;
+	}
+	set(value, stamp) {
+		if (stamp < this.stamp || stamp === this.stamp && this.writer >= this.nodeId) return;
+		this.value = value;
+		this.stamp = stamp;
+		this.writer = this.nodeId;
+	}
+	get() {
+		return this.value;
+	}
+	state() {
+		return {
+			value: this.value,
+			stamp: this.stamp,
+			writer: this.writer
+		};
+	}
+	merge(other) {
+		if (other.stamp < this.stamp) return;
+		if (other.stamp === this.stamp && other.writer <= this.writer) return;
+		this.value = other.value;
+		this.stamp = other.stamp;
+		this.writer = other.writer;
+	}
+};
+/**
+* 收敛审计（验证锚点）: 两副本各自应用同批操作的任意置换，再互相
+* 合并（含重复合并）——三律成立 ⟹ 状态逐位相等（强最终一致性的
+* 有限样本验证）。返回最大状态偏差（应恒 0）。
+*/
+function crdtConvergenceAudit(ops, permutation) {
+	const ca = new GCounter();
+	const cb = new GCounter();
+	const sa = new ORSet();
+	const sb = new ORSet();
+	for (const idx of permutation) {
+		const op = ops[idx];
+		if (!op) continue;
+		const [cTarget, sTarget] = op.node === "a" ? [ca, sa] : [cb, sb];
+		if (op.kind === "inc") cTarget.increment(op.node, op.by);
+		else if (op.kind === "add") sTarget.add(op.element, `${op.node}:${idx}`);
+		else sTarget.remove(op.element);
+	}
+	const ca2 = ca.clone();
+	const cb2 = cb.clone();
+	ca.merge(cb2);
+	cb.merge(ca2);
+	const sa2 = sa.clone();
+	const sb2 = sb.clone();
+	sa.merge(sb2);
+	sb.merge(sa2);
+	const counterDelta = Math.abs(ca.value() - cb.value());
+	const a = new Set(sa.elements());
+	const b = new Set(sb.elements());
+	let setSymmetricDiff = 0;
+	for (const e of a) if (!b.has(e)) setSymmetricDiff += 1;
+	for (const e of b) if (!a.has(e)) setSymmetricDiff += 1;
+	return {
+		counterDelta,
+		setSymmetricDiff
+	};
+}
 //#endregion
 //#region src/sync/distributed-sync.ts
 /**
@@ -4676,7 +5389,130 @@ var DistributedSync = class {
 			fs.renameSync(tmp, this.statePath);
 		} catch {}
 	}
+	/** 47.0：跨节点收敛计数器（G-Counter；按通道隔离） */
+	crdtCounters = /* @__PURE__ */ new Map();
+	/**
+	* 47.0：CRDT 收敛通道（幂等挂载，挂载即生效——纯增量口径）。
+	*
+	* 网络分区 / 乱序 / 重复送达下的状态收敛从协议希望升级为合并算子
+	* 的代数性质（join-semilattice 三律 ⟹ 强最终一致性，Shapiro 2011）：
+	* 本地递增 incrementCrdtCounter，远端状态经 mergeCrdtState 合入，
+	* crdtState 读取——任何消息顺序都收敛到同一读数。
+	*/
+	attachCrdtChannel(channels) {
+		for (const c of channels) if (!this.crdtCounters.has(c)) this.crdtCounters.set(c, new GCounter());
+	}
+	/** 47.0：本地递增（通道不存在时惰性创建） */
+	incrementCrdtCounter(channel, by = 1) {
+		let counter = this.crdtCounters.get(channel);
+		if (!counter) {
+			counter = new GCounter();
+			this.crdtCounters.set(channel, counter);
+		}
+		counter.increment(this.localNodeId, by);
+	}
+	/** 47.0：合入远端 CRDT 状态（交换/幂等——重复合入无害） */
+	mergeCrdtState(remote) {
+		for (const [channel, counts] of Object.entries(remote)) {
+			let counter = this.crdtCounters.get(channel);
+			if (!counter) {
+				counter = new GCounter();
+				this.crdtCounters.set(channel, counter);
+			}
+			const other = new GCounter();
+			for (const [node, v] of Object.entries(counts)) other.increment(node, v);
+			counter.merge(other);
+		}
+	}
+	/** 47.0：CRDT 状态快照（可序列化 gossip 载荷） */
+	crdtState() {
+		const out = {};
+		for (const [channel, counter] of this.crdtCounters) out[channel] = counter.state();
+		return out;
+	}
 };
+//#endregion
+//#region src/core/quorum-systems.ts
+/**
+* 多数派法定人数审计（n ≥ 1）。
+*
+* minIntersection = 2q − n（q = ⌊n/2⌋+1）；拜占庭容错 = minIntersection−1
+* （交集 ≥ f+1 ⟺ f ≤ 交−1）；n ≤ 3f ⟹ 拜占庭容错 < f——诚实给出。
+*/
+function majorityQuorumAudit(n) {
+	const nodes = Math.floor(n);
+	if (nodes < 1) throw new Error("majorityQuorumAudit: n ≥ 1");
+	const quorumSize = Math.floor(nodes / 2) + 1;
+	const minIntersection = 2 * quorumSize - nodes;
+	const crashFaultTolerance = quorumSize - 1;
+	const byzantineTolerance = Math.max(0, minIntersection - 1);
+	return {
+		nodes,
+		quorumSize,
+		crashFaultTolerance,
+		minIntersection,
+		intersects: minIntersection >= 1,
+		byzantineTolerance,
+		load: quorumSize / nodes
+	};
+}
+/** 枚举所有 ⌊n/2⌋+1 子集的两两最小交集（验证锚点；n ≤ 15 适用） */
+function bruteForceMinIntersection(n, quorumSize = Math.floor(n / 2) + 1) {
+	const subsets = [];
+	const combo = [];
+	const rec = (start) => {
+		if (combo.length === quorumSize) {
+			subsets.push(combo.reduce((mask, i) => mask | 1 << i, 0));
+			return;
+		}
+		for (let i = start; i < n; i += 1) {
+			combo.push(i);
+			rec(i + 1);
+			combo.pop();
+		}
+	};
+	rec(0);
+	let min = Infinity;
+	for (let a = 0; a < subsets.length; a += 1) for (let b = a + 1; b < subsets.length; b += 1) {
+		const inter = popcount$2(subsets[a] & subsets[b]);
+		if (inter < min) min = inter;
+	}
+	return min;
+}
+function popcount$2(x) {
+	let c = 0;
+	while (x) {
+		x &= x - 1;
+		c += 1;
+	}
+	return c;
+}
+/**
+* 拜占庭可行性判别（n > 3f 存在性口径）：给定 n 与目标拜占庭容错 f，
+* 最优 quorum 构造 q = ⌈(n+f+1)/2⌉ 是否给出 ≥ f+1 交集——n ≥ 3f+1
+* 时可行（经典构造）；n ≤ 3f 时诚实 false——3f+1 下界（不存在性定理，
+* 换任何 quorum 系统都救不了）。
+*/
+function byzantineFeasible(n, f) {
+	if (f < 1 || n < 3 * f + 1) return false;
+	const q = Math.ceil((n + f + 1) / 2);
+	if (q > n) return false;
+	return 2 * q - n >= f + 1;
+}
+/**
+* Raft 集群安全审计（46.0 接线口径，纯读取）。
+*
+* members: 集群节点数（Raft 配置口径）；产出多数派交叉、容错上界与
+* 负载——共识安全性从「被相信」升级为「被检查」。
+*/
+function raftSafetyAudit(members) {
+	const audit = majorityQuorumAudit(members);
+	const verdict = audit.intersects ? `多数派两两相交（最小交集 ${audit.minIntersection}）：崩溃容错 ${audit.crashFaultTolerance}，拜占庭容错 ${audit.byzantineTolerance}${members <= 3 * audit.byzantineTolerance + 1 && audit.byzantineTolerance > 0 ? "" : ""}，负载 ${(audit.load * 100).toFixed(0)}%` : "n=1 单节点（无共识可验证）";
+	return {
+		...audit,
+		verdict
+	};
+}
 //#endregion
 //#region src/consensus/raft-engine.ts
 /**
@@ -5263,6 +6099,16 @@ var RaftEngine = class {
 			this.votedFor = state.votedFor ?? null;
 			this.log = Array.isArray(state.log) ? state.log : [];
 		} catch {}
+	}
+	/**
+	* 46.0：法定人数安全审计（纯读取，零漂移）。
+	*
+	* 多数派交叉 / 容错上界 / 拜占庭可行性 / 负载——共识安全性从
+	* 「被相信」升级为「被检查」（多数派两两相交是 Raft 安全性的
+	* 根基，46.0 内核的闭式口径）。
+	*/
+	quorumAudit() {
+		return raftSafetyAudit(this.config.cluster.length);
 	}
 	/** 持久化状态（原子写入） */
 	persistState() {
@@ -6173,10 +7019,37 @@ var BenchmarkEngine = class {
 			});
 			if (!passed) report.overallPassed = false;
 		}
+		if (this.ocbaAllocator && report.scenarios.length >= 2) {
+			const plan = ocbaAllocate(report.scenarios.map((s) => ({
+				name: s.name,
+				mean: s.stats.avgLatency,
+				std: Math.sqrt(Math.max(1e-6, s.stats.p95Latency - s.stats.avgLatency))
+			})), this.ocbaAllocator.confirmationBudget, { biggerIsBetter: true });
+			const worst = report.scenarios[plan.best];
+			report.bottleneckFocus = {
+				candidate: worst ? worst.name : void 0,
+				rationale: worst ? `延迟最高场景 ${worst.name}（均值 ${Math.round(worst.stats.avgLatency)}ms）——下一轮确认预算 ${this.ocbaAllocator.confirmationBudget} 次 OCBA 分配：${report.scenarios.map((s, i) => `${s.name}:${plan.counts[i]}`).join(" / ")}` : void 0,
+				allocation: report.scenarios.map((s, i) => ({
+					name: s.name,
+					count: plan.counts[i]
+				}))
+			};
+		}
 		report.totalDuration = Date.now() - startedAt;
 		this.saveReport(report);
 		return report;
 	}
+	/**
+	* 45.0：挂载 OCBA 预算分配器（幂等覆盖，挂载即生效——纯报告附加）。
+	*
+	* runAll 结束时以各场景延迟统计为试点，给出「确认瓶颈子系统」的
+	* OCBA 最优重跑预算分配（P(CS) 渐近最优）附在报告 bottleneckFocus；
+	* 不改变场景执行本身（零漂移）。
+	*/
+	attachOcbaAllocator(options) {
+		this.ocbaAllocator = { confirmationBudget: Math.max(10, Math.floor(options?.confirmationBudget ?? 200)) };
+	}
+	ocbaAllocator;
 	/** 加载全部历史报告（按时间倒序） */
 	loadReports() {
 		if (!fs.existsSync(this.reportDir)) return [];
@@ -6857,6 +7730,157 @@ var RobustStream = class {
 	}
 };
 //#endregion
+//#region src/core/robust-decisions.ts
+/**
+* 34.0 分布鲁棒内核 —— CVaR + Wasserstein 球：最坏情况有了闭式价格
+*
+* 动机: 系统里一切「按均值/按经验分位」的决策都隐含一个赌注：未来样本
+* 来自与历史相同的分布。但模型延迟分布会漂移（上游变慢、配额收紧），
+* 超时预算按均值设 → 一漂移就雪崩式超时。分布鲁棒优化（DRO）不赌单一
+* 分布，而是问:
+*
+*   sup_{Q: W₁(Q, P̂) ≤ ε} E_Q[ℓ]     （以经验分布为中心、半径 ε 的
+*                                     Wasserstein 球内的最坏期望）
+*
+*   Kantorovich–Rubinstein 对偶: W₁(Q,P̂) = sup{|E_Q φ − E_P̂ φ| : φ 1-Lipschitz}
+*   → 一维恒等映射是 1-Lipschitz ⟹ |E_Q[X] − E_P̂[X]| ≤ W₁ ≤ ε，且
+*     上界可达（把 ε 预算全部用于把最低处的质量搬到最高处——单位距离
+*     单位收益）。于是:
+*
+*     sup_{W₁≤ε} E[X] = min(E[X] + ε, b)   （支撑上界 b 已知时；
+*                                            无界支撑 = E[X] + ε）
+*     鲁棒均值不是启发式加成，是对偶定理的代数恒等式。
+*
+*   尾部风险的凸口径: CVaR（Rockafellar–Uryasev 2002）是唯一同时满足
+*   凸性 / 单调性 / 平移等变 / 正齐次的**相干风险度量**（与 16.0 Shapley
+*   的公理化同一品味——四公理不是描述，是唯一性定理）:
+*
+*     CVaR_α(X) = min_t { t + E[(X−t)₊]/(1−α) }
+*              = 最坏 (1−α) 尾部的期望（经验分布上 O(n log n) 精确）
+*
+*   超越概率的鲁棒口径: W₁ 球内质量要跨过阈值 t 至少要移动 (t − x)
+*   的距离 → 从最贴近 t 的下方样本搬起（单位质量成本最小）——精确的
+*   组合最坏化，worst P(X ≥ t) 有显式有限样本算法。
+*
+*   调度语义: 超时预算 = margin × CVaR_α(该模型延迟史)——「按最坏尾部
+*   的期望定价」而非「按均值加拍脑袋的裕度」；超时率从此有分布口径。
+*
+* 零漂移: 未挂载时一切路径与升级前逐位一致。
+*/
+/** 样本分位（最近邻下插值；空样本返回 undefined） */
+function quantile(samples, p) {
+	if (samples.length === 0) return void 0;
+	const sorted = [...samples].sort((a, b) => a - b);
+	return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1))];
+}
+/**
+* CVaR_α（损失口径，越大越坏）：最坏 1−α 尾部的期望。
+*
+* Rockafellar–Uryasev min-form 在经验分布上的闭式解（α 为**置信水平**，
+* α=0.95 即最坏 5% 尾）：k = ⌈(1−α)n⌉，最坏 k−1 个样本全取 + 第 k 个
+* 取分数权重（权重恰合 1−α）。
+*/
+function cvar(samples, alpha) {
+	if (samples.length === 0) return void 0;
+	const beta = Math.min(1, Math.max(1e-9, 1 - alpha));
+	const n = samples.length;
+	const m = beta * n;
+	const sorted = [...samples].sort((a, b) => b - a);
+	const full = Math.floor(m + 1e-12);
+	const frac = m - full;
+	let acc = 0;
+	for (let i = 0; i < full && i < n; i += 1) acc += sorted[i];
+	if (frac > 1e-12 && full < n) acc += frac * sorted[full];
+	return acc / m;
+}
+/** Rockafellar–Uryasev min-form 数值口径（验证锚点：与 cvar() 解析式对账） */
+function cvarMinForm(samples, alpha) {
+	if (samples.length === 0) return void 0;
+	let best = Infinity;
+	for (const t of samples) {
+		let excess = 0;
+		for (const x of samples) excess += Math.max(0, x - t);
+		best = Math.min(best, t + excess / samples.length / Math.max(1e-9, 1 - alpha));
+	}
+	return best;
+}
+/** CVaR 相干性公理审计（与 16.0 Shapley 四公理同一品味的验证锚点） */
+function cvarCoherenceAudit(samples, alpha) {
+	const base = cvar(samples, alpha) ?? 0;
+	const shifted = cvar(samples.map((x) => x + 5), alpha) ?? 0;
+	const scaled = cvar(samples.map((x) => x * 3), alpha) ?? 0;
+	const xs = samples.filter((_, i) => i % 2 === 0);
+	const ys = samples.filter((_, i) => i % 2 === 1);
+	const zs = xs.map((x, i) => x + ys[i]);
+	const subadd = (cvar(xs, alpha) ?? 0) + (cvar(ys, alpha) ?? 0) - (cvar(zs, alpha) ?? 0);
+	return {
+		monotone: (cvar(samples.map((x) => x + 1), alpha) ?? 0) >= base - 1e-9,
+		translationEquivariant: Math.abs(shifted - (base + 5)) <= 1e-9,
+		positivelyHomogeneous: Math.abs(scaled - 3 * base) <= 1e-9,
+		subadditive: subadd >= -1e-9
+	};
+}
+/** Wasserstein-1 鲁棒均值（对偶定理的代数恒等式）。
+*
+* sup_{W₁(Q,P̂)≤ε} E_Q[X] = min(E_P̂[X] + ε, supportUpper)。
+* supportUpper 未提供 = 无界支撑（值 = E + ε）。样本为空 → undefined。
+*/
+function wassersteinRobustMean(samples, epsilon, supportUpper) {
+	if (samples.length === 0) return void 0;
+	const robust = samples.reduce((s, x) => s + x, 0) / samples.length + Math.max(0, epsilon);
+	return supportUpper !== void 0 ? Math.min(robust, supportUpper) : robust;
+}
+/** 超越概率的最坏化（W₁ 球内 P(X ≥ t) 的精确有限样本最大值）。
+*
+* 贪心搬质量：单位质量从 x < t 跨到 t 的运价 = t − x，从最贴近 t 的
+* 下方样本搬起直到预算耗尽——运输问题的精确解（成本递增序贪心 =
+* 最小代价流）。返回名义值与最坏值。
+*/
+function robustExceedance(samples, threshold, epsilon) {
+	if (samples.length === 0) return void 0;
+	const n = samples.length;
+	let above = 0;
+	const below = [];
+	for (const x of samples) if (x >= threshold) above += 1;
+	else below.push(x);
+	below.sort((a, b) => b - a);
+	let budget = Math.max(0, epsilon);
+	let moved = 0;
+	for (const x of below) {
+		if (budget <= 0) break;
+		const costPerUnit = threshold - x;
+		if (costPerUnit <= 0) continue;
+		const affordable = budget / costPerUnit;
+		const take = Math.min(1 / n, affordable);
+		moved += take;
+		budget -= take * costPerUnit;
+	}
+	const nominal = above / n;
+	return {
+		nominal,
+		worst: Math.min(1, nominal + moved),
+		movedMass: moved
+	};
+}
+/**
+* 鲁棒超时预算（34.0 接线口径）。
+*
+* margin × CVaR_α(延迟样本)，钳位 [floor, cap]；样本不足返回 undefined
+* （调用方回退原口径——零漂移）。比「均值 × 3」好在：尾部的形状直接
+* 进入价格——重尾模型自动获得更长预算、轻尾模型不被一刀切。
+*/
+function robustTimeout(samples, config) {
+	const alpha = config?.alpha ?? .95;
+	const margin = config?.margin ?? 1.5;
+	const minSamples = config?.minSamples ?? 30;
+	const floorMs = config?.floorMs ?? 5e3;
+	const capMs = config?.capMs ?? 3e5;
+	if (samples.length < minSamples) return void 0;
+	const tail = cvar(samples, alpha);
+	if (tail === void 0 || !Number.isFinite(tail) || tail <= 0) return void 0;
+	return Math.min(capMs, Math.max(floorMs, tail * margin));
+}
+//#endregion
 //#region src/llm-client.ts
 /**
 * llm-client.ts — OpenAI 兼容 LLM 调用客户端（集成层基础设施）
@@ -7064,6 +8088,32 @@ var LLMClient = class {
 	getLatencySamples(modelId) {
 		return this.robustStreams.get(modelId)?.toSamples();
 	}
+	/**
+	* 34.0：挂载 CVaR 超时预算（幂等覆盖，挂载即生效）。
+	*
+	* 每模型超时从固定魔数升级为 margin × CVaR_α(该模型延迟史)——按
+	* 「最坏尾部的期望」定价：重尾模型自动获得更长预算、轻尾模型不被
+	* 一刀切。依赖 robustLatency 启用（延迟样本与其共用）；样本不足
+	* minSamples 时该模型回退全局缺省超时（零漂移）。
+	*/
+	attachCvarTimeouts(options) {
+		this.cvarTimeoutConfig = {
+			alpha: options?.alpha ?? .95,
+			margin: options?.margin ?? 1.5,
+			minSamples: options?.minSamples ?? 30,
+			floorMs: options?.floorMs ?? 5e3,
+			capMs: options?.capMs ?? 3e5
+		};
+	}
+	/** 34.0：CVaR 超时配置（未挂载 undefined） */
+	cvarTimeoutConfig;
+	/** 34.0：模型的 CVaR 超时预算（未挂载 / 样本不足 → undefined 回退缺省） */
+	getCvarTimeout(modelId) {
+		if (!this.cvarTimeoutConfig) return void 0;
+		const samples = this.getLatencySamples(modelId);
+		if (!samples) return void 0;
+		return robustTimeout(samples, this.cvarTimeoutConfig);
+	}
 	/** 获取并发槽位（必要时排队） */
 	acquireSlot(state) {
 		if (state.active < state.maxConcurrency) {
@@ -7114,7 +8164,7 @@ var LLMClient = class {
 	/** 单次 HTTP 调用（含超时控制；keyAttempt 用于多密钥轮换） */
 	async chatOnce(state, messages, options, keyAttempt = 0) {
 		const { config } = state;
-		const timeout = options.timeout ?? this.config.timeout;
+		const timeout = options.timeout ?? this.getCvarTimeout(config.id) ?? this.config.timeout;
 		const url = buildCompletionsUrl(config.endpoint);
 		const startedAt = Date.now();
 		const controller = new AbortController();
@@ -7477,6 +8527,597 @@ function createBaselinePolicy(id = "policy-baseline", version = 1) {
 	};
 }
 //#endregion
+//#region src/core/online-learning.ts
+/**
+* Fixed-Share 指数权重。
+*
+* update(losses) 每轮一次；weights() 只读；stats() 给出与定理界的实时
+* 对账（验证脚本用它断言「任意对手序列下 regret ≤ bound」）。
+*/
+var Hedge = class {
+	n;
+	eta;
+	alpha;
+	omega;
+	cumulative;
+	hedgeLoss = 0;
+	rounds = 0;
+	partial = false;
+	constructor(options) {
+		const n = Math.max(1, Math.floor(options.experts));
+		this.n = n;
+		this.eta = clamp$2(options.eta ?? .3, 1e-6, 1);
+		this.alpha = clamp$2(options.alpha ?? .05, 0, .999);
+		this.omega = Array.from({ length: n }, () => 1 / n);
+		this.cumulative = Array.from({ length: n }, () => 0);
+	}
+	/** 一轮对抗反馈：losses[i] ∈ [0,1]（越低越好；自动钳位） */
+	update(losses) {
+		if (losses.length !== this.n) throw new Error(`Hedge.update 期望 ${this.n} 个损失，收到 ${losses.length}`);
+		const ell = Array.from({ length: this.n }, (_, i) => clamp$2(losses[i] ?? 0, 0, 1));
+		let wSum = 0;
+		for (const w of this.omega) wSum += w;
+		const expectation = wSum > 0 ? this.omega.reduce((s, w, i) => s + w * ell[i], 0) / wSum : 1 / this.n;
+		this.hedgeLoss += expectation;
+		this.rounds += 1;
+		const updated = this.omega.map((w, i) => w * Math.exp(-this.eta * ell[i]));
+		let total = 0;
+		for (const w of updated) total += w;
+		const posterior = total > 0 ? updated.map((w) => w / total) : Array.from({ length: this.n }, () => 1 / this.n);
+		this.omega = posterior.map((p) => (1 - this.alpha) * p + this.alpha / this.n);
+		for (let i = 0; i < this.n; i += 1) this.cumulative[i] += ell[i];
+	}
+	/** reward 口径入口（质量 ∈ [0,1]；ℓ = 1 − r 无损变换） */
+	updateRewards(rewards) {
+		this.update(rewards.map((r) => 1 - clamp$2(r, 0, 1)));
+	}
+	/**
+	* 部分反馈入口（每轮仅一个专家被指派、有观测）。
+	*
+	* 掩码更新：其余专家本轮损失记 0（指数权重下等价于其权重不动，
+	* 仅受 Fixed-Share 回灌微调）；记账切换为**已实现口径**——cumulative
+	* 只累计各专家真实发生的损失，hedgeLoss = 算法实际承受的损失之和。
+	* 全反馈定理界仍作为上界参考（部分信息下界弱化 √N 倍，口径在
+	* stats.feedback 标注——不冒充全反馈保证）。
+	*/
+	reportSingle(index, reward) {
+		if (index < 0 || index >= this.n) return;
+		const ell = clamp$2(1 - clamp$2(reward, 0, 1), 0, 1);
+		this.partial = true;
+		this.hedgeLoss += ell;
+		this.rounds += 1;
+		this.cumulative[index] += ell;
+		const masked = Array.from({ length: this.n }, (_, i) => i === index ? ell : 0);
+		const updated = this.omega.map((w, i) => w * Math.exp(-this.eta * masked[i]));
+		let total = 0;
+		for (const w of updated) total += w;
+		const posterior = total > 0 ? updated.map((w) => w / total) : Array.from({ length: this.n }, () => 1 / this.n);
+		this.omega = posterior.map((p) => (1 - this.alpha) * p + this.alpha / this.n);
+	}
+	/** 当前归一化权重（拷贝） */
+	weights() {
+		return [...this.omega];
+	}
+	/** 当前最优专家（权重最高者；平手取小下标——确定性） */
+	recommend() {
+		let best = 0;
+		for (let i = 1; i < this.n; i += 1) if (this.omega[i] > this.omega[best]) best = i;
+		return best;
+	}
+	stats() {
+		let bestExpert = 0;
+		for (let i = 1; i < this.n; i += 1) if (this.cumulative[i] < this.cumulative[bestExpert]) bestExpert = i;
+		const bestLoss = this.cumulative[bestExpert];
+		return {
+			rounds: this.rounds,
+			hedgeLoss: this.hedgeLoss,
+			bestExpert,
+			bestLoss,
+			regret: this.hedgeLoss - bestLoss,
+			regretBound: staticRegretBound(this.n, this.eta, this.rounds),
+			weights: [...this.omega],
+			feedback: this.partial ? "partial" : "full"
+		};
+	}
+};
+/** 平稳界：R_T ≤ lnN/η + ηT/2（η ∈ (0,1]，Freund–Schapire 切线界推论） */
+function staticRegretBound(experts, eta, rounds) {
+	return Math.log(Math.max(1, experts)) / eta + eta / 2 * rounds;
+}
+/** 未知视界 T 的时间变学习率 η_t = min(1, √(lnN / t))（√(2T lnN) 阶自适配） */
+function timeVaryingEta(experts, t) {
+	if (t < 1) return 1;
+	return Math.min(1, Math.sqrt(Math.log(Math.max(2, experts)) / t));
+}
+/** Fixed-Share 跟踪遗憾上界（区间长 τ、切换 S 次；Herbster–Warmuth 口径） */
+function trackingRegretBound(experts, eta, tau, switches, alpha) {
+	const lnN = Math.log(Math.max(1, experts));
+	const a = clamp$2(alpha, 1e-12, 1 - 1e-12);
+	return (lnN + (switches * Math.log(1 / a) + Math.max(0, tau - switches) * Math.log(1 / (1 - a)))) / eta + eta / 2 * tau;
+}
+/** 首步学习率调优建议（视界 T 已知时的最优 η = √(2 lnN/T)） */
+function staticEtaFor(experts, horizon) {
+	if (horizon < 1) return 1;
+	return Math.min(1, Math.sqrt(2 * Math.log(Math.max(2, experts)) / horizon));
+}
+function clamp$2(x, lo, hi) {
+	return Math.min(hi, Math.max(lo, Number.isFinite(x) ? x : lo));
+}
+/**
+* 模型组合的 Hedge 乘数（31.0 接线辅助）。
+*
+* 权重 → 评分乘数 w_i / mean(w)，钳位 [minMultiplier, maxMultiplier]：
+* - 对抗口径下持续表现好（对手奈何不了它）的模型最多升 maxMultiplier 倍；
+* - 被对手打爆的模型最多降 minMultiplier 倍——**有界干预**，Hedge 只在
+*   证据权重侧表态，不接管评分主体（与经济乘数同一挂载位）。
+*/
+function hedgeMultiplier(weights, index, minMultiplier = .25, maxMultiplier = 4) {
+	const w = weights[index];
+	if (w === void 0 || !Number.isFinite(w)) return 1;
+	let mean = 0;
+	for (const x of weights) mean += x;
+	mean = mean / weights.length;
+	if (!(mean > 0)) return 1;
+	return clamp$2(w / mean, minMultiplier, maxMultiplier);
+}
+//#endregion
+//#region src/core/feedback-control.ts
+/**
+* 35.0 反馈控制内核 —— 离散 LQR + Lyapunov 证书：并发极限的闭环驾驭
+*
+* 动机: 25.0 容量规划用排队论**反解**最优并发（Erlang-C / Kingman）——
+* 但那是开环的：模型给一个静态建议，世界变了它不知道。真实的负载是
+* 非平稳的（模型变慢、配额收紧、流量起伏），并发上限需要**闭环**：
+*
+*   反馈律: u_k = u_{k−1} + K·(y* − y_k)     （y = 实测利用率，y* = 目标）
+*   闭环系统 y_{k+1} = (1 − bK)·y_k + bK·y* + 噪声
+*
+*   最优 K 从离散代数 Riccati 方程（DARE）解出:
+*     P = q + a²P − a²b²P²/(r + b²P),   K = abP/(r + b²P)
+*   a = 1（积分器口径）时有**闭式解**（P² − qP − qr/b² = 0）:
+*     P = (q + √(q² + 4qr/b²))/2
+*   ——闭式与不动点迭代逐位对账，控制增益不是调出来的，是解出来的。
+*
+*   Lyapunov 证书（与 15.0「证明携带」同一哲学）: 取 V(x) = P x²，则
+*   DARE 恒等式给出
+*     V(x_{k+1}) − V(x_k) = −(q x_k² + r u_k²) ≤ 0
+*   ——闭环的每一步都被李雅普诺夫函数**证明**不发散（数值上逐位可查），
+*   稳定性不是观察出来的，是代数恒等式。
+*
+*   工程加固: 死区（|e| < ε 不动——抗抖振）、输出钳位 [u_min, u_max]、
+*   增益调度保守化（b 未知时按最坏灵敏度取下界 b_min——保证 0 < bK < 2
+*   的稳定域对真实 b 稳健）。AIMD 式启发式调参从此退役。
+*
+* 零漂移: 未挂载时 computeParallelism 与升级前逐位一致（静态口径）。
+*/
+/** 标量 DARE（a=1 积分器口径）闭式解：P = (q + √(q² + 4qr/b²))/2 */
+function dareScalarClosedForm(b, q, r) {
+	if (!(b > 0)) throw new Error("dareScalarClosedForm: b 必须 > 0");
+	return (q + Math.sqrt(q * q + 4 * q * r / (b * b))) / 2;
+}
+/** 标量 DARE 不动点迭代（一般 a；收敛判据 |P_{k+1} − P_k| ≤ tol） */
+function dareIterate(a, b, q, r, iterations = 2e3, tol = 1e-12) {
+	if (!(r > 0)) throw new Error("dareIterate: r 必须 > 0");
+	let p = q;
+	let converged = false;
+	for (let k = 0; k < iterations; k += 1) {
+		const next = q + a * a * p - a * a * b * b * p * p / (r + b * b * p);
+		if (Math.abs(next - p) <= tol) {
+			p = next;
+			converged = true;
+			break;
+		}
+		p = next;
+	}
+	return {
+		p,
+		converged
+	};
+}
+/** LQR 增益 K = abP/(r + b²P)（P 为 DARE 解） */
+function lqrGain(a, b, p, r) {
+	return a * b * p / (r + b * b * p);
+}
+/**
+* Lyapunov 稳定的并发反馈控制器。
+*
+* 被控对象口径（积分器）: y_{k+1} = y_k + b·Δu_k；控制 Δu = K·(y*−y)。
+* 输出钳位同时充当抗积分饱和（输出到界后误差继续累计不再积深——
+* 增量直接被钳位截断，无 hidden state）。
+*/
+var FeedbackController = class {
+	target;
+	b;
+	q;
+	r;
+	deadband;
+	minOutput;
+	maxOutput;
+	p;
+	k;
+	output;
+	lastError;
+	constructor(config) {
+		this.target = clamp$1(config?.target ?? .75, .05, 1);
+		this.b = clamp$1(config?.plantGain ?? .4, .001, 10);
+		this.q = Math.max(1e-6, config?.q ?? 1);
+		this.r = Math.max(1e-6, config?.r ?? 4);
+		this.deadband = Math.max(0, config?.deadband ?? .05);
+		this.minOutput = Math.max(1, config?.minOutput ?? 1);
+		this.maxOutput = Math.max(this.minOutput, config?.maxOutput ?? 16);
+		this.output = clamp$1(config?.initialOutput ?? Math.ceil((this.minOutput + this.maxOutput) / 2), this.minOutput, this.maxOutput);
+		this.p = dareScalarClosedForm(this.b, this.q, this.r);
+		this.k = lqrGain(1, this.b, this.p, this.r);
+	}
+	/** LQR 增益（审计） */
+	get gain() {
+		return this.k;
+	}
+	/** 闭环极点 1 − bK（|·| < 1 即稳定；本口径 ∈ (0,1)） */
+	get closedLoopPole() {
+		return 1 - this.b * this.k;
+	}
+	/** DARE 解 P（Lyapunov 函数的系数） */
+	get dare() {
+		return this.p;
+	}
+	/** 当前输出（只读） */
+	get currentOutput() {
+		return this.output;
+	}
+	/**
+	* 一步反馈：观测当前利用率 measured，返回新输出。
+	*
+	* Lyapunov: V(e) = P·e²；按被控对象模型 e_{k+1} = (1−bK)e_k，
+	* V(e_{k+1}) − V(e_k) = −(q e² + r u²) ≤ 0 —— DARE 恒等式（数值
+	* 验证见 verify-equilibrium-kernels）。死区/钳位只会让动作更小
+	* （V 降得更慢），不会破坏单调性。
+	*/
+	step(measured) {
+		const y = clamp$1(measured, 0, 2);
+		const error = this.target - y;
+		const inDeadband = Math.abs(error) < this.deadband;
+		const rawIncrement = this.k * error;
+		const increment = inDeadband ? 0 : rawIncrement;
+		const previous = this.output;
+		const next = clamp$1(this.output + increment, this.minOutput, this.maxOutput);
+		this.output = next;
+		this.lastError = error;
+		return {
+			output: next,
+			error,
+			increment: next - previous,
+			lyapunov: this.p * error * error,
+			meta: {
+				gainK: this.k,
+				closedLoopPole: this.closedLoopPole,
+				p: this.p,
+				method: "closed-form"
+			}
+		};
+	}
+	/** 最近一次误差（未 step 时 undefined） */
+	get lastStepError() {
+		return this.lastError;
+	}
+};
+/**
+* Lyapunov 证书审计（验证锚点）: 在被控对象模型 y_{k+1} = y_k + b·Δu 上
+* 闭环仿真，逐步断言 V(e_{k+1}) − V(e_k) = −(q·e_k² + r·(K·e_k)²)（DARE
+* 恒等式应到机器精度），返回最大残差。
+*/
+function lyapunovCertificate(config, initialY, steps = 50) {
+	const controller = new FeedbackController(config);
+	const b = controller["b"];
+	const q = controller["q"];
+	const r = controller["r"];
+	let y = initialY;
+	let maxResidual = 0;
+	for (let k = 0; k < steps; k += 1) {
+		const e = controller.step(y).error;
+		const u = controller.gain * e;
+		const nextY = y + b * u;
+		const eNext = controller["target"] - nextY;
+		const vBefore = controller.dare * e * e;
+		const vAfter = controller.dare * eNext * eNext;
+		const predictedDrop = q * e * e + r * u * u;
+		const residual = Math.abs(vBefore - vAfter - predictedDrop);
+		maxResidual = Math.max(maxResidual, residual);
+		y = nextY;
+	}
+	return {
+		maxResidual,
+		convergedToTarget: Math.abs(controller.lastStepError ?? 1) < .02,
+		finalError: controller.lastStepError ?? 1,
+		pole: controller.closedLoopPole
+	};
+}
+function clamp$1(x, lo, hi) {
+	return Math.min(hi, Math.max(lo, Number.isFinite(x) ? x : lo));
+}
+//#endregion
+//#region src/core/max-flow.ts
+/** Edmonds-Karp 最大流（BFS 增广；返回残量网络与最小割） */
+function maxFlow(network) {
+	const n = network.nodes;
+	const residual = network.capacity.map((row) => [...row]);
+	const label = (i) => network.labels?.[i] ?? String(i);
+	let flowValue = 0;
+	let paths = 0;
+	const parent = new Array(n).fill(-1);
+	const bfs = () => {
+		parent.fill(-1);
+		parent[network.source] = network.source;
+		const queue = [network.source];
+		while (queue.length > 0) {
+			const u = queue.shift();
+			for (let v = 0; v < n; v += 1) {
+				if (parent[v] !== -1 || residual[u][v] <= 0) continue;
+				parent[v] = u;
+				if (v === network.sink) return true;
+				queue.push(v);
+			}
+		}
+		return false;
+	};
+	while (bfs()) {
+		paths += 1;
+		let bottleneck = Infinity;
+		for (let v = network.sink; v !== network.source; v = parent[v]) bottleneck = Math.min(bottleneck, residual[parent[v]][v]);
+		for (let v = network.sink; v !== network.source; v = parent[v]) {
+			residual[parent[v]][v] -= bottleneck;
+			residual[v][parent[v]] += bottleneck;
+		}
+		flowValue += bottleneck;
+	}
+	const reachable = /* @__PURE__ */ new Set([network.source]);
+	const stack = [network.source];
+	while (stack.length > 0) {
+		const u = stack.pop();
+		for (let v = 0; v < n; v += 1) if (!reachable.has(v) && residual[u][v] > 0) {
+			reachable.add(v);
+			stack.push(v);
+		}
+	}
+	const sourceSide = [];
+	const sinkSide = [];
+	const edges = [];
+	for (let u = 0; u < n; u += 1) if (reachable.has(u)) sourceSide.push(u);
+	else sinkSide.push(u);
+	for (const u of sourceSide) for (const v of sinkSide) if (network.capacity[u][v] > 0) edges.push({
+		from: label(u),
+		to: label(v),
+		capacity: network.capacity[u][v]
+	});
+	return {
+		flowValue,
+		residual,
+		minCut: {
+			sourceSide,
+			sinkSide,
+			edges
+		},
+		augmentingPaths: paths
+	};
+}
+/** 割证书审计（验证锚点）：割边全饱和（残量 0）且割容量 = 流值 */
+function minCutCertificate(network, result) {
+	let cutCapacity = 0;
+	let saturated = true;
+	for (const u of result.minCut.sourceSide) for (const v of result.minCut.sinkSide) if (network.capacity[u][v] > 0) {
+		cutCapacity += network.capacity[u][v];
+		if (result.residual[u][v] > 1e-9) saturated = false;
+	}
+	return {
+		saturated,
+		cutCapacity,
+		equalsFlow: Math.abs(cutCapacity - result.flowValue) <= 1e-9
+	};
+}
+/** 穷举最小割（验证锚点；2^n 枚举，n ≤ 16 适用） */
+function bruteForceMinCut(network) {
+	const n = network.nodes;
+	let best = Infinity;
+	for (let mask = 0; mask < 1 << n; mask += 1) {
+		if (!(mask & 1 << network.source) || mask & 1 << network.sink) continue;
+		let cut = 0;
+		for (let u = 0; u < n; u += 1) {
+			if (!(mask & 1 << u)) continue;
+			for (let v = 0; v < n; v += 1) {
+				if (mask & 1 << v) continue;
+				cut += network.capacity[u][v];
+			}
+		}
+		best = Math.min(best, cut);
+	}
+	return best;
+}
+/**
+* 类型需求 × 模型容量的流前沿（43.0 接线口径）。
+*
+* demands: taskType → 待执行数量；modelCapacities: modelId → maxConcurrency；
+* eligibility: (taskType, modelId) => boolean（评分 > 0 视为可达）。
+* 网络: 源 → 类型（容量 = 需求）→ 模型（可达边容量 ∞）→ 汇（容量 = 并发）。
+*/
+function capacityFrontier(demands, modelCapacities, eligibility) {
+	const typeCount = demands.length;
+	const modelCount = modelCapacities.length;
+	const n = 2 + typeCount + modelCount;
+	const capacity = Array.from({ length: n }, () => new Array(n).fill(0));
+	const labels = [
+		"source",
+		...demands.map((d) => `type:${d.type}`),
+		...modelCapacities.map((m) => `model:${m.id}`),
+		"sink"
+	];
+	demands.forEach((d, i) => {
+		capacity[0][1 + i] = Math.max(0, d.count);
+	});
+	demands.forEach((d, i) => {
+		modelCapacities.forEach((m, j) => {
+			if (eligibility(d.type, m.id)) capacity[1 + i][1 + typeCount + j] = Number.MAX_SAFE_INTEGER / 4;
+		});
+	});
+	modelCapacities.forEach((m, j) => {
+		capacity[1 + typeCount + j][n - 1] = Math.max(0, m.capacity);
+	});
+	const result = maxFlow({
+		nodes: n,
+		source: 0,
+		sink: n - 1,
+		capacity,
+		labels
+	});
+	const bindingConstraints = result.minCut.edges.filter((e) => e.capacity < Number.MAX_SAFE_INTEGER / 8 || e.from.startsWith("type:")).slice(0, 8);
+	return {
+		maxDispatch: result.flowValue,
+		bindingConstraints,
+		demandStarved: result.minCut.edges.filter((e) => e.from === "source").length,
+		modelLimited: result.minCut.edges.filter((e) => e.to === "sink").length
+	};
+}
+//#endregion
+//#region src/core/matrix-completion.ts
+/**
+* 低秩矩阵补全（ALS；行/列闭式岭回归交替）。
+*
+* observed: 观测条目列表 [{i, j, value}]；n/m 为矩阵维度。
+* 行/列因子以确定性小扰动初始化（对称破缺）。
+*/
+function completeMatrix(observed, n, m, options) {
+	const rank = Math.max(1, Math.floor(options?.rank ?? 3));
+	const maxIterations = options?.maxIterations ?? 200;
+	const tol = options?.tol ?? 1e-6;
+	const lambda = options?.lambda ?? .001;
+	let s = (options?.seed ?? 20261020) >>> 0;
+	const rnd = () => {
+		s = s + 1831565813 | 0;
+		let t = Math.imul(s ^ s >>> 15, 1 | s);
+		t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+	const U = Array.from({ length: n }, () => Array.from({ length: rank }, () => rnd() * .1 + .05));
+	const V = Array.from({ length: m }, () => Array.from({ length: rank }, () => rnd() * .1 + .05));
+	const rows = /* @__PURE__ */ new Map();
+	const cols = /* @__PURE__ */ new Map();
+	for (const e of observed) {
+		if (e.i < 0 || e.i >= n || e.j < 0 || e.j >= m || !Number.isFinite(e.value)) continue;
+		const row = rows.get(e.i) ?? [];
+		row.push({
+			j: e.j,
+			value: e.value
+		});
+		rows.set(e.i, row);
+		const col = cols.get(e.j) ?? [];
+		col.push({
+			i: e.i,
+			value: e.value
+		});
+		cols.set(e.j, col);
+	}
+	const solveRidge = (entries, factors) => {
+		const A = Array.from({ length: rank }, () => new Array(rank).fill(0));
+		const b = new Array(rank).fill(0);
+		for (const e of entries) {
+			const f = factors[e.other];
+			if (!f) continue;
+			for (let a = 0; a < rank; a += 1) {
+				for (let c = 0; c < rank; c += 1) A[a][c] += f[a] * f[c];
+				b[a] += e.value * f[a];
+			}
+		}
+		for (let a = 0; a < rank; a += 1) A[a][a] += lambda + 1e-9;
+		for (let col = 0; col < rank; col += 1) {
+			let pivot = col;
+			for (let r2 = col + 1; r2 < rank; r2 += 1) if (Math.abs(A[r2][col]) > Math.abs(A[pivot][col])) pivot = r2;
+			[A[col], A[pivot]] = [A[pivot], A[col]];
+			[b[col], b[pivot]] = [b[pivot], b[col]];
+			const d = A[col][col] || 1e-9;
+			for (let c = col; c < rank; c += 1) A[col][c] /= d;
+			b[col] /= d;
+			for (let r2 = 0; r2 < rank; r2 += 1) {
+				if (r2 === col) continue;
+				const f = A[r2][col];
+				if (!f) continue;
+				for (let c = col; c < rank; c += 1) A[r2][c] -= f * A[col][c];
+				b[r2] -= f * b[col];
+			}
+		}
+		return b;
+	};
+	let prevRmse = Infinity;
+	let converged = false;
+	let iterations = 0;
+	const rmse = () => {
+		let sum = 0;
+		let count = 0;
+		for (const [i, entries] of rows) for (const e of entries) {
+			const u = U[i];
+			const v = V[e.j];
+			if (!u || !v) continue;
+			let pred = 0;
+			for (let a = 0; a < rank; a += 1) pred += u[a] * v[a];
+			sum += (pred - e.value) ** 2;
+			count += 1;
+		}
+		return count > 0 ? Math.sqrt(sum / count) : 0;
+	};
+	for (iterations = 1; iterations <= maxIterations; iterations += 1) {
+		for (let i = 0; i < n; i += 1) {
+			const entries = rows.get(i);
+			if (!entries || entries.length === 0) continue;
+			U[i] = solveRidge(entries.map((e) => ({
+				other: e.j,
+				value: e.value
+			})), V);
+		}
+		for (let j = 0; j < m; j += 1) {
+			const entries = cols.get(j);
+			if (!entries || entries.length === 0) continue;
+			V[j] = solveRidge(entries.map((e) => ({
+				other: e.i,
+				value: e.value
+			})), U);
+		}
+		const cur = rmse();
+		if (Math.abs(prevRmse - cur) <= tol * Math.max(1, prevRmse)) {
+			prevRmse = cur;
+			converged = true;
+			break;
+		}
+		prevRmse = cur;
+	}
+	let totalEnergy = 0;
+	let fittedEnergy = 0;
+	for (const [i, entries] of rows) for (const e of entries) {
+		const u = U[i];
+		const v = V[e.j];
+		if (!u || !v) continue;
+		let pred = 0;
+		for (let a = 0; a < rank; a += 1) pred += u[a] * v[a];
+		totalEnergy += e.value * e.value;
+		fittedEnergy += pred * pred;
+	}
+	return {
+		rowFactors: U,
+		colFactors: V,
+		trainRmse: prevRmse,
+		observedRatio: observed.length / Math.max(1, n * m),
+		iterations,
+		converged,
+		lowRankShare: totalEnergy > 0 ? Math.min(1, fittedEnergy / totalEnergy) : 0
+	};
+}
+/** 补全预测：M_ij ≈ u_i · v_j（观测未覆盖的条目外推） */
+function completedEntry(report, i, j) {
+	const u = report.rowFactors[i];
+	const v = report.colFactors[j];
+	if (!u || !v) return void 0;
+	let pred = 0;
+	for (let a = 0; a < u.length; a += 1) pred += u[a] * v[a];
+	return pred;
+}
+//#endregion
 //#region src/model-scheduler.ts
 /**
 * 模型调度器
@@ -7502,6 +9143,20 @@ var ModelScheduler = class {
 	bwKBudgetProvider;
 	/** 22.0：最近一次路由裁决（诊断口径；getAttachedDiagnostics 消费） */
 	lastBwKVerdict;
+	/** 31.0：对抗组合（Fixed-Share Hedge；未挂载零漂移） */
+	hedge;
+	/** 31.0：专家下标 ↔ 模型 id 映射（挂载时刻的注册模型快照） */
+	hedgeModelIds = [];
+	/** 35.0：并发反馈控制器（未挂载零漂移——静态口径） */
+	concurrencyController;
+	/** 43.0：容量前沿挂载标志（未挂载零记录零介入） */
+	capacityFrontierEnabled = false;
+	/** 43.0：最近一次容量前沿（max-flow 值 + min-cut 归因；诊断口径） */
+	lastCapacityFrontier;
+	/** 50.0：潜因子挂载标志（未挂载零介入——纯诊断口径） */
+	latentFactorsEnabled = false;
+	/** 50.0：最近一次矩阵补全报告（冷启动能力预测的原料） */
+	lastCompletion;
 	constructor(params) {
 		this.llm = params.llm;
 		this.memory = params.memory;
@@ -7581,12 +9236,175 @@ var ModelScheduler = class {
 		this.bwKRouter = router;
 		this.bwKBudgetProvider = budgetProvider;
 	}
-	/** 21.0/22.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
+	/** 21.0/22.0/31.0/35.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
 	getAttachedDiagnostics() {
 		const diagnostics = {};
 		if (this.indexScheduler) diagnostics.indexScheduling = this.indexScheduler.getTable().snapshot();
 		if (this.lastBwKVerdict) diagnostics.lastBwK = this.lastBwKVerdict;
+		if (this.hedge) diagnostics.hedge = this.hedge.stats();
+		if (this.lastControlStep) diagnostics.concurrencyControl = this.lastControlStep;
 		return diagnostics;
+	}
+	/**
+	* 31.0：挂载对抗组合（Fixed-Share Hedge，幂等覆盖，挂载即生效）。
+	*
+	* 专家 = 挂载时刻的注册模型快照；执行侧每节点完成时经
+	* reportHedgeOutcome(modelId, reward∈[0,1]) 回报质量。权重经
+	* hedgeMultiplierOf 以有界乘数（[0.25, 4]）作用于利用端评分——
+	* 统计学习口径（Wilson/UCB/Gittins）之上叠加**对抗口径**：无论世界
+	* 怎么漂移（限流、静默降级），对事后最优固定模型的遗憾 ≤ √(2T lnN)。
+	* 未挂载时乘数恒 1（评分逐位零漂移）。
+	*/
+	attachHedgePortfolio(options) {
+		this.hedgeModelIds = this.llm.getModelStatuses().map((s) => s.id);
+		if (this.hedgeModelIds.length === 0) {
+			this.hedge = void 0;
+			return;
+		}
+		this.hedge = new Hedge({
+			experts: this.hedgeModelIds.length,
+			eta: options?.eta,
+			alpha: options?.alpha
+		});
+	}
+	/**
+	* 31.0：执行结果回报（reward = 成功质量 ∈ [0,1]，失败 = 0；未挂载为空操作）。
+	*
+	* 部分反馈口径：本轮仅被指派模型有观测（掩码更新——未被指派的专家
+	* 权重不动，只受 Fixed-Share 回灌微调）。对手把某模型打爆时，其权重
+	* 以每失败一轮 e^{−η} 的速度衰减——比统计口径（Wilson 时间衰减）快
+	* 一个数量级的对抗性降权。
+	*/
+	reportHedgeOutcome(modelId, reward) {
+		if (!this.hedge) return;
+		const idx = this.hedgeModelIds.indexOf(modelId);
+		if (idx < 0) return;
+		this.hedge.reportSingle(idx, reward);
+	}
+	/** 31.0：对抗组合对模型的有界评分乘数（未挂载恒 1；零漂移） */
+	hedgeMultiplierOf(modelId) {
+		if (!this.hedge) return 1;
+		const idx = this.hedgeModelIds.indexOf(modelId);
+		if (idx < 0) return 1;
+		return hedgeMultiplier(this.hedge.weights(), idx);
+	}
+	/**
+	* 35.0：挂载并发反馈控制器（幂等覆盖，挂载即生效）。
+	*
+	* computeParallelism 从静态口径（总并发容量钳位）升级为闭环：每次
+	* 被调用即一步反馈（观测当前总利用率 → LQR 增益 → 新上限），目标
+	* 利用率缺省 0.75。稳定性由 DARE/Lyapunov 证书背书（35.0 内核），
+	* 死区抗抖振、输出钳位即抗饱和。未挂载时与原静态口径逐位一致。
+	*/
+	attachConcurrencyController(options) {
+		this.concurrencyController = new FeedbackController({
+			target: .75,
+			plantGain: .4,
+			minOutput: 1,
+			maxOutput: 16,
+			...options
+		});
+	}
+	/** 35.0：最近一次控制步（诊断口径） */
+	lastControlStep;
+	/**
+	* 43.0：挂载容量前沿（幂等覆盖，挂载即生效——纯诊断口径）。
+	*
+	* 「类型需求 × 模型容量」流网络（源→类型（需求）→模型（评分>0 可达
+	* 边）→汇（maxConcurrency））上解 Edmonds-Karp 最大流 = 可立即满足
+	* 的最大并发派发；最小割指认钳制者（类型在饿还是模型是独木桥）——
+	* 割容量 = 流值（Ford-Fulkerson 证书）。执行器每批回写待执行需求；
+	* 不改变任何派发行为（零漂移），吞吐上限与瓶颈归因经
+	* getAttachedDiagnostics / query_memory capacity 可读。
+	*/
+	attachCapacityFrontier() {
+		this.capacityFrontierEnabled = true;
+	}
+	/** 43.0：执行批回写待执行需求（未挂载为空操作；类型计数 × 候选容量 → 流前沿） */
+	updateCapacityFrontier(demands) {
+		if (!this.capacityFrontierEnabled || demands.length === 0) return;
+		const models = this.llm.getModelStatuses().map((s) => ({
+			id: s.id,
+			capacity: s.maxConcurrency
+		}));
+		if (models.length === 0) return;
+		this.lastCapacityFrontier = capacityFrontier(demands, models, (taskType, modelId) => {
+			const status = this.llm.getModelStatuses().find((s) => s.id === modelId);
+			if (!status) return false;
+			const score = status.taskScores[taskType] ?? status.taskScores["general"];
+			return score === void 0 || score > 0;
+		});
+	}
+	/**
+	* 50.0：挂载潜因子补全（幂等覆盖，挂载即生效——纯诊断口径）。
+	*
+	* 「模型 × 任务类型」能力矩阵经 ALS 低秩补全（rank 缺省 3）：观测
+	* 条目（各模型 taskScores 已有值的部分）拟合 U·Vᵀ，未观测条目由
+	* 潜因子外推——新模型的冷启动选型从零样本瞎选升级为潜维度预测
+	* （Candès–Recht 恢复条件背书）。lowRankShare 读出低秩假设的成色；
+	* 不改变任何评分路径（零漂移），coldStartEstimate 按需读取。
+	*/
+	attachLatentFactors(options) {
+		this.latentFactorsEnabled = true;
+		this.latentRank = Math.max(1, Math.min(6, Math.floor(options?.rank ?? 3)));
+		this.refreshLatentFactors();
+	}
+	latentRank = 3;
+	/** 50.0：重算能力矩阵补全（观测 = 各模型 taskScores 的非空条目，行=模型 列=任务类型并集） */
+	refreshLatentFactors() {
+		const statuses = this.llm.getModelStatuses();
+		const modelIds = statuses.map((s) => s.id);
+		const taskTypes = /* @__PURE__ */ new Set();
+		for (const s of statuses) for (const t of Object.keys(s.taskScores)) taskTypes.add(t);
+		const types = [...taskTypes];
+		const observed = [];
+		statuses.forEach((s, i) => {
+			for (const [t, v] of Object.entries(s.taskScores)) {
+				const j = types.indexOf(t);
+				if (j >= 0 && Number.isFinite(v)) observed.push({
+					i,
+					j,
+					value: v
+				});
+			}
+		});
+		this.latentTypeIndex = new Map(types.map((t, j) => [t, j]));
+		this.latentModelIndex = new Map(modelIds.map((id, i) => [id, i]));
+		if (observed.length < 4 || modelIds.length < 2 || types.length < 2) {
+			this.lastCompletion = void 0;
+			return;
+		}
+		this.lastCompletion = completeMatrix(observed, modelIds.length, types.length, { rank: this.latentRank });
+	}
+	latentTypeIndex = /* @__PURE__ */ new Map();
+	latentModelIndex = /* @__PURE__ */ new Map();
+	/**
+	* 50.0：冷启动能力预测（观测未覆盖的 model×taskType 条目由潜因子
+	* 外推；未挂载/未覆盖返回 undefined——诚实降级）
+	*/
+	coldStartEstimate(modelId, taskType) {
+		if (!this.lastCompletion) return void 0;
+		const i = this.latentModelIndex.get(modelId);
+		const j = this.latentTypeIndex.get(taskType) ?? this.latentTypeIndex.get("general");
+		if (i === void 0 || j === void 0) return void 0;
+		return completedEntry(this.lastCompletion, i, j);
+	}
+	/** 50.0：补全报告快照（纯读取） */
+	getLatentFactorReport() {
+		return this.lastCompletion ? {
+			rank: this.latentRank,
+			trainRmse: this.lastCompletion.trainRmse,
+			observedRatio: this.lastCompletion.observedRatio,
+			lowRankShare: this.lastCompletion.lowRankShare,
+			converged: this.lastCompletion.converged
+		} : void 0;
+	}
+	/** 43.0：最近一次容量前沿（纯读取；未挂载/未回写返回 undefined） */
+	getCapacityFrontier() {
+		return this.lastCapacityFrontier ? {
+			...this.lastCapacityFrontier,
+			bindingConstraints: [...this.lastCapacityFrontier.bindingConstraints]
+		} : void 0;
 	}
 	/** 模型的当前经济乘数（无信号 = 中性 1；economicFeedbackEnabled 关闭时恒为 1） */
 	economicMultiplierOf(modelId) {
@@ -7629,7 +9447,7 @@ var ModelScheduler = class {
 			memoryCalls: estimate ? Math.round(estimate.effectiveSamples) : 0,
 			avgQuality: estimate?.emaQuality || .5,
 			avgTokens: status.totalCalls > 0 ? status.totalTokensUsed / status.totalCalls : 0
-		}) * this.economicMultiplierOf(status.id);
+		}) * this.economicMultiplierOf(status.id) * this.hedgeMultiplierOf(status.id);
 	}
 	/**
 	* 全候选评分（2.0：利用端策略评分 + UCB 探索加成）
@@ -7900,12 +9718,243 @@ var ModelScheduler = class {
 	/**
 	* 动态并行度：依据已注册模型的总并发容量计算同层最大并行数
 	* （避免同层节点数超过模型并发容量导致全部排队）
+	*
+	* 35.0：挂载反馈控制器后升级为闭环口径——每次调用即一步反馈
+	* （观测总利用率 activeRequests / 总容量 → LQR 增益步 → 新上限，
+	* 死区抗抖振、钳位 [1,16] 抗饱和，稳定性由 Lyapunov 证书背书）。
+	* 未挂载时与原静态口径逐位一致（零漂移）。
 	*/
 	computeParallelism() {
-		const totalConcurrency = this.llm.getModelStatuses().reduce((sum, s) => sum + s.maxConcurrency, 0);
+		const statuses = this.llm.getModelStatuses();
+		const totalConcurrency = statuses.reduce((sum, s) => sum + s.maxConcurrency, 0);
+		if (this.concurrencyController) {
+			const active = statuses.reduce((sum, s) => sum + s.activeRequests, 0);
+			const utilization = totalConcurrency > 0 ? active / totalConcurrency : 0;
+			this.lastControlStep = this.concurrencyController.step(utilization);
+			return Math.round(this.lastControlStep.output);
+		}
 		return Math.max(1, Math.min(16, totalConcurrency || 4));
 	}
+	/**
+	* 32.0：候选评分公开口径（批量全局指派的收益矩阵原料）。
+	*
+	* 与 assignModelWithInsight 同一评分路径（含 UCB/EFE 加成与经济/
+	* 对抗乘数），返回 (id, total) 降序排列——供执行侧构造批内收益矩阵，
+	* 匈牙利算法在「同一批节点 × 全体候选」上求全局最优指派。
+	*/
+	rankCandidateScores(taskType, context, exclude = []) {
+		const avoid = new Set(exclude);
+		const statuses = this.llm.getModelStatuses().filter((s) => !avoid.has(s.id));
+		if (statuses.length === 0) return [];
+		return this.scoreCandidates(taskType, context, statuses).map((s) => ({
+			id: s.id,
+			score: s.total
+		})).sort((a, b) => b.score - a.score);
+	}
 };
+//#endregion
+//#region src/core/optimal-assignment.ts
+/**
+* 线性和指派（最小化）——Jonker–Volgenant 风格 O(n³)。
+*
+* cost 为 rows × cols 矩阵（rows ≤ cols 直接解；rows > cols 自动转置后
+* 原地还原）。空矩阵 / 零行零列安全返回。
+*/
+function solveAssignment(cost) {
+	if (cost.length === 0 || cost[0].length === 0) return {
+		assignment: [],
+		totalCost: 0,
+		rows: cost.length,
+		cols: cost[0]?.length ?? 0
+	};
+	const n = cost.length;
+	const m = cost[0].length;
+	for (const row of cost) if (row.length !== m) throw new Error("solveAssignment: 代价矩阵必须为矩形");
+	const transposed = n > m;
+	const R = transposed ? m : n;
+	const C = transposed ? n : m;
+	const c = (i, j) => transposed ? cost[j][i] : cost[i][j];
+	const u = new Array(R + 1).fill(0);
+	const v = new Array(C + 1).fill(0);
+	const p = new Array(C + 1).fill(0);
+	const way = new Array(C + 1).fill(0);
+	for (let i = 1; i <= R; i += 1) {
+		p[0] = i;
+		let j0 = 0;
+		const minv = new Array(C + 1).fill(Infinity);
+		const used = new Array(C + 1).fill(false);
+		do {
+			used[j0] = true;
+			const i0 = p[j0];
+			let delta = Infinity;
+			let j1 = 0;
+			for (let j = 1; j <= C; j += 1) {
+				if (used[j]) continue;
+				const cur = c(i0 - 1, j - 1) - u[i0] - v[j];
+				if (cur < minv[j]) {
+					minv[j] = cur;
+					way[j] = j0;
+				}
+				if (minv[j] < delta) {
+					delta = minv[j];
+					j1 = j;
+				}
+			}
+			if (!Number.isFinite(delta)) break;
+			for (let j = 0; j <= C; j += 1) if (used[j]) {
+				u[p[j]] += delta;
+				v[j] -= delta;
+			} else minv[j] -= delta;
+			j0 = j1;
+		} while (p[j0] !== 0);
+		do {
+			const j1 = way[j0];
+			p[j0] = p[j1];
+			j0 = j1;
+		} while (j0 !== 0);
+	}
+	const colOfRow = new Array(R).fill(-1);
+	for (let j = 1; j <= C; j += 1) if (p[j] > 0) colOfRow[p[j] - 1] = j - 1;
+	let totalCost = 0;
+	for (let i = 0; i < R; i += 1) if (colOfRow[i] >= 0) totalCost += c(i, colOfRow[i]);
+	let dualU;
+	let dualV;
+	if (transposed) {
+		dualU = v.slice(1, n + 1);
+		dualV = u.slice(1, m + 1);
+	} else {
+		dualU = u.slice(1, R + 1);
+		dualV = v.slice(1, C + 1);
+	}
+	const assignment = new Array(n).fill(-1);
+	if (transposed) for (let i = 0; i < R; i += 1) assignment[colOfRow[i]] = i;
+	else for (let i = 0; i < R; i += 1) assignment[i] = colOfRow[i];
+	return {
+		assignment,
+		totalCost,
+		rows: n,
+		cols: m,
+		dual: {
+			u: dualU,
+			v: dualV
+		}
+	};
+}
+/** 最大化指派（收益矩阵 → 取负 → 最小化）。
+*
+* 返回的 dual 为**最大化口径**证书：u_i + v_j ≥ p_ij 对一切 (i,j) 成立、
+* 匹配边上取等（弱对偶：任意指派的收益 ≤ Σu + Σv = 本解收益）。
+* 最小化口径的 assignmentCertificate 请与 solveAssignment 配套使用。
+*/
+function solveAssignmentMax(profit) {
+	const result = solveAssignment(profit.map((row) => row.map((x) => -x)));
+	return {
+		...result,
+		totalCost: -result.totalCost,
+		dual: result.dual ? {
+			u: result.dual.u.map((x) => -x),
+			v: result.dual.v.map((x) => -x)
+		} : void 0,
+		totalProfit: -result.totalCost
+	};
+}
+/**
+* 对偶证书检查（证明携带）:
+*   可行 ∀i,j: u_i + v_j ≤ c_ij + tol；松弛：匹配边等号；间隙 = |Σu+Σv−成本|。
+* 三项全过 → optimal = true：本次指派的最优性被数学证明，而非被声称。
+*/
+function assignmentCertificate(cost, result, tol = 1e-6) {
+	const { assignment, dual } = result;
+	if (!dual) return {
+		dualFeasible: false,
+		complementarySlackness: false,
+		dualityGap: Infinity,
+		optimal: false,
+		maxConstraintViolation: Infinity
+	};
+	const n = cost.length;
+	let maxViolation = 0;
+	for (let i = 0; i < n; i += 1) for (let j = 0; j < cost[i].length; j += 1) {
+		const slack = dual.u[i] + dual.v[j] - cost[i][j];
+		if (slack > tol) maxViolation = Math.max(maxViolation, slack);
+	}
+	let slackViolation = 0;
+	let dualSum = 0;
+	let primalSum = 0;
+	for (let i = 0; i < n; i += 1) {
+		dualSum += dual.u[i];
+		const j = assignment[i];
+		if (j === void 0 || j < 0) continue;
+		primalSum += cost[i][j];
+		slackViolation = Math.max(slackViolation, Math.abs(dual.u[i] + dual.v[j] - cost[i][j]));
+	}
+	for (let j = 0; j < dual.v.length; j += 1) dualSum += dual.v[j];
+	const gap = Math.abs(dualSum - primalSum);
+	const dualFeasible = maxViolation <= tol;
+	const complementarySlackness = slackViolation <= tol;
+	return {
+		dualFeasible,
+		complementarySlackness,
+		dualityGap: gap,
+		optimal: dualFeasible && complementarySlackness && gap <= tol * Math.max(1, n),
+		maxConstraintViolation: maxViolation
+	};
+}
+/** 穷举最优（验证锚点；n ≤ 8 适用，排列枚举） */
+function bruteForceAssignment(cost) {
+	const n = cost.length;
+	const m = n > 0 ? cost[0].length : 0;
+	if (n === 0 || m === 0) return {
+		assignment: [],
+		totalCost: 0
+	};
+	if (n > m) throw new Error("bruteForceAssignment: 仅支持 rows ≤ cols");
+	let best = [];
+	let bestCost = Infinity;
+	const perm = [];
+	const used = new Array(m).fill(false);
+	const rec = () => {
+		if (perm.length === n) {
+			let c = 0;
+			for (let i = 0; i < n; i += 1) c += cost[i][perm[i]];
+			if (c < bestCost) {
+				bestCost = c;
+				best = [...perm];
+			}
+			return;
+		}
+		for (let j = 0; j < m; j += 1) {
+			if (used[j]) continue;
+			used[j] = true;
+			perm.push(j);
+			rec();
+			perm.pop();
+			used[j] = false;
+		}
+	};
+	rec();
+	return {
+		assignment: best,
+		totalCost: bestCost
+	};
+}
+/**
+* 批内收益矩阵 → 全局指派（32.0 接线辅助）。
+*
+* profit[i][j] = 节点 i 给模型 j 的调度评分；返回 节点 → 模型 指派
+* （未覆盖节点返回 -1，交还逐节点原路径——行数超过列数时的诚实降级）。
+*/
+function assignBatch(profit) {
+	if (profit.length === 0) return {
+		modelOfNode: [],
+		totalProfit: 0
+	};
+	const result = solveAssignmentMax(profit);
+	return {
+		modelOfNode: result.assignment,
+		totalProfit: result.totalProfit
+	};
+}
 //#endregion
 //#region src/task-executor.ts
 /**
@@ -7947,6 +9996,10 @@ var TaskExecutor = class {
 	breakers;
 	/** 2.0：最近一次计划执行的调度决策洞察（校准闭环素材，getAndClearDecisionInsights 取走） */
 	decisionInsights = [];
+	/** 32.0：批内全局最优指派（匈牙利算法；未挂载时逐节点选型原样） */
+	batchAssignmentEnabled = false;
+	/** 32.0：批内指派的候选池上限（每任务类型取评分前 K） */
+	batchCandidateCap = 8;
 	constructor(params) {
 		this.config = params.config;
 		this.llm = params.llm;
@@ -7970,6 +10023,71 @@ var TaskExecutor = class {
 			...this.config,
 			...patch
 		};
+	}
+	/**
+	* 32.0：挂载批内全局最优指派（幂等，挂载即生效）。
+	*
+	* 挂载后每个执行批（同层就绪节点 × 并发上限切片）中的**动态选型节点**
+	* 不再逐个调用调度器（局部贪心），而是构造「节点 × 候选模型」收益
+	* 矩阵（与逐节点路径同一评分口径），经匈牙利算法求**全局总收益最优**
+	* 的一对一指派（O(n³) 精确解，携带对偶证书）——最优模型不再被同批
+	* 节点重复超订，次优模型不再闲置。计划指定 / 优化器推荐的节点不受
+	* 影响（约束优先，只对无约束节点做全局协调）。未挂载时逐位零漂移。
+	*/
+	attachOptimalAssignment(options) {
+		this.batchAssignmentEnabled = true;
+		if (options?.candidateCap && options.candidateCap >= 1) this.batchCandidateCap = Math.floor(options.candidateCap);
+	}
+	/** 32.0：批内指派断开（诊断/回退口径） */
+	detachOptimalAssignment() {
+		this.batchAssignmentEnabled = false;
+	}
+	/**
+	* 32.0：为执行批计算全局指派（节点 id → 模型 id；无指派必要的批返回 undefined）。
+	*
+	* 只有批内「动态选型节点」（无计划指定模型、无可执行推荐模型）≥ 2 且
+	* 候选模型 ≥ 2 时才升级为全局口径；被约束节点占用的模型从候选池剔除
+	* （一对一语义）。返回的 map 缺席 = 该节点走原动态路径（诚实降级）。
+	*/
+	planBatchAssignment(chunk, recommendedModels, avoidModels) {
+		const avoidSet = new Set(avoidModels);
+		const takenByConstraint = /* @__PURE__ */ new Set();
+		/** 节点的约束模型（指定/推荐且可用）——有约束的节点不参与全局协调 */
+		const constrained = /* @__PURE__ */ new Map();
+		for (const node of chunk) {
+			let planned = node.modelId;
+			if (planned && (avoidSet.has(planned) || !this.modelExecutable(planned))) planned = void 0;
+			if (planned) {
+				constrained.set(node.id, planned);
+				takenByConstraint.add(planned);
+				continue;
+			}
+			let preferred = recommendedModels?.[node.type];
+			if (preferred && (avoidSet.has(preferred) || !this.modelExecutable(preferred))) preferred = void 0;
+			if (preferred) {
+				constrained.set(node.id, preferred);
+				takenByConstraint.add(preferred);
+			}
+		}
+		const dynamicNodes = chunk.filter((node) => !constrained.has(node.id));
+		if (dynamicNodes.length < 2) return void 0;
+		const scoresByType = /* @__PURE__ */ new Map();
+		for (const node of dynamicNodes) {
+			if (scoresByType.has(node.type)) continue;
+			const ranked = this.modelScheduler.rankCandidateScores(node.type, void 0, [...avoidSet]);
+			const map = /* @__PURE__ */ new Map();
+			for (const entry of ranked.slice(0, this.batchCandidateCap)) map.set(entry.id, entry.score);
+			scoresByType.set(node.type, map);
+		}
+		const candidateIds = [];
+		for (const map of scoresByType.values()) for (const id of map.keys()) if (!candidateIds.includes(id) && !takenByConstraint.has(id) && this.modelExecutable(id)) candidateIds.push(id);
+		if (candidateIds.length < 2) return void 0;
+		const { modelOfNode } = assignBatch(dynamicNodes.map((node) => candidateIds.map((id) => scoresByType.get(node.type)?.get(id) ?? 0)));
+		const assignment = /* @__PURE__ */ new Map();
+		modelOfNode.forEach((candidateIdx, nodeIdx) => {
+			if (candidateIdx >= 0) assignment.set(dynamicNodes[nodeIdx].id, candidateIds[candidateIdx]);
+		});
+		return assignment.size > 0 ? assignment : void 0;
 	}
 	/**
 	* 取走最近一次计划执行的调度决策洞察（2.0：校准闭环桥接）
@@ -8053,12 +10171,22 @@ var TaskExecutor = class {
 		try {
 			const layers = this.topologicalLayers(plan.nodes);
 			const parallelism = this.modelScheduler.computeParallelism();
+			this.modelScheduler.updateCapacityFrontier(plan.nodes.reduce((acc, node) => {
+				const found = acc.find((a) => a.type === node.type);
+				if (found) found.count += 1;
+				else acc.push({
+					type: node.type,
+					count: 1
+				});
+				return acc;
+			}, []));
 			for (const layer of layers) {
 				if (controller.signal.aborted) break;
 				for (let i = 0; i < layer.length; i += parallelism) {
 					if (controller.signal.aborted) break;
 					const chunk = layer.slice(i, i + parallelism);
-					const layerResults = await Promise.all(chunk.map((node) => this.executeNode(planId, node, signal, outputs, controller.signal, recommendedModels, options?.avoidModels ?? [])));
+					const batchAssignment = this.batchAssignmentEnabled ? this.planBatchAssignment(chunk, recommendedModels, options?.avoidModels ?? []) : void 0;
+					const layerResults = await Promise.all(chunk.map((node) => this.executeNode(planId, node, signal, outputs, controller.signal, recommendedModels, options?.avoidModels ?? [], batchAssignment?.get(node.id))));
 					for (const result of layerResults) {
 						nodeResults.push(result);
 						if (result.success && result.output) outputs.set(result.nodeId, result.output);
@@ -8115,7 +10243,7 @@ var TaskExecutor = class {
 		return fallback;
 	}
 	/** 单节点执行（4.0：熔断感知调度 + 错误分型退避重试 + 质量反思切换、级联触发） */
-	async executeNode(planId, node, signal, outputs, abortSignal, recommendedModels, avoidModels = []) {
+	async executeNode(planId, node, signal, outputs, abortSignal, recommendedModels, avoidModels = [], forcedModel) {
 		const context = {};
 		for (const dep of node.dependsOn) {
 			const depOutput = outputs.get(dep);
@@ -8126,7 +10254,8 @@ var TaskExecutor = class {
 		if (preferred && (avoidSet.has(preferred) || !this.modelExecutable(preferred))) preferred = void 0;
 		let plannedModel = node.modelId;
 		if (plannedModel && (avoidSet.has(plannedModel) || !this.modelExecutable(plannedModel))) plannedModel = void 0;
-		const assignment = plannedModel ? this.modelScheduler.modelInsight(node.type, plannedModel) : this.modelScheduler.assignModelWithInsight(node.type, preferred, void 0, { avoidModels });
+		const forced = forcedModel && !avoidSet.has(forcedModel) && this.modelExecutable(forcedModel) ? forcedModel : void 0;
+		const assignment = plannedModel ? this.modelScheduler.modelInsight(node.type, plannedModel) : forced ? this.modelScheduler.modelInsight(node.type, forced) : this.modelScheduler.assignModelWithInsight(node.type, preferred, void 0, { avoidModels });
 		let modelId = assignment.modelId;
 		this.decisionInsights.push({
 			nodeId: node.id,
@@ -8227,6 +10356,7 @@ var TaskExecutor = class {
 						reason: verdict.reason || `质量 ${verdict.quality.toFixed(2)} ≥ 阈值 ${threshold.toFixed(2)}`
 					});
 					this.decisionInsights[insightIndex].success = true;
+					this.modelScheduler.reportHedgeOutcome(modelId, verdict.quality);
 					this.triggerCascade(node, signal, output);
 					return {
 						nodeId: node.id,
@@ -8302,6 +10432,7 @@ var TaskExecutor = class {
 				break;
 			}
 		}
+		this.modelScheduler.reportHedgeOutcome(modelId, 0);
 		return {
 			nodeId: node.id,
 			modelId,
@@ -8791,6 +10922,213 @@ var Optimizer = class {
 	}
 };
 //#endregion
+//#region src/core/information-bottleneck.ts
+function klDivergence(p, q) {
+	let acc = 0;
+	for (let i = 0; i < p.length; i += 1) {
+		const pi = p[i];
+		if (pi <= 0) continue;
+		const qi = q[i] > 0 ? q[i] : 1e-300;
+		acc += pi * Math.log(pi / qi);
+	}
+	return acc;
+}
+function mutualInfo(joint) {
+	let total = 0;
+	for (const row of joint) for (const v of row) total += v;
+	if (!(total > 0)) return {
+		ixy: 0,
+		px: [],
+		py: [],
+		pyx: []
+	};
+	const nx = joint.length;
+	const ny = joint[0].length;
+	const px = joint.map((row) => row.reduce((s, v) => s + v, 0) / total);
+	const py = Array.from({ length: ny }, (_, j) => joint.reduce((s, row) => s + (row[j] ?? 0), 0) / total);
+	let ixy = 0;
+	const pyx = [];
+	for (let i = 0; i < nx; i += 1) {
+		const cond = [];
+		for (let j = 0; j < ny; j += 1) {
+			const pij = (joint[i][j] ?? 0) / total;
+			cond.push(px[i] > 0 ? pij / px[i] : 1 / ny);
+			if (pij > 0) ixy += pij * Math.log(pij / (px[i] * py[j]));
+		}
+		pyx.push(cond);
+	}
+	return {
+		ixy,
+		px,
+		py,
+		pyx
+	};
+}
+/**
+* 信息瓶颈（Blahut–Arimoto / Tishby 1999）。
+*
+* 迭代自洽方程至收敛；拉格朗日量单调不增（验证锚点）。|X|=1 或
+* I(X;Y)=0 时诚实返回 retention=0（无信息可保留——不值得蒸馏）。
+*/
+function informationBottleneck(joint, options) {
+	const beta = options?.beta ?? 5;
+	const maxIterations = options?.maxIterations ?? 200;
+	const tol = options?.tol ?? 1e-9;
+	const { ixy, px, py, pyx } = mutualInfo(joint);
+	const nx = joint.length;
+	const ny = nx > 0 ? joint[0].length : 0;
+	if (nx === 0 || ny === 0) throw new Error("informationBottleneck: 空分布");
+	if (ixy <= 1e-12 || nx === 1) return {
+		clusters: 1,
+		iXY: ixy,
+		iTY: 0,
+		retention: 0,
+		iXT: 0,
+		lagrangian: 0,
+		assignment: Array.from({ length: nx }, () => 0),
+		clusterPosteriors: [py.slice()],
+		iterations: 0,
+		converged: true
+	};
+	const k = Math.max(1, Math.min(options?.clusterCap ?? Math.min(nx, 6), nx));
+	const mkRng = (seed) => {
+		let s = seed >>> 0;
+		return () => {
+			s = s + 1831565813 | 0;
+			let t = Math.imul(s ^ s >>> 15, 1 | s);
+			t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+			return ((t ^ t >>> 14) >>> 0) / 4294967296;
+		};
+	};
+	const runOnce = (seed) => {
+		const rnd = mkRng(seed);
+		let qtx = Array.from({ length: nx }, () => Array.from({ length: k }, () => .8 / k + .2 * rnd()));
+		const currentLagrangian = () => {
+			const qt = Array.from({ length: k }, () => 0);
+			for (let i = 0; i < nx; i += 1) {
+				let rowSum = 0;
+				for (let t = 0; t < k; t += 1) rowSum += qtx[i][t];
+				for (let t = 0; t < k; t += 1) qt[t] += px[i] * qtx[i][t] / (rowSum || 1);
+			}
+			const qyt = Array.from({ length: k }, () => Array.from({ length: ny }, () => 0));
+			for (let i = 0; i < nx; i += 1) {
+				let rowSum = 0;
+				for (let t = 0; t < k; t += 1) rowSum += qtx[i][t];
+				for (let t = 0; t < k; t += 1) {
+					const w = px[i] * qtx[i][t] / (rowSum || 1);
+					for (let j = 0; j < ny; j += 1) qyt[t][j] += w * pyx[i][j];
+				}
+			}
+			for (let t = 0; t < k; t += 1) {
+				const rowSum = qyt[t].reduce((a, b) => a + b, 0);
+				if (rowSum > 0) for (let j = 0; j < ny; j += 1) qyt[t][j] /= rowSum;
+				else for (let j = 0; j < ny; j += 1) qyt[t][j] = 1 / ny;
+			}
+			let ixt = 0;
+			for (let i = 0; i < nx; i += 1) {
+				let rowSum = 0;
+				for (let t = 0; t < k; t += 1) rowSum += qtx[i][t];
+				for (let t = 0; t < k; t += 1) {
+					const q = qtx[i][t] / (rowSum || 1);
+					if (q > 0) ixt += px[i] * q * Math.log(q / (qt[t] || 1e-300));
+				}
+			}
+			let ity = 0;
+			for (let t = 0; t < k; t += 1) {
+				if (qt[t] <= 0) continue;
+				ity += qt[t] * klDivergence(qyt[t], py);
+			}
+			return {
+				ixt,
+				ity,
+				lag: ixt - beta * ity,
+				qt,
+				qyt
+			};
+		};
+		let prev = currentLagrangian();
+		let converged = false;
+		let iterations = 0;
+		for (iterations = 1; iterations <= maxIterations; iterations += 1) {
+			const next = [];
+			for (let i = 0; i < nx; i += 1) {
+				const row = [];
+				for (let t = 0; t < k; t += 1) {
+					const d = klDivergence(pyx[i], prev.qyt[t]);
+					row.push(Math.max(1e-300, (prev.qt[t] || 1e-300) * Math.exp(-beta * d)));
+				}
+				next.push(row);
+			}
+			qtx = next;
+			const cur = currentLagrangian();
+			if (Math.abs(cur.lag - prev.lag) <= tol * Math.max(1, Math.abs(prev.lag))) {
+				prev = cur;
+				converged = true;
+				break;
+			}
+			if (cur.lag > prev.lag + 1e-6) {
+				prev = cur;
+				break;
+			}
+			prev = cur;
+		}
+		return {
+			prev,
+			qtx,
+			iterations,
+			converged
+		};
+	};
+	const baseSeed = options?.seed ?? 20261002;
+	let best = runOnce(baseSeed);
+	for (const offset of [7919, 104729]) {
+		const attempt = runOnce(baseSeed + offset >>> 0);
+		if (attempt.prev.lag < best.prev.lag - 1e-12) best = attempt;
+	}
+	const { prev, qtx, iterations, converged } = best;
+	const assignment = qtx.map((row) => {
+		let bestIdx = 0;
+		for (let t = 1; t < k; t += 1) if (row[t] > row[bestIdx]) bestIdx = t;
+		return bestIdx;
+	});
+	const alive = new Set(assignment);
+	const clusterPosteriors = prev.qyt.filter((_, t) => alive.has(t));
+	return {
+		clusters: alive.size,
+		iXY: ixy,
+		iTY: prev.ity,
+		retention: ixy > 0 ? Math.min(1, prev.ity / ixy) : 0,
+		iXT: prev.ixt,
+		lagrangian: prev.lag,
+		assignment,
+		clusterPosteriors,
+		iterations,
+		converged
+	};
+}
+/**
+* 蒸馏信息定价（37.0 接线口径）。
+*
+* 样本形如 { features: 位型标签数组（如 ['code', 'slow']）, success }。
+* 特征位型做 X、成败做 Y 聚合经验分布 → IB 压缩 → retention 为
+* 「这批样本携带的值得蒸馏的信息比例」。
+*/
+function distillRetention(samples, options) {
+	const featureSets = samples.map((s) => [...new Set(s.features.filter((f) => f.length > 0))].sort().join("|"));
+	const vocab = [...new Set(featureSets)];
+	const xi = new Map(vocab.map((v, i) => [v, i]));
+	const pxy = Array.from({ length: vocab.length }, () => [0, 0]);
+	for (const s of samples) {
+		const i = xi.get([...new Set(s.features)].sort().join("|"));
+		if (i === void 0) continue;
+		pxy[i][s.success ? 1 : 0] += 1;
+	}
+	return {
+		...informationBottleneck(pxy, options),
+		sampleCount: samples.length
+	};
+}
+//#endregion
 //#region src/reflector.ts
 /**
 * reflector.ts — 反思器组件（新架构「任务执行 → 反思器 → 记忆更新」）
@@ -8821,6 +11159,10 @@ var Reflector = class {
 	onMemoryChange;
 	/** 蒸馏进行中标志（阈值自动触发的防抖，避免并发重复蒸馏） */
 	distilling = false;
+	/** 37.0：信息瓶颈蒸馏定价（attachBottleneckDistiller 后生效；未挂载零漂移） */
+	bottleneck;
+	/** 37.0：最近一次瓶颈定价读数（审计口径） */
+	lastBottleneck;
 	/** 2.0：校准滑动窗口（Brier 残差滚动统计） */
 	calibrationWindow = [];
 	constructor(params) {
@@ -9083,6 +11425,25 @@ var Reflector = class {
 	* @param options.force 强制蒸馏（Tool 按需调用 / 首次蒸馏时使用）
 	* @returns 蒸馏报告（含本次产出的语义/程序记忆与兼容策略）
 	*/
+	/**
+	* 37.0：挂载信息瓶颈蒸馏定价（幂等覆盖，挂载即生效）。
+	*
+	* 蒸馏门槛从纯水位（样本计数）升维为水位 + 信息量双门：X = 任务位型
+	* （类型 × 质量档 × 延迟档），Y = 成败；Blahut–Arimoto IB 压缩后的
+	* 保留率 retention = I(T;Y)/I(X;Y) < retentionFloor 时，样本与既有
+	* 知识同构——水位再高也只产出重复知识，诚实跳过（below-information）。
+	* 未挂载零漂移（原水位单门）。
+	*/
+	attachBottleneckDistiller(options) {
+		this.bottleneck = {
+			beta: options?.beta ?? 5,
+			retentionFloor: Math.min(.99, Math.max(.01, options?.retentionFloor ?? .4))
+		};
+	}
+	/** 37.0：最近一次瓶颈定价读数（未挂载/未评估时 undefined） */
+	getBottleneckView() {
+		return this.lastBottleneck ? { ...this.lastBottleneck } : void 0;
+	}
 	async distillKnowledge(options) {
 		const now = Date.now();
 		const minConfidence = this.config.distillMinConfidence ?? .6;
@@ -9102,6 +11463,43 @@ var Reflector = class {
 				skipped: true,
 				skipReason: "below-threshold"
 			};
+			if (this.bottleneck) {
+				const samples = this.memory.getAllTaskPatterns().flatMap((p) => {
+					const total = p.successfulPlans.length + p.failureRecords.length;
+					if (total === 0) return [];
+					const qualityBucket = p.avgQualityScore >= .8 ? "high-q" : p.avgQualityScore >= .6 ? "mid-q" : "low-q";
+					const latencyBucket = p.avgExecutionTime >= 3e4 ? "slow" : "fast";
+					const outcomes = [];
+					for (let k = 0; k < Math.min(total, 5); k += 1) outcomes.push({
+						features: [
+							p.taskSummary.slice(0, 12),
+							qualityBucket,
+							latencyBucket
+						],
+						success: k < p.successfulPlans.length
+					});
+					return outcomes;
+				});
+				if (samples.length >= 8) {
+					const report = distillRetention(samples, { beta: this.bottleneck.beta });
+					this.lastBottleneck = {
+						retention: report.retention,
+						iXY: report.iXY,
+						clusters: report.clusters,
+						sampleCount: report.sampleCount
+					};
+					if (report.iXY < .05 || report.retention < this.bottleneck.retentionFloor) return {
+						distilledAt: now,
+						sourceEpisodicCount: 0,
+						semanticMemories: [],
+						proceduralMemories: [],
+						strategies: [],
+						summary: `跳过蒸馏：水位已达但信息瓶颈保留率 ${report.retention.toFixed(3)} < ${this.bottleneck.retentionFloor}（I(X;Y)=${report.iXY.toFixed(3)} nat，${report.sampleCount} 样本同构——值得蒸馏的新信息不足）`,
+						skipped: true,
+						skipReason: "below-information"
+					};
+				}
+			}
 		}
 		if (this.distilling) return {
 			distilledAt: now,
@@ -11991,6 +14389,277 @@ var LocalLinearTrendFilter = class {
 	}
 };
 //#endregion
+//#region src/core/nonlinear-dynamics.ts
+/**
+* Rosenstein 最大 Lyapunov 指数。
+*
+* series: 标量序列（≥ 32 点）；meanGap 排除时间近邻（假最近邻防御）；
+* fitWindow: 线性拟合的步数上限（缺省 ~ √N）。
+*/
+function largestLyapunov(series, options) {
+	const n = series.length;
+	if (n < 32) return void 0;
+	const meanGap = Math.max(1, options?.meanGap ?? 5);
+	const fitWindow = Math.max(4, Math.min(options?.fitWindow ?? Math.floor(Math.sqrt(n)), n - 2));
+	const neighbor = new Array(n).fill(-1);
+	for (let i = 0; i < n; i += 1) {
+		let best = -1;
+		let bestDist = Infinity;
+		for (let j = 0; j < n; j += 1) {
+			if (Math.abs(i - j) < meanGap) continue;
+			const d = Math.abs(series[i] - series[j]);
+			if (d < bestDist) {
+				bestDist = d;
+				best = j;
+			}
+		}
+		neighbor[i] = best;
+	}
+	const used = Array.from({ length: n }, (_, i) => i).filter((i) => neighbor[i] >= 0 && i + fitWindow < n && neighbor[i] + fitWindow < n);
+	if (used.length < 8) return void 0;
+	const divergence = [];
+	for (let k = 0; k <= fitWindow; k += 1) {
+		let sum = 0;
+		for (const i of used) sum += Math.log(1e-12 + Math.abs(series[i + k] - series[neighbor[i] + k]));
+		divergence.push(sum / used.length);
+	}
+	let lambda = 0;
+	for (let span = Math.max(3, Math.floor(fitWindow / 3)); span <= fitWindow; span += 1) {
+		const m = span + 1;
+		const mx = (m - 1) / 2;
+		const my = divergence.slice(0, m).reduce((a, b) => a + b, 0) / m;
+		let num = 0;
+		let den = 0;
+		for (let k = 0; k < m; k += 1) {
+			num += (k - mx) * (divergence[k] - my);
+			den += (k - mx) * (k - mx);
+		}
+		if (den > 0) lambda = Math.max(lambda, num / den);
+	}
+	return {
+		lambda,
+		fitWindow,
+		divergence,
+		usedPairs: used.length
+	};
+}
+/** R/S 分析（多窗口聚合回归；窗口数不足时返回 undefined） */
+function hurstExponent(series) {
+	const n = series.length;
+	if (n < 32) return void 0;
+	const points = [];
+	for (let size = 8; size <= n / 2; size = Math.floor(size * 1.6)) {
+		const chunks = Math.floor(n / size);
+		let rsSum = 0;
+		let used = 0;
+		for (let c = 0; c < chunks; c += 1) {
+			const seg = series.slice(c * size, (c + 1) * size);
+			const mean = seg.reduce((a, b) => a + b, 0) / seg.length;
+			let cum = 0;
+			let min = Infinity;
+			let max = -Infinity;
+			let ss = 0;
+			for (const x of seg) {
+				cum += x - mean;
+				min = Math.min(min, cum);
+				max = Math.max(max, cum);
+				ss += (x - mean) * (x - mean);
+			}
+			const s = Math.sqrt(ss / seg.length);
+			if (s <= 1e-12) continue;
+			rsSum += (max - min) / s;
+			used += 1;
+		}
+		if (used > 0) points.push({
+			logN: Math.log(size),
+			logRS: Math.log(rsSum / used)
+		});
+	}
+	if (points.length < 3) return void 0;
+	const mx = points.reduce((s, p) => s + p.logN, 0) / points.length;
+	const my = points.reduce((s, p) => s + p.logRS, 0) / points.length;
+	let num = 0;
+	let den = 0;
+	for (const p of points) {
+		num += (p.logN - mx) * (p.logRS - my);
+		den += (p.logN - mx) * (p.logN - mx);
+	}
+	if (den <= 0) return void 0;
+	return {
+		hurst: num / den,
+		points
+	};
+}
+/**
+* 最近邻一步可预测性（噪声门判据，Casdagli 局部线性预测）。
+*
+* 每点取值域最近 m 邻居，用邻居的下一步均值预测：白噪声无增益
+* （score ≈ 1）；确定性映射近零误差（score ≈ 0）；线性 AR 只有
+* 线性增益（φ=±0.8 → score ≈ 0.6）。作混沌判定的前置门——白噪声
+* 对 Rosenstein 是无穷维混沌（最近邻瞬间发散），必须先排除。
+*/
+function determinismScore(series, m = 8) {
+	const n = series.length;
+	if (n < 32) return void 0;
+	const mean = series.reduce((s, x) => s + x, 0) / n;
+	let varSum = 0;
+	for (const x of series) varSum += (x - mean) * (x - mean);
+	const sd = Math.sqrt(varSum / n);
+	if (sd <= 1e-12) return void 0;
+	let errSum = 0;
+	let used = 0;
+	for (let i = 0; i + 1 < n; i += 1) {
+		const dists = [];
+		for (let j = 0; j + 1 < n; j += 1) {
+			if (Math.abs(i - j) < 5) continue;
+			dists.push({
+				d: Math.abs(series[i] - series[j]),
+				next: series[j + 1]
+			});
+		}
+		if (dists.length < m) continue;
+		dists.sort((a, b) => a.d - b.d);
+		let pred = 0;
+		for (let k = 0; k < m; k += 1) pred += dists[k].next;
+		pred /= m;
+		errSum += (series[i + 1] - pred) * (series[i + 1] - pred);
+		used += 1;
+	}
+	if (used < 16) return void 0;
+	return Math.sqrt(errSum / used) / sd;
+}
+/**
+* 动力学体质分类（38.0 接线口径）。
+*
+* 判序: 先过**噪声门**（最近邻一步可预测性 determinism < 0.5——白噪声
+* 无可预测增益，却会被 Rosenstein 判成无穷维混沌）；过门且 λ₁ > λPos
+* （缺省 0.05 nat/步）→ 混沌；否则 H > 0.5+δ → 持续、H < 0.5−δ →
+* 反持续、其余 → 随机漫步体质。
+*/
+function dynamicsRegime(series, options) {
+	const lambdaThreshold = options?.lambdaThreshold ?? .05;
+	const hurstDelta = options?.hurstDelta ?? .08;
+	const determinismGate = options?.determinismGate ?? .5;
+	const lyap = largestLyapunov(series);
+	const hurst = hurstExponent(series);
+	const det = determinismScore(series.length > 96 ? series.slice(-96) : series);
+	const h = hurst?.hurst;
+	const readable = lyap !== void 0 && hurst !== void 0;
+	if (lyap !== void 0 && lyap.lambda > lambdaThreshold && det !== void 0 && det < determinismGate) return {
+		regime: "chaotic",
+		lyapunov: lyap.lambda,
+		hurst: h,
+		forecastHorizonSteps: Math.max(1, Math.round(1 / lyap.lambda)),
+		readable
+	};
+	if (h !== void 0 && h > .5 + hurstDelta) return {
+		regime: "persistent",
+		lyapunov: lyap?.lambda,
+		hurst: h,
+		forecastHorizonSteps: void 0,
+		readable
+	};
+	if (h !== void 0 && h < .5 - hurstDelta) return {
+		regime: "mean-reverting",
+		lyapunov: lyap?.lambda,
+		hurst: h,
+		forecastHorizonSteps: void 0,
+		readable
+	};
+	return {
+		regime: "stochastic",
+		lyapunov: lyap?.lambda,
+		hurst: h,
+		forecastHorizonSteps: void 0,
+		readable
+	};
+}
+//#endregion
+//#region src/core/multiscale-wavelet.ts
+/** Haar 离散小波变换（n 为 2 的幂；O(n log n)） */
+function haarDecompose(series) {
+	let n = series.length;
+	if (n < 2 || (n & n - 1) !== 0) {
+		let padded = 2;
+		while (padded < n) padded <<= 1;
+		const filled = [...series.slice(0, padded)];
+		while (filled.length < padded) filled.push(filled[filled.length - 1] ?? 0);
+		return haarDecompose(filled);
+	}
+	let approx = [...series];
+	const details = [];
+	while (approx.length >= 2) {
+		const nextApprox = [];
+		const detail = [];
+		for (let i = 0; i < approx.length; i += 2) {
+			nextApprox.push((approx[i] + approx[i + 1]) / Math.SQRT2);
+			detail.push((approx[i] - approx[i + 1]) / Math.SQRT2);
+		}
+		approx = nextApprox;
+		details.push(detail);
+	}
+	const totalEnergy = series.reduce((s, x) => s + x * x, 0) || 1;
+	const energyShares = [];
+	details.forEach((d, i) => {
+		const e = d.reduce((s, x) => s + x * x, 0);
+		energyShares.push({
+			scale: `detail-${2 ** i}`,
+			share: e / totalEnergy
+		});
+	});
+	const approxEnergy = approx.reduce((s, x) => s + x * x, 0);
+	energyShares.push({
+		scale: "trend",
+		share: approxEnergy / totalEnergy
+	});
+	return {
+		details,
+		approximation: approx,
+		energyShares,
+		length: series.length
+	};
+}
+/** Haar 逆变换（完美重构验证锚点） */
+function haarReconstruct(decomposition) {
+	let approx = [...decomposition.approximation];
+	for (let level = decomposition.details.length - 1; level >= 0; level -= 1) {
+		const detail = decomposition.details[level];
+		const next = [];
+		for (let i = 0; i < detail.length; i += 1) {
+			const a = approx[i];
+			const d = detail[i];
+			next.push((a + d) / Math.SQRT2, (a - d) / Math.SQRT2);
+		}
+		approx = next;
+	}
+	return approx;
+}
+/** 多尺度读数（49.0 接线口径：元认知 KPI 的尺度透镜） */
+function multiScaleView(series) {
+	const dec = haarDecompose(series);
+	const mean = series.length > 0 ? series.reduce((s, x) => s + x, 0) / series.length : 0;
+	let burstShare = 0;
+	let driftShare = 0;
+	const trendShare = dec.energyShares.find((e) => e.scale === "trend")?.share ?? 0;
+	let dominant = "trend";
+	let dominantShare = trendShare;
+	dec.energyShares.forEach((e, i) => {
+		if (e.scale === "trend") return;
+		if (i === 0) burstShare = e.share;
+		if (e.scale === "detail-8" || e.scale === "detail-16" || e.scale === "detail-32") driftShare += e.share;
+		if (e.share > dominantShare) {
+			dominantShare = e.share;
+			dominant = e.scale;
+		}
+	});
+	return {
+		trendLevel: mean,
+		burstShare,
+		dominantScale: dominant,
+		driftShare
+	};
+}
+//#endregion
 //#region src/meta-cognition.ts
 /** 默认配置 */
 const DEFAULT_META_COGNITION_CONFIG = {
@@ -12068,6 +14737,10 @@ var MetaCognitionEngine = class {
 	transportDriftState = /* @__PURE__ */ new Map();
 	/** 27.0：KPI 局部线性趋势滤波器（挂载后异常判定升级为 NIS 假设检验） */
 	kalmanFilters;
+	/** 38.0：KPI 动力学体质序列（attachChaosDiagnostics 后积累） */
+	chaosSeries;
+	/** 38.0：已确立的动力学体质（翻转沿洞察的去重状态） */
+	chaosRegimeState = /* @__PURE__ */ new Map();
 	/** 27.0：各 KPI 的上次门控态（翻转沿触发洞察） */
 	kalmanGateState = /* @__PURE__ */ new Map();
 	/** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
@@ -12192,6 +14865,111 @@ var MetaCognitionEngine = class {
 	/** 27.0：KPI 的当前滤波读数（纯读取；未挂载返回 undefined） */
 	kalmanView(kpi) {
 		return this.kalmanFilters?.get(kpi)?.lastRead;
+	}
+	/**
+	* 38.0：挂载动力学体质诊断（幂等覆盖，挂载即生效）。
+	*
+	* 每个 KPI 序列积累满 minPoints（缺省 96）后做体质分类：混沌
+	* （λ₁ > 0，预测视野 ~1/λ₁ 步）、持续（H > 0.5+δ，趋势自我强化）、
+	* 反持续（H < 0.5−δ，均值回归）、随机漫步（无结构）。体质确立的
+	* 翻转沿产出洞察——**同一份 KPI，三种读法**：混沌序列上精细预测器
+	* 的置信应随视野收窄、持续序列的趋势洞察加权、反持续序列的「突破」
+	* 多半回归。未挂载零漂移。
+	*/
+	attachChaosDiagnostics(options) {
+		const kpis = options?.kpis ?? [
+			"successRate",
+			"avgQuality",
+			"avgLatency",
+			"cacheHitRate"
+		];
+		this.chaosMinPoints = Math.max(64, Math.floor(options?.minPoints ?? 96));
+		this.chaosOptions = {
+			lambdaThreshold: options?.lambdaThreshold,
+			hurstDelta: options?.hurstDelta
+		};
+		this.chaosSeries = /* @__PURE__ */ new Map();
+		this.chaosRegimeState = /* @__PURE__ */ new Map();
+		for (const kpi of kpis) this.chaosSeries.set(kpi, []);
+	}
+	chaosMinPoints = 96;
+	chaosOptions = {};
+	/**
+	* 49.0：挂载多尺度小波视图（幂等覆盖，挂载即生效——纯读数口径）。
+	*
+	* KPI 序列经 Haar 小波分解为对数个正交尺度：最粗趋势（长期水平）、
+	* 中尺度细节（漂移带能量）、最细细节（瞬时突发）——单尺度异常检测
+	* 看不见的「慢漂移 vs 快突发」结构分离。waveletView 给出各尺度能量
+	* 落位；洞察消费留给上层（零漂移：仅新增读数）。
+	*/
+	attachWaveletView(options) {
+		const kpis = options?.kpis ?? [
+			"successRate",
+			"avgQuality",
+			"avgLatency",
+			"cacheHitRate"
+		];
+		this.waveletMinPoints = Math.max(32, Math.floor(options?.minPoints ?? 64));
+		this.waveletSeries = /* @__PURE__ */ new Map();
+		for (const kpi of kpis) this.waveletSeries.set(kpi, []);
+	}
+	waveletSeries;
+	waveletMinPoints = 64;
+	/** 49.0：KPI 的多尺度读数（纯读取；未挂载/未满窗返回 undefined） */
+	waveletView(kpi) {
+		const series = this.waveletSeries?.get(kpi);
+		if (!series || series.length < this.waveletMinPoints) return void 0;
+		return multiScaleView(series);
+	}
+	/** 49.0：序列喂入（observe 的 0.9 段调用；未挂载零开销） */
+	feedWavelet(kpi, value) {
+		const series = this.waveletSeries?.get(kpi);
+		if (!series || !Number.isFinite(value)) return;
+		series.push(value);
+		if (series.length > 256) series.splice(0, series.length - 256);
+	}
+	/** 38.0：KPI 的动力学体质读数（纯读取；未挂载/未满窗返回 undefined） */
+	chaosView(kpi) {
+		const series = this.chaosSeries?.get(kpi);
+		if (!series || series.length < this.chaosMinPoints) return void 0;
+		return dynamicsRegime(series, this.chaosOptions);
+	}
+	/** 38.0：体质分类（满窗后每批快照评估；翻转沿产出洞察） */
+	checkChaos(kpi, value) {
+		const series = this.chaosSeries?.get(kpi);
+		if (!series || !Number.isFinite(value)) return [];
+		series.push(value);
+		if (series.length > 256) series.splice(0, series.length - 256);
+		if (series.length < this.chaosMinPoints) return [];
+		const assessment = dynamicsRegime(series, this.chaosOptions);
+		const last = this.chaosRegimeState.get(kpi);
+		this.chaosRegimeState.set(kpi, assessment.regime);
+		if (last === void 0 || last === assessment.regime || assessment.regime === "stochastic") return [];
+		const hint = {
+			chaotic: {
+				severity: .7,
+				message: `KPI ${kpi} 动力学体质转为混沌（λ₁=${assessment.lyapunov?.toFixed(3)} nat/步 > 0）：误差指数放大，可用预测视野约 ${assessment.forecastHorizonSteps} 步`,
+				suggestion: "收窄 26.0 GP 校准与 2 号预测的信任视野至 ~1/λ₁ 步；混沌不是噪声——加大采样不解决敏感依赖，改用区间/包络口径而非点预测"
+			},
+			persistent: {
+				severity: .55,
+				message: `KPI ${kpi} 呈持续性（H=${assessment.hurst?.toFixed(2)} > 0.5）：趋势自我强化，动量口径成立`,
+				suggestion: "趋势洞察加权：上升沿的健康度下滑更可能是真退化（勿当突发噪声 dismissing）；回落确认需更长证据"
+			},
+			"mean-reverting": {
+				severity: .45,
+				message: `KPI ${kpi} 呈反持续性（H=${assessment.hurst?.toFixed(2)} < 0.5）：均值回归，单点「突破」多半回摆`,
+				suggestion: "突破类洞察降权：等待回归失败（连续越界）再升级；熔断/阈值口径可适度放宽瞬时抖动"
+			}
+		}[assessment.regime];
+		return hint ? [{
+			source: "meta-cognition",
+			category: "dynamics-regime",
+			taskType: void 0,
+			severity: hint.severity,
+			message: hint.message,
+			suggestion: hint.suggestion
+		}] : [];
 	}
 	/** 27.0：NIS 门控检验（每批快照后调用；进入门控的翻转沿产出洞察） */
 	checkKalman(kpi, value) {
@@ -12338,6 +15116,11 @@ var MetaCognitionEngine = class {
 			if (!Number.isFinite(value)) continue;
 			insights.push(...this.checkKalman(kpi, value));
 		}
+		if (this.chaosSeries) for (const kpi of this.chaosSeries.keys()) {
+			const value = kpi === "avgLatency" ? snapshot.avgLatency : kpi === "cacheHitRate" ? snapshot.cacheHitRate : kpi === "successRate" ? snapshot.successRate : snapshot.avgQuality;
+			insights.push(...this.checkChaos(kpi, value));
+		}
+		if (this.waveletSeries) for (const kpi of this.waveletSeries.keys()) this.feedWavelet(kpi, kpi === "avgLatency" ? snapshot.avgLatency : kpi === "cacheHitRate" ? snapshot.cacheHitRate : kpi === "successRate" ? snapshot.successRate : snapshot.avgQuality);
 		if (this.history.length >= 5) {
 			for (const kpi of [
 				"successRate",
@@ -13525,6 +16308,10 @@ var AutonomyLoop = class {
 	capacityAdvisor;
 	/** 28.0：尾部风险顾问（可选注入；心跳 2.7 段消费，缺省零改动） */
 	tailRiskAdvisor;
+	/** 33.0：系统性风险顾问（可选注入；心跳 2.8 段消费，缺省零改动） */
+	systemicRiskAdvisor;
+	/** 41.0：排队网络顾问（可选注入；心跳 2.9 段消费，缺省零改动） */
+	networkAdvisor;
 	worldModel;
 	curiosity;
 	governor;
@@ -13555,6 +16342,8 @@ var AutonomyLoop = class {
 		this.symbiosis = params.symbiosis;
 		this.capacityAdvisor = params.capacityAdvisor;
 		this.tailRiskAdvisor = params.tailRiskAdvisor;
+		this.systemicRiskAdvisor = params.systemicRiskAdvisor;
+		this.networkAdvisor = params.networkAdvisor;
 		this.worldModel = params.worldModel;
 		this.curiosity = params.curiosity;
 		this.governor = params.governor;
@@ -13665,6 +16454,18 @@ var AutonomyLoop = class {
 			if (this.tailRiskAdvisor) {
 				const tailInsights = this.tailRiskAdvisor();
 				if (tailInsights && tailInsights.length > 0) insights.push(...tailInsights);
+			}
+		} catch {}
+		try {
+			if (this.systemicRiskAdvisor) {
+				const systemicInsights = this.systemicRiskAdvisor();
+				if (systemicInsights && systemicInsights.length > 0) insights.push(...systemicInsights);
+			}
+		} catch {}
+		try {
+			if (this.networkAdvisor) {
+				const networkInsights = this.networkAdvisor();
+				if (networkInsights && networkInsights.length > 0) insights.push(...networkInsights);
 			}
 		} catch {}
 		try {
@@ -16990,6 +19791,207 @@ var GpSeriesCalibrator = class {
 	}
 };
 //#endregion
+//#region src/core/spectral-periodicity.ts
+/**
+* 42.0 谱周期内核 —— FFT 周期图 + Fisher g 检验：节律从数据里解出来
+*
+* 动机: 世界模型的「时段热度」是 24 小时直方图——周期被**预设**为一天。
+* 但多模型调度面对的节律不止昼夜：分钟级突发回环、小时级批处理、
+* 周节律——预设直方图看不见它们。谱分析把周期问题变成数据问题:
+*
+*   离散傅里叶变换（Cooley–Tukey 1965, O(n log n)）:
+*     X_k = Σ_t x_t e^{−2πikt/n}
+*   周期图 I_k = |X_k|²——信号能量在频率上的分布（Parseval: ΣI = nΣx²）。
+*
+*   Fisher g 检验（1929）: g = max_k I_k / Σ_k I_k——最大周期图份额；
+*   白噪声下 g 的精确分布已知（P(g > g₀) 递推式），g 显著大 ⟹ 序列
+*   含有**真实周期**而不是抖动。显著周期经谐波重构给出相位感知的
+*   季节因子——「现在处于周期的哪个相位」成为可计算的读数。
+*
+*   调度语义: 到达历史的显著周期 + 相位 → 预测乘上季节因子（该相位
+*   的历史期望权重），时段热度从「预设的小时直方图」升级为「从数据
+*   里解出的频谱」；无显著周期时因子恒 1（诚实无节律）。
+*
+*   验证锚点: FFT 往返恒等（x ↔ FFT⁻¹FFT(x)）、Parseval 定理、已知
+*   周期的频率恢复、纯噪声 g 检验不显著 / 注入周期显著。
+*
+* 零漂移: 未挂载时预测路径与升级前逐位一致。
+*/
+/** 迭代 radix-2 FFT（n 为 2 的幂；原地蝶形，bit 反转重排） */
+function fft(input) {
+	const { re, im } = fftComplex([...input], new Array(input.length).fill(0));
+	return re.map((r, i) => ({
+		re: r,
+		im: im[i]
+	}));
+}
+/** 复数输入的 FFT 核心（ifft 的共轭法依赖它） */
+function fftComplex(reIn, imIn) {
+	const n = reIn.length;
+	if (n === 0) return {
+		re: [],
+		im: []
+	};
+	if ((n & n - 1) !== 0) throw new Error("fft: 长度必须是 2 的幂");
+	const re = [...reIn];
+	const im = [...imIn];
+	for (let i = 1, j = 0; i < n; i += 1) {
+		let bit = n >> 1;
+		for (; j & bit; bit >>= 1) j ^= bit;
+		j |= bit;
+		if (i < j) {
+			[re[i], re[j]] = [re[j], re[i]];
+			[im[i], im[j]] = [im[j], im[i]];
+		}
+	}
+	for (let len = 2; len <= n; len <<= 1) {
+		const ang = -2 * Math.PI / len;
+		const wRe = Math.cos(ang);
+		const wIm = Math.sin(ang);
+		for (let i = 0; i < n; i += len) {
+			let curRe = 1;
+			let curIm = 0;
+			for (let k = 0; k < len / 2; k += 1) {
+				const uRe = re[i + k];
+				const uIm = im[i + k];
+				const vRe = re[i + k + len / 2] * curRe - im[i + k + len / 2] * curIm;
+				const vIm = re[i + k + len / 2] * curIm + im[i + k + len / 2] * curRe;
+				re[i + k] = uRe + vRe;
+				im[i + k] = uIm + vIm;
+				re[i + k + len / 2] = uRe - vRe;
+				im[i + k + len / 2] = uIm - vIm;
+				const nextRe = curRe * wRe - curIm * wIm;
+				curIm = curRe * wIm + curIm * wRe;
+				curRe = nextRe;
+			}
+		}
+	}
+	return {
+		re,
+		im
+	};
+}
+/** 逆 FFT（共轭法：IFFT(X) = conj(FFT(conj(X)))/n，实序列取实部） */
+function ifft(spectrum) {
+	const n = spectrum.length;
+	const { re } = fftComplex(spectrum.map((c) => c.re), spectrum.map((c) => -c.im));
+	return re.map((r) => r / n);
+}
+/**
+* Fisher g 检验上侧概率（精确递推，n_bins = n/2）:
+*   P(g > g₀) = Σ_j (-1)^{j+1} C(m, j) (1 - j·g₀)^{m-1}，j ≤ 1/g₀
+* （Fisher 1929；只取 1 - j·g₀ > 0 的项）
+*/
+function fisherGUpperTail(g, m) {
+	if (!(g > 0) || m < 2) return 1;
+	if (g >= 1) return 0;
+	let p = 0;
+	const binom = (a, b) => {
+		let c = 1;
+		for (let i = 0; i < b; i += 1) c = c * (a - i) / (i + 1);
+		return c;
+	};
+	for (let j = 1; j * g < 1 && j <= m; j += 1) {
+		const term = binom(m, j) * Math.pow(1 - j * g, m - 1);
+		p += j % 2 === 1 ? term : -term;
+	}
+	return Math.min(1, Math.max(0, p));
+}
+/**
+* 周期图 + Fisher g 检验 + 谱峰提取。
+*
+* series: 等间隔采样序列（自动去均值）；lengthPad: 补零目标长度（2 的幂，
+* 缺省不补）。alpha 显著水平（缺省 0.05）。
+*/
+function periodogram(series, options) {
+	const alpha = options?.alpha ?? .05;
+	const topPeaks = options?.topPeaks ?? 3;
+	const n = series.length;
+	if (n < 8 || (n & n - 1) !== 0) {
+		let padded = 8;
+		while (padded < n) padded <<= 1;
+		const mean = series.length > 0 ? series.reduce((a, b) => a + b, 0) / series.length : 0;
+		return analyze([...series.map((x) => x - mean), ...new Array(padded - n).fill(0)], n, alpha, topPeaks);
+	}
+	const mean = series.reduce((a, b) => a + b, 0) / n;
+	return analyze(series.map((x) => x - mean), n, alpha, topPeaks);
+}
+function analyze(centered, originalN, alpha, topPeaks) {
+	const n = centered.length;
+	const spec = fft(centered);
+	const half = Math.floor(n / 2);
+	const pg = [];
+	for (let k = 0; k <= half; k += 1) pg.push(spec[k].re * spec[k].re + spec[k].im * spec[k].im);
+	const total = pg.reduce((a, b) => a + b, 0) || 1;
+	let g = 0;
+	for (let k = 2; k < half; k += 1) {
+		const share = pg[k] / total;
+		if (share > g) g = share;
+	}
+	const m = half - 2;
+	const pValue = fisherGUpperTail(g, m);
+	const significant = pValue < alpha;
+	const peaks = [];
+	if (significant) {
+		const order = Array.from({ length: half - 3 }, (_, i) => i + 2).sort((a, b) => pg[b] - pg[a]);
+		const seen = [];
+		for (const k of order) {
+			if (peaks.length >= topPeaks) break;
+			if (seen.some((s) => Math.max(s, k) % Math.min(s, k) === 0)) continue;
+			seen.push(k);
+			const amplitude = 2 * Math.sqrt(pg[k]) / originalN;
+			const phase = Math.atan2(-spec[k].im, spec[k].re);
+			peaks.push({
+				share: pg[k] / total,
+				period: originalN / k,
+				frequency: k,
+				phase,
+				amplitude
+			});
+		}
+	}
+	return {
+		periodogram: pg,
+		g,
+		pValue,
+		significant,
+		peaks,
+		bins: n
+	};
+}
+/**
+* 季节因子（42.0 接线口径）：给定历史等间隔序列与当前相位 bin，
+* 显著周期时返回「该相位的历史期望权重」（谐波重构，缺省平滑到 1），
+* 无显著周期 / 样本不足返回 1（诚实无节律——零介入）。
+*/
+function seasonalFactor(history, phaseBin) {
+	if (history.length < 16) return {
+		factor: 1,
+		significant: false,
+		period: void 0
+	};
+	const report = periodogram(history);
+	if (!report.significant || report.peaks.length === 0) return {
+		factor: 1,
+		significant: false,
+		period: void 0
+	};
+	const n = history.length;
+	const mean = history.reduce((a, b) => a + b, 0) / n;
+	if (!(mean > 0)) return {
+		factor: 1,
+		significant: false,
+		period: void 0
+	};
+	let value = mean;
+	for (const peak of report.peaks) value += peak.amplitude * Math.cos(2 * Math.PI * peak.frequency * phaseBin / n + peak.phase);
+	return {
+		factor: Math.min(1.6, Math.max(.4, value / mean)),
+		significant: true,
+		period: report.peaks[0].period
+	};
+}
+//#endregion
 //#region src/world-model.ts
 /**
 * world-model.ts — 世界模型（自主智能"预见"支柱）
@@ -17161,7 +20163,7 @@ var WorldModel = class {
 			const ratePerMs = this.recentRate(entry, now);
 			const trend = this.trendOf(entry, now);
 			const trendFactor = trend === "rising" ? 1.25 : trend === "falling" ? .75 : 1;
-			const adjustedRaw = ratePerMs * horizonMs * trendFactor * this.hourFactor(entry, now + horizonMs / 2);
+			const adjustedRaw = ratePerMs * horizonMs * trendFactor * (this.spectralCalendar ? this.spectralFactorOf(entry, now + horizonMs / 2) ?? this.hourFactor(entry, now + horizonMs / 2) : this.hourFactor(entry, now + horizonMs / 2));
 			const confidence = this.calibrationConfidence(type);
 			const gpCorrection = this.gpFor(type)?.predictAt(now);
 			const gpFactor = gpCorrection?.factor ?? 1;
@@ -17351,6 +20353,52 @@ var WorldModel = class {
 		return recent.length / windowMs;
 	}
 	/** 时段热度因子：目标时段计数 / 全天均值 */
+	/**
+	* 42.0：挂载谱日历（幂等覆盖，挂载即生效）。
+	*
+	* 时段热度从「预设为一天的小时直方图」升级为谱分析：到达时间戳按
+	* 小时分桶为时间序列，FFT 周期图 + Fisher g 检验判定是否存在显著
+	* 周期（任意周期——分钟回环/小时批处理/昼夜/周节律）；显著时
+	* predictArrivals 的热度因子切换为谐波重构的季节因子（相位感知），
+	* 不显著时逐位回退原直方图口径。未挂载零漂移。
+	*/
+	attachSpectralCalendar(options) {
+		this.spectralCalendar = { bins: Math.max(32, Math.floor(options?.bins ?? 128)) };
+	}
+	/** 42.0：谱日历配置（未挂载 undefined） */
+	spectralCalendar;
+	/** 42.0：谱季节因子（显著周期时数值；不显著 / 样本不足 → undefined 回退） */
+	spectralFactorOf(entry, targetTimestamp) {
+		const bins = this.spectralCalendar?.bins ?? 128;
+		if (entry.timestamps.length < 16) return void 0;
+		const hourMs = 36e5;
+		const newest = entry.timestamps[entry.timestamps.length - 1];
+		const baseHour = Math.floor(newest / hourMs);
+		const counts = new Array(bins).fill(0);
+		let firstCovered = -1;
+		for (const t of entry.timestamps) {
+			const hourIndex = Math.floor(t / hourMs) - (baseHour - bins + 1);
+			if (hourIndex >= 0 && hourIndex < bins) {
+				counts[hourIndex] += 1;
+				if (firstCovered < 0 || hourIndex < firstCovered) firstCovered = hourIndex;
+			}
+		}
+		if (firstCovered < 0) return void 0;
+		const covered = counts.slice(firstCovered);
+		const seasonal = seasonalFactor(covered, ((Math.floor(targetTimestamp / hourMs) - (baseHour - bins + 1) - firstCovered) % covered.length + covered.length) % covered.length);
+		this.lastSpectral = {
+			bins,
+			samples: entry.timestamps.length,
+			significant: seasonal.significant,
+			periodHours: seasonal.period
+		};
+		return seasonal.significant ? seasonal.factor : void 0;
+	}
+	/** 42.0：谱日历状态（纯读取；未挂载/未评估时 undefined） */
+	getSpectralCalendarStatus() {
+		return this.lastSpectral ? { ...this.lastSpectral } : void 0;
+	}
+	lastSpectral;
 	hourFactor(entry, targetTimestamp) {
 		const total = entry.hourHistogram.reduce((a, b) => a + b, 0);
 		if (total === 0) return 1;
@@ -21447,6 +24495,321 @@ var TailRiskMonitor = class {
 	}
 };
 //#endregion
+//#region src/core/random-matrix.ts
+/**
+* 循环 Jacobi 对称特征分解。
+*
+* 每轮扫描所有非对角 (p,q)，用 Givens 旋转把 A[p][q] 消零；非对角能量
+* 单调下降且二次收敛（经典结果，~6-10 轮到机器精度）。
+*/
+function jacobiEigensym(input, maxSweeps = 30, tol = 1e-12) {
+	const n = input.length;
+	if (n === 0) return {
+		values: [],
+		vectors: []
+	};
+	for (const row of input) if (row.length !== n) throw new Error("jacobiEigensym: 需要方阵");
+	const a = input.map((row) => [...row]);
+	const q = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => i === j ? 1 : 0));
+	for (let sweep = 0; sweep < maxSweeps; sweep += 1) {
+		let offDiag = 0;
+		for (let p = 0; p < n; p += 1) for (let qq = p + 1; qq < n; qq += 1) offDiag += a[p][qq] * a[p][qq];
+		if (offDiag <= tol * tol) break;
+		for (let p = 0; p < n - 1; p += 1) for (let qq = p + 1; qq < n; qq += 1) {
+			if (Math.abs(a[p][qq]) < 1e-300) continue;
+			const theta = (a[qq][qq] - a[p][p]) / (2 * a[p][qq]);
+			const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+			const cos = 1 / Math.sqrt(t * t + 1);
+			const sin = t * cos;
+			for (let k = 0; k < n; k += 1) {
+				const akp = a[k][p];
+				const akq = a[k][qq];
+				a[k][p] = cos * akp - sin * akq;
+				a[k][qq] = sin * akp + cos * akq;
+			}
+			for (let k = 0; k < n; k += 1) {
+				const apk = a[p][k];
+				const aqk = a[qq][k];
+				a[p][k] = cos * apk - sin * aqk;
+				a[qq][k] = sin * apk + cos * aqk;
+			}
+			for (let k = 0; k < n; k += 1) {
+				const qkp = q[k][p];
+				const qkq = q[k][qq];
+				q[k][p] = cos * qkp - sin * qkq;
+				q[k][qq] = sin * qkp + cos * qkq;
+			}
+		}
+	}
+	const order = Array.from({ length: n }, (_, i) => a[i][i]).map((v, i) => ({
+		v,
+		i
+	})).sort((x, y) => y.v - x.v);
+	return {
+		values: order.map((o) => o.v),
+		vectors: order.map((o) => q.map((row) => row[o.i]))
+	};
+}
+/** Marchenko–Pastur 谱边界：γ = p/n ∈ (0,1] 口径（γ > 1 时取 1/γ 的对偶带；σ² 缺省 1） */
+function mpEdges(gamma, sigma2 = 1) {
+	const root = Math.sqrt(Math.min(1, Math.max(1e-9, gamma)));
+	return {
+		lambdaMinus: sigma2 * (1 - root) ** 2,
+		lambdaPlus: sigma2 * (1 + root) ** 2
+	};
+}
+/** 相关系数矩阵（Pearson；零方差序列 → 与一切不相关，行/列置 0、对角 1） */
+function correlationFromSeries(series) {
+	const p = series.length;
+	const n = p > 0 ? series[0].length : 0;
+	const means = series.map((s) => n > 0 ? s.reduce((a, b) => a + b, 0) / n : 0);
+	const vars = series.map((s, i) => {
+		let acc = 0;
+		for (const x of s) acc += (x - means[i]) * (x - means[i]);
+		return acc / Math.max(1, n);
+	});
+	const corr = Array.from({ length: p }, () => Array.from({ length: p }, () => 0));
+	for (let i = 0; i < p; i += 1) {
+		corr[i][i] = 1;
+		for (let j = i + 1; j < p; j += 1) {
+			let cov = 0;
+			for (let t = 0; t < n; t += 1) cov += (series[i][t] - means[i]) * (series[j][t] - means[j]);
+			cov /= Math.max(1, n);
+			const denom = Math.sqrt(vars[i] * vars[j]);
+			const r = denom > 1e-12 ? cov / denom : 0;
+			corr[i][j] = r;
+			corr[j][i] = r;
+		}
+	}
+	return corr;
+}
+/**
+* RMT 特征值清洗（Laloux–Cizeau–Bouchaud / Plerou et al.）。
+*
+* 步骤: 谱分解 → λ < λ+ 的特征值替换为其均值（保迹）→ 重组 → 对角
+* 归一化到 1。输入应已是（准）相关矩阵；ratio = p/n（模型数 / 观测数）。
+*/
+function cleanseCorrelation(matrix, ratio, edgeFactor = 1) {
+	const p = matrix.length;
+	const eigen = jacobiEigensym(matrix);
+	const values = eigen.values;
+	const trace = values.reduce((s, x) => s + x, 0) || p;
+	const { lambdaPlus } = mpEdges(ratio);
+	const edge = edgeFactor * lambdaPlus;
+	const noiseIdx = /* @__PURE__ */ new Set();
+	let noiseSum = 0;
+	for (let i = 0; i < values.length; i += 1) if (values[i] < edge) {
+		noiseIdx.add(i);
+		noiseSum += values[i];
+	}
+	const noiseCount = noiseIdx.size;
+	const replacement = noiseCount > 0 ? noiseSum / noiseCount : 0;
+	const cleansed = values.map((v, i) => noiseIdx.has(i) ? replacement : v);
+	const cleaned = Array.from({ length: p }, () => Array.from({ length: p }, () => 0));
+	for (let k = 0; k < p; k += 1) {
+		const vk = eigen.vectors[k];
+		for (let i = 0; i < p; i += 1) for (let j = i; j < p; j += 1) {
+			const contribution = cleansed[k] * vk[i] * vk[j];
+			cleaned[i][j] += contribution;
+			if (j !== i) cleaned[j][i] += contribution;
+		}
+	}
+	for (let i = 0; i < p; i += 1) {
+		const d = Math.sqrt(Math.max(1e-12, cleaned[i][i]));
+		for (let j = 0; j < p; j += 1) {
+			cleaned[i][j] /= d;
+			cleaned[j][i] /= d;
+		}
+	}
+	return {
+		eigenvalues: values,
+		noiseEdge: edge,
+		noiseCount,
+		topShare: values[0] !== void 0 ? values[0] / trace : 0,
+		signal: values[0] !== void 0 && values[0] > edge,
+		cleaned
+	};
+}
+/**
+* 系统性风险监视器（33.0 接线桥）。
+*
+* 每个观测周期 observe() 一份「各模型本期失败计数」快照；窗口攒满后
+* 每次 assess() 对失败序列做相关矩阵 → RMT 清洗 → 共同因子判定。
+* 纯噪声的伪相关被 MP 边界吸收（不误报）；真因子结构触发 systemic，
+* 头号特征向量给出「谁在同一艘船上」的排序。
+*/
+var SystemicRiskMonitor = class {
+	window;
+	minModels;
+	edgeFactor;
+	systemicShare;
+	ids = [];
+	series = [];
+	filled = false;
+	constructor(config) {
+		this.window = Math.max(8, Math.floor(config?.window ?? 32));
+		this.minModels = Math.max(3, Math.floor(config?.minModels ?? 4));
+		this.edgeFactor = config?.edgeFactor ?? 1.1;
+		this.systemicShare = config?.systemicShare ?? .35;
+	}
+	/** 一期观测：counts 里只登记有活动（Δcalls > 0）的模型，缺席记 null */
+	observe(counts) {
+		for (const id of Object.keys(counts)) if (!this.ids.includes(id)) this.ids.push(id);
+		const row = this.ids.map((id) => {
+			const v = counts[id];
+			return v === void 0 || v === null ? NaN : v;
+		});
+		this.series.push(row);
+		if (this.series.length > this.window) this.series.splice(0, this.series.length - this.window);
+		this.filled = this.series.length >= this.window;
+	}
+	/** 当前窗口是否已攒满（未满时 assess 返回 undefined——先验无知） */
+	get ready() {
+		return this.filled;
+	}
+	/** 观测数（窗口内） */
+	get observations() {
+		return this.series.length;
+	}
+	/**
+	* 评估系统性风险（窗口未满 / 活跃模型不足 → undefined）。
+	*
+	* 缺席（NaN）以该模型窗口均值插补（等价于「本期无信息」的中性口径），
+	* 保证相关矩阵总是良定义。
+	*/
+	assess() {
+		if (!this.filled) return void 0;
+		const p = this.ids.length;
+		const active = [];
+		for (let i = 0; i < p; i += 1) {
+			let present = 0;
+			for (const row of this.series) if (Number.isFinite(row[i])) present += 1;
+			if (present >= 2 / 3 * this.series.length) active.push(i);
+		}
+		if (active.length < this.minModels) return void 0;
+		const corr = correlationFromSeries(active.map((i) => {
+			let sum = 0;
+			let cnt = 0;
+			for (const row of this.series) if (Number.isFinite(row[i])) {
+				sum += row[i];
+				cnt += 1;
+			}
+			const mean = cnt > 0 ? sum / cnt : 0;
+			return this.series.map((row) => Number.isFinite(row[i]) ? row[i] : mean);
+		}));
+		const report = cleanseCorrelation(corr, active.length / this.series.length, this.edgeFactor);
+		const topVec = jacobiEigensym(corr).vectors[0] ?? [];
+		const loading = active.map((idxAbs, k) => ({
+			index: idxAbs,
+			loading: topVec[k] ?? 0
+		})).sort((x, y) => Math.abs(y.loading) - Math.abs(x.loading)).slice(0, 5);
+		return {
+			models: active.length,
+			topEigenvalue: report.eigenvalues[0] ?? 0,
+			noiseEdge: report.noiseEdge,
+			topShare: report.topShare,
+			topLoading: loading,
+			systemic: report.signal && report.topShare >= this.systemicShare,
+			observations: this.series.length
+		};
+	}
+	/** 模型 id（下标口径） */
+	get modelIds() {
+		return [...this.ids];
+	}
+};
+//#endregion
+//#region src/core/queueing-network.ts
+/**
+* 41.0 排队网络内核 —— Jackson 乘积形式 + 串联逗留 + 瓶颈站：吞吐链路成为网络
+*
+* 动机: 25.0 容量规划把「一个模型」当一台 M/M/c 排队机反解并发；但一次
+* 调度要穿过**一条链**：入队 → 模型调用 → 反思回流——端到端延迟与吞吐
+* 上限由整条串联网络决定，瓶颈站在哪一站是排队网络的问题。
+*
+*   Jackson 定理 (1957): 串联（更一般地，乘积形式网络）各站的稳态
+*   边际分布相互独立、每站各自是 M/M/c：
+*     π(n₁,…,n_K) = Π_k π_k(n_k)，π_k 为该站独立的 M/M(c_k) 稳态
+*   → 端到端逗留时间 = Σ_k (Wq_k + 1/μ_k)；**瓶颈站 = ρ 最大者**，
+*     ρ_k = λ/(c_k μ_k) → 1 时全网排队爆炸（其他站再快也无济于事）。
+*
+*   单站口径复用 25.0 的 erlangC（等待概率 / 平均等待闭式）——内核间
+*   协同：25.0 反解「要多少并发」，41.0 回答「链路瓶颈在哪、端到端
+*   要多久」。验证锚点: 两站串联 M/M/1 的边际独立性（模拟对照乘积
+*   形式）、端到端逗留 = 各站之和。
+*
+* 零漂移: 未挂载时心跳与调度行为与升级前逐位一致。
+*/
+/** 串联排队网络分析（Jackson 乘积形式；各站独立 M/M/c 边际） */
+function tandemNetwork(stations) {
+	const metrics = stations.map((s) => {
+		const q = erlangC(s.lambdaPerMs, s.muPerMs, s.servers);
+		return {
+			name: s.name,
+			rho: q.rho,
+			stable: q.stable,
+			avgWaitMs: q.avgWait,
+			avgSojournMs: q.avgWait + 1 / Math.max(1e-12, s.muPerMs),
+			waitProbability: q.waitProbability
+		};
+	});
+	const stable = metrics.every((m) => m.stable);
+	let bottleneck;
+	for (const m of metrics) if (!bottleneck || !m.stable && bottleneck.stable || m.stable === bottleneck.stable && m.rho > bottleneck.rho) bottleneck = m;
+	return {
+		stations: metrics,
+		endToEndSojournMs: stable ? metrics.reduce((s, m) => s + m.avgSojournMs, 0) : Number.POSITIVE_INFINITY,
+		bottleneck,
+		stable
+	};
+}
+/** 网络可稳定的最小服务员配置（逐站反解 ⌈λ/μ⌉ + 1，与 25.0 反解同口径） */
+function minimalStableServers(stations) {
+	return stations.map((s) => Math.ceil(s.lambdaPerMs / Math.max(1e-12, s.muPerMs) - 1e-9) || 1);
+}
+/**
+* Jackson 乘积形式审计（验证锚点）：给定各站队长样本，检验两站边际
+* 的经验相关性 ≈ 0（独立性的有限样本读数）。
+*/
+function jacksonIndependenceAudit(queueSamples) {
+	const n = queueSamples.length;
+	if (n < 8) return {
+		correlation: NaN,
+		samples: n
+	};
+	const xs = queueSamples.map((p) => p[0]);
+	const ys = queueSamples.map((p) => p[1]);
+	const mx = xs.reduce((a, b) => a + b, 0) / n;
+	const my = ys.reduce((a, b) => a + b, 0) / n;
+	let num = 0;
+	let dx = 0;
+	let dy = 0;
+	for (let i = 0; i < n; i += 1) {
+		num += (xs[i] - mx) * (ys[i] - my);
+		dx += (xs[i] - mx) * (xs[i] - mx);
+		dy += (ys[i] - my) * (ys[i] - my);
+	}
+	return {
+		correlation: dx > 0 && dy > 0 ? num / Math.sqrt(dx * dy) : 0,
+		samples: n
+	};
+}
+/** 瓶颈站洞察构造（autonomy-loop 2.9 段消费） */
+function bottleneckInsight(report, rhoThreshold = .85) {
+	const b = report.bottleneck;
+	if (!b || b.stable && b.rho < rhoThreshold) return void 0;
+	if (!b.stable) return {
+		message: `排队网络不可稳定：瓶颈站 ${b.name} 利用率 ρ=${b.rho.toFixed(2)} ≥ 1——到达率超出服务能力，队列无界增长（其他站再快也无济于事）`,
+		suggestion: "立即降载（收紧哨兵聚合 / 降低派发并发）或扩容瓶颈站并发上限；按 minimalStableServers 反解最小可行服务员数",
+		severity: .9
+	};
+	return {
+		message: `排队网络瓶颈站：${b.name} 利用率 ρ=${b.rho.toFixed(2)}（等待概率 ${(b.waitProbability * 100).toFixed(0)}%，端到端逗留 ${Math.round(report.endToEndSojournMs)}ms）——接近饱和，波动将被指数放大`,
+		suggestion: "把下一批低价值信号的派发错峰到瓶颈站冷却后，或上调该站并发上限（其余站有富余）",
+		severity: Math.min(.85, .5 + (b.rho - rhoThreshold) * 2)
+	};
+}
+//#endregion
 //#region src/symbiosis/ledger.ts
 /**
 * ledger.ts — 认知能量账本（共生进化架构第五阶段 1/4）
@@ -22749,6 +26112,127 @@ function curvatureEstimate(f, samples = 200, seed = 20260921) {
 	};
 }
 //#endregion
+//#region src/core/fair-division.ts
+/**
+* 极大极小公平分配（注水算法）。
+*
+* demands: 各方需求（≥ 0）；capacity ≥ 0。需求 ≤ 水位者拿满需求，
+* 超额者在剩余容量中均摊。词典序最优性是构造性保证。
+*/
+function maxMinFair(demands, capacity) {
+	const n = demands.length;
+	const shares = new Array(n).fill(0);
+	const remaining = [...demands.map((d) => Math.max(0, d))];
+	let left = Math.max(0, capacity);
+	let unfilled = remaining.filter((r) => r > 0).length;
+	while (unfilled > 0 && left > 0) {
+		const share = left / unfilled;
+		let progressed = false;
+		for (let i = 0; i < n; i += 1) {
+			if (remaining[i] <= 0) continue;
+			if (remaining[i] <= share + 1e-12) {
+				shares[i] += remaining[i];
+				left -= remaining[i];
+				remaining[i] = 0;
+				unfilled -= 1;
+				progressed = true;
+			}
+		}
+		if (!progressed) {
+			for (let i = 0; i < n; i += 1) if (remaining[i] > 0) shares[i] += share;
+			left = 0;
+		}
+	}
+	const deficit = remaining.reduce((a, b) => a + Math.max(0, b), 0);
+	return {
+		shares,
+		waterLevel: shares.length > 0 ? Math.max(...shares) : 0,
+		deficit
+	};
+}
+/**
+* 加权极大极小公平（progressive filling：各方按权重比例注水）。
+*
+* 份额增长率 ∝ w_i；某方到达需求后退出，其余继续。w_i 全相等时退化为
+* 经典 max-min（等权重是特例——验证锚点之一）。
+*/
+function weightedMaxMinFair(demands, weights, capacity) {
+	const n = demands.length;
+	const w = weights.map((x) => Number.isFinite(x) && x > 0 ? x : 1);
+	const shares = new Array(n).fill(0);
+	const remaining = demands.map((d) => Math.max(0, d));
+	const active = new Set(remaining.map((r, i) => r > 0 ? i : -1).filter((i) => i >= 0));
+	let left = Math.max(0, capacity);
+	while (active.size > 0 && left > 0) {
+		const wSum = [...active].reduce((s, i) => s + w[i], 0);
+		let timeToFill = Infinity;
+		for (const i of active) timeToFill = Math.min(timeToFill, remaining[i] / w[i]);
+		if (timeToFill * wSum <= left) for (const i of active) {
+			shares[i] += timeToFill * w[i];
+			remaining[i] -= timeToFill * w[i];
+			left -= timeToFill * w[i];
+			if (remaining[i] <= 1e-12) {
+				remaining[i] = 0;
+				active.delete(i);
+			}
+		}
+		else {
+			const scale = left / wSum;
+			for (const i of active) shares[i] += scale * w[i];
+			left = 0;
+		}
+	}
+	const deficit = remaining.reduce((a, b) => a + Math.max(0, b), 0);
+	return {
+		shares,
+		waterLevel: shares.length > 0 ? Math.max(...shares) : 0,
+		deficit
+	};
+}
+/**
+* 公平支配性审计（验证锚点）: 极大极小的定义性检查——
+* ∀i: x_i < demand_i（未拿满）⟹ ∃j≠i: x_j/w_j ≤ x_i/w_i 且 x_j > 0
+* （i 的任何增长必挤占一个相对份额不高于自己的持有者）。
+*/
+function fairnessAudit(demands, allocation, weights) {
+	const w = weights ?? demands.map(() => 1);
+	let violations = 0;
+	for (let i = 0; i < demands.length; i += 1) {
+		if (allocation[i] >= demands[i] - 1e-9) continue;
+		const relI = allocation[i] / w[i];
+		if (!demands.some((_, j) => j !== i && allocation[j] > 1e-9 && allocation[j] / w[j] <= relI + 1e-9)) violations += 1;
+	}
+	return {
+		fair: violations === 0,
+		violations
+	};
+}
+/** 域预算接线口径：需求（各域盲区数 × 新颖度权重）→ 加权公平份额（整数保底：活跃域优先各得 1，再按权重注水） */
+function fairDomainBudget(domains, budget) {
+	if (domains.length === 0) return [];
+	const active = domains.filter((d) => d.demand > 0);
+	if (active.length === 0) return domains.map((d) => ({
+		id: d.id,
+		share: 0
+	}));
+	const shares = new Map(domains.map((d) => [d.id, 0]));
+	let left = Math.max(0, Math.floor(budget));
+	for (const d of [...active].sort((a, b) => b.weight - a.weight)) {
+		if (left <= 0) break;
+		const grant = Math.min(1, Math.floor(d.demand));
+		shares.set(d.id, grant);
+		left -= grant;
+	}
+	if (left > 0) {
+		const alloc = weightedMaxMinFair(active.map((d) => Math.max(0, d.demand - (shares.get(d.id) ?? 0))), active.map((d) => d.weight), left);
+		active.forEach((d, i) => shares.set(d.id, (shares.get(d.id) ?? 0) + Math.floor(alloc.shares[i])));
+	}
+	return domains.map((d) => ({
+		id: d.id,
+		share: shares.get(d.id) ?? 0
+	}));
+}
+//#endregion
 //#region src/curiosity-engine.ts
 /**
 * curiosity-engine.ts — 好奇心引擎（自主智能"内在动机"支柱）
@@ -22935,6 +26419,17 @@ var CuriosityEngine = class CuriosityEngine {
 		this.submodularSelector = { coverageStrength: options?.coverageStrength ?? .7 };
 	}
 	submodularSelector;
+	/**
+	* 44.0：挂载公平预算（幂等覆盖，挂载即生效）。
+	*
+	* 探索预算按域（taskType）加权极大极小分配（新颖度权重 + 注水算法，
+	* 词典序最优）：热门域可以多拿，但任何活跃域的相对份额不被压扁——
+	* 探索的覆盖有公平定理背书（多样性坍缩在预算层上锁）。未挂载零漂移。
+	*/
+	attachFairBudget() {
+		this.fairBudget = true;
+	}
+	fairBudget = false;
 	/** 30.0：任务类型 → token 集（主题 = 共享 token；camelCase 与连字符统一拆分） */
 	static tokenize(taskType) {
 		return taskType.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 2);
@@ -22961,6 +26456,48 @@ var CuriosityEngine = class CuriosityEngine {
 			noveltyScore: gap.noveltyScore,
 			expectedGain: this.describeGain(gap)
 		}));
+		if (this.fairBudget) {
+			const familyOf = (taskType) => taskType.split(/[-_\s]/)[0] || taskType;
+			const byDomain = /* @__PURE__ */ new Map();
+			for (const gap of gaps) {
+				const family = familyOf(gap.taskType);
+				const bucket = byDomain.get(family) ?? [];
+				bucket.push(gap);
+				byDomain.set(family, bucket);
+			}
+			const shares = new Map(fairDomainBudget([...byDomain.entries()].map(([id, list]) => ({
+				id,
+				demand: list.length,
+				weight: Math.max(1e-6, list.reduce((s, g) => s + g.noveltyScore, 0) / list.length)
+			})), budget).map((s) => [s.id, Math.floor(s.share)]));
+			const proposals = [];
+			const domainsSorted = [...byDomain.entries()].sort((a, b) => shares.get(b[0]) - shares.get(a[0]));
+			for (const [domain, list] of domainsSorted) {
+				const take = Math.min(list.length, shares.get(domain) ?? 0);
+				for (const gap of [...list].sort((a, b) => b.noveltyScore - a.noveltyScore).slice(0, take)) proposals.push({
+					taskType: gap.taskType,
+					description: this.describeExploration(gap),
+					noveltyScore: gap.noveltyScore,
+					expectedGain: this.describeGain(gap)
+				});
+			}
+			if (proposals.length < budget) {
+				const taken = new Set(proposals.map((p) => p.taskType + p.description));
+				for (const gap of [...gaps].sort((a, b) => b.noveltyScore - a.noveltyScore)) {
+					if (proposals.length >= budget) break;
+					const key = gap.taskType + this.describeExploration(gap);
+					if (taken.has(key)) continue;
+					taken.add(key);
+					proposals.push({
+						taskType: gap.taskType,
+						description: this.describeExploration(gap),
+						noveltyScore: gap.noveltyScore,
+						expectedGain: this.describeGain(gap)
+					});
+				}
+			}
+			return proposals.slice(0, budget);
+		}
 		if (this.submodularSelector) {
 			const order = lazyGreedy(coverageFromTokens(gaps.map((gap) => ({
 				tokens: CuriosityEngine.tokenize(gap.taskType),
@@ -23294,6 +26831,133 @@ function severityRank(severity) {
 	return severity === "critical" ? 3 : severity === "warn" ? 2 : 1;
 }
 //#endregion
+//#region src/core/first-passage.ts
+/**
+* 40.0 首达时间内核 —— 反射原理 + 逆高斯 + 赌徒破产：等待恢复有了概率价格
+*
+* 动机: 熔断器打开后的冷却时间是配置魔数（cooldownMs 定值）。但「多久
+* 才敢再试」是随机过程的首达问题——失败率的恢复是带漂移的随机游走，
+* 过早重试 = 高概率再次击穿（熔断风暴），过晚 = 无谓的可用性损失。
+*
+*   反射原理（Brownian 对称性）: P(sup_{s≤t} W_s ≥ a) = 2·P(W_t ≥ a)
+*     —— 最大值分布从端点分布一步读出；无漂移随机游走重越阈值 a 的
+*     概率 = 2(1 − Φ(a/(σ√t)))，闭式。
+*
+*   带漂移首达（逆高斯）: dX = μ ds + σ dW 从 0 出发首达 a > 0 的
+*     时间 T ~ IG(均值 a/μ, 形状 a²/σ²)——密度闭式、期望闭式；
+*     μ ≤ 0 时首达概率 < 1（可能永不到达——诚实区分「会恢复」与
+*     「结构性恶化」）。
+*
+*   离散口径（赌徒破产）: 每步 ±1 概率 p/q，从 i 出发触 N 先于 0 的
+*     概率（p≠q 闭式 (1−(q/p)^i)/(1−(q/p)^N)；p=1/2 时 i/N——公平
+*     游走的经典）。
+*
+*   冷却定价: 从观察到的失败间隔估计 (μ̂, σ̂)，解首达概率
+*     P(T_recover ≤ cooldown) ≥ target 的最小 cooldown——熔断冷却从
+*     魔数升维为「以 target 概率确信已恢复」的定价。
+*
+* 零漂移: 未挂载时熔断与治理行为与升级前逐位一致。
+*/
+/** 标准正态 CDF（erf 近似，Abramowitz–Stegun 7.1.26；模块私有——公共口径见 gaussian-process.ts 的 normalCdf） */
+function normalCdf$1(x) {
+	const sign = x < 0 ? -1 : 1;
+	const z = Math.abs(x) / Math.SQRT2;
+	const t = 1 / (1 + .3275911 * z);
+	return .5 * (1 + sign * (1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - .284496736) * t + .254829592) * t * Math.exp(-z * z)));
+}
+/**
+* 反射原理: 无漂移 Brownian（方差率 σ²）在 (0, t] 内上穿阈值 a > 0 的概率。
+*
+* P(sup W_s ≥ a) = 2(1 − Φ(a/(σ√t)))——与端点分布的解析恒等式
+* （验证脚本用离散模拟对照）。
+*/
+function reflectionMaxProb(threshold, horizon, sigma = 1) {
+	if (!(threshold > 0) || !(horizon > 0)) return 0;
+	return Math.min(1, Math.max(0, 2 * (1 - normalCdf$1(threshold / (sigma * Math.sqrt(horizon))))));
+}
+/** 逆高斯密度: dX = μ ds + σ dW 首达 a > 0 的时间分布（μ > 0） */
+function inverseGaussianPdf(t, mean, shape) {
+	if (t <= 0 || !(mean > 0) || !(shape > 0)) return 0;
+	const lambda = shape;
+	return Math.sqrt(lambda / (2 * Math.PI * t * t * t)) * Math.exp(-lambda * (t - mean) * (t - mean) / (2 * mean * mean * t));
+}
+/** 逆高斯 CDF（闭式，Chhikara–Folks）：F(t) = Φ(√(λ/t)(t−μ)/μ) + e^{2λ/μ}Φ(−√(λ/t)(t+μ)/μ) */
+function inverseGaussianCdf(t, mean, shape) {
+	if (t <= 0 || !(mean > 0) || !(shape > 0)) return 0;
+	const root = Math.sqrt(shape / t);
+	const first = normalCdf$1(root * (t - mean) / mean);
+	const second = Math.exp(2 * shape / mean) * normalCdf$1(-root * (t + mean) / mean);
+	return Math.min(1, Math.max(0, first + second));
+}
+/** 赌徒破产: 从 i 出发、触 N 先于 0 的概率（步进 ±1，上行概率 p） */
+function gamblerRuin(i, n, p) {
+	if (n <= 0 || i <= 0 || i >= n) return i >= n ? 1 : 0;
+	if (Math.abs(p - .5) < 1e-12) return i / n;
+	const ratio = (1 - p) / p;
+	return (1 - Math.pow(ratio, i)) / (1 - Math.pow(ratio, n));
+}
+/**
+* 冷却定价（40.0 接线口径）。
+*
+* failureIntervals: 观察到的相邻失败间隔（时间单位任意，一致即可）。
+* 「恢复」被建模为失败强度游走下行首达阈值 a（缺省 = 间隔均值的一半，
+* 即失败频率减半）：μ̂/σ̂ 由间隔序列的均值/标准差估计（间隔上升 =
+* 恢复方向）。recommendedCooldown 二分求解。
+*/
+function firstPassageCooldown(failureIntervals, options) {
+	const n = failureIntervals.length;
+	if (n < 3) return void 0;
+	const mean = failureIntervals.reduce((s, x) => s + x, 0) / n;
+	let ss = 0;
+	for (const x of failureIntervals) ss += (x - mean) * (x - mean);
+	const sigma = Math.sqrt(ss / Math.max(1, n - 1));
+	const a = options?.threshold ?? mean / 2;
+	const target = Math.min(.99, Math.max(.5, options?.targetProb ?? .9));
+	if (!(a > 0) || !(sigma > 0)) return void 0;
+	let sxy = 0;
+	let sxx = 0;
+	for (let i = 0; i < n; i += 1) {
+		sxy += (i - (n - 1) / 2) * (failureIntervals[i] - mean);
+		sxx += (i - (n - 1) / 2) * (i - (n - 1) / 2);
+	}
+	const mu = sxx > 0 ? sxy / sxx : 0;
+	if (mu > 0) {
+		const m = a / mu;
+		const shape = a * a / (sigma * sigma);
+		let lo = m * .2;
+		let hi = Math.max(m * 5, 1);
+		while (inverseGaussianCdf(hi, m, shape) < target && hi < m * 1e6) hi *= 2;
+		if (inverseGaussianCdf(hi, m, shape) >= target) {
+			for (let k = 0; k < 60; k += 1) {
+				const mid = (lo + hi) / 2;
+				if (inverseGaussianCdf(mid, m, shape) >= target) hi = mid;
+				else lo = mid;
+			}
+			return {
+				mu,
+				sigma,
+				probByHorizon: inverseGaussianCdf(hi, m, shape),
+				expectedTime: m,
+				recommendedCooldown: hi
+			};
+		}
+		return {
+			mu,
+			sigma,
+			probByHorizon: inverseGaussianCdf(hi, m, shape),
+			expectedTime: m,
+			recommendedCooldown: hi
+		};
+	}
+	return {
+		mu,
+		sigma,
+		probByHorizon: 0,
+		expectedTime: void 0,
+		recommendedCooldown: void 0
+	};
+}
+//#endregion
 //#region src/safety-governor.ts
 /**
 * safety-governor.ts — 安全治理器（自主智能"边界"支柱）
@@ -23364,6 +27028,12 @@ var SafetyGovernor = class {
 	circuitState = "closed";
 	consecutiveFailures = 0;
 	circuitOpenedAt = 0;
+	/** 40.0：失败时间戳（attachFirstPassageAdvisor 后记录；首达定价原料） */
+	failureTimestamps = [];
+	/** 40.0：首达冷却配置（未挂载 undefined——零记录零介入） */
+	firstPassage;
+	/** 40.0：最近一次首达定价读数（breaker 打开时刷新） */
+	lastFirstPassage;
 	/** 4.0：半开试探互斥（探测在途时其余动作继续拒绝） */
 	halfOpenProbeInFlight = false;
 	/** Kill Switch */
@@ -23519,6 +27189,37 @@ var SafetyGovernor = class {
 		return verdict;
 	}
 	/**
+	* 40.0：挂载首达时间冷却定价（幂等覆盖，挂载即生效）。
+	*
+	* 熔断打开时的冷却从配置魔数升维为概率定价：观察到的相邻失败间隔
+	* （恢复方向的漂移 μ̂ 与波动 σ̂）喂入逆高斯首达模型，二分解出
+	* 「P(失败强度恢复 ≤ cooldown) ≥ targetProb」的最小冷却。μ̂ ≤ 0
+	* （结构性恶化）时诚实给出 undefined——再等也不会自己好。定价为
+	* 建议口径（半开转换时序仍由既有状态机治理）；未挂载零记录零介入。
+	*/
+	attachFirstPassageAdvisor(options) {
+		this.firstPassage = { targetProb: Math.min(.99, Math.max(.5, options?.targetProb ?? .9)) };
+	}
+	/** 40.0：最近一次首达定价读数（纯读取；未挂载/未打开过熔断返回 undefined） */
+	firstPassageView() {
+		return this.lastFirstPassage ? { ...this.lastFirstPassage } : void 0;
+	}
+	/** 40.0：从失败间隔序列做首达定价（breaker 打开沿调用） */
+	assessFirstPassage() {
+		if (!this.firstPassage || this.failureTimestamps.length < 4) return;
+		const intervals = [];
+		for (let i = 1; i < this.failureTimestamps.length; i += 1) intervals.push(Math.max(1, this.failureTimestamps[i] - this.failureTimestamps[i - 1]));
+		const estimate = firstPassageCooldown(intervals, { targetProb: this.firstPassage.targetProb });
+		if (!estimate || estimate.recommendedCooldown === void 0) return;
+		this.lastFirstPassage = {
+			recommendedCooldownMs: estimate.recommendedCooldown,
+			expectedRecoverMs: estimate.expectedTime ?? estimate.recommendedCooldown,
+			mu: estimate.mu,
+			sigma: estimate.sigma,
+			targetProb: this.firstPassage.targetProb
+		};
+	}
+	/**
 	* 回写动作结果（驱动熔断器与预算统计）
 	* @param success 动作是否成功
 	* @param tokensUsed 本次消耗 token
@@ -23536,6 +27237,8 @@ var SafetyGovernor = class {
 			}
 		} else {
 			this.consecutiveFailures += 1;
+			if (this.firstPassage) this.failureTimestamps.push(Date.now());
+			if (this.failureTimestamps.length > 64) this.failureTimestamps.splice(0, this.failureTimestamps.length - 64);
 			this.emit("action-failed", { consecutiveFailures: this.consecutiveFailures });
 			if (this.circuitState === "half-open") {
 				this.halfOpenProbeInFlight = false;
@@ -23545,6 +27248,7 @@ var SafetyGovernor = class {
 			} else if (this.consecutiveFailures >= this.config.circuitFailureThreshold && this.circuitState !== "open") {
 				this.circuitState = "open";
 				this.circuitOpenedAt = Date.now();
+				this.assessFirstPassage();
 				this.emit("breaker-opened", { via: `consecutive-failures-${this.consecutiveFailures}` });
 			}
 		}
@@ -26979,6 +30683,84 @@ function apply(ctx, config) {
 		curiosity.attachSubmodularSelector({ coverageStrength: cfg.autonomy.submodular.coverageStrength });
 		logger.info("30.0 次模内核已挂载：探索预算加权覆盖贪心（coverageStrength=%s）", cfg.autonomy.submodular.coverageStrength ?? .7);
 	}
+	if (cfg.autonomy?.hedgePortfolio?.enabled === true) {
+		modelScheduler.attachHedgePortfolio({
+			eta: cfg.autonomy.hedgePortfolio.eta,
+			alpha: cfg.autonomy.hedgePortfolio.alpha
+		});
+		logger.info("31.0 对抗组合内核已挂载：Fixed-Share Hedge（eta=%s, alpha=%s）", cfg.autonomy.hedgePortfolio.eta ?? .3, cfg.autonomy.hedgePortfolio.alpha ?? .05);
+	}
+	if (cfg.autonomy?.optimalAssignment?.enabled === true) {
+		taskExecutor.attachOptimalAssignment({ candidateCap: cfg.autonomy.optimalAssignment.candidateCap });
+		logger.info("32.0 全局指派内核已挂载：批内匈牙利最优指派（candidateCap=%s）", cfg.autonomy.optimalAssignment.candidateCap ?? 8);
+	}
+	if (cfg.autonomy?.cvarTimeouts?.enabled === true) {
+		llm.attachCvarTimeouts({
+			alpha: cfg.autonomy.cvarTimeouts.alpha,
+			margin: cfg.autonomy.cvarTimeouts.margin,
+			minSamples: cfg.autonomy.cvarTimeouts.minSamples,
+			floorMs: cfg.autonomy.cvarTimeouts.floorMs,
+			capMs: cfg.autonomy.cvarTimeouts.capMs
+		});
+		logger.info("34.0 分布鲁棒内核已挂载：CVaR 超时预算（alpha=%s, margin=%s, minSamples=%s）", cfg.autonomy.cvarTimeouts.alpha ?? .95, cfg.autonomy.cvarTimeouts.margin ?? 1.5, cfg.autonomy.cvarTimeouts.minSamples ?? 30);
+	}
+	if (cfg.autonomy?.concurrencyControl?.enabled === true) {
+		modelScheduler.attachConcurrencyController({
+			target: cfg.autonomy.concurrencyControl.target,
+			plantGain: cfg.autonomy.concurrencyControl.plantGain,
+			r: cfg.autonomy.concurrencyControl.r,
+			deadband: cfg.autonomy.concurrencyControl.deadband
+		});
+		logger.info("35.0 反馈控制内核已挂载：并发闭环 LQR（target=%s, plantGain=%s）", cfg.autonomy.concurrencyControl.target ?? .75, cfg.autonomy.concurrencyControl.plantGain ?? .4);
+	}
+	if (cfg.autonomy?.informationBottleneck?.enabled === true) {
+		reflector.attachBottleneckDistiller({
+			beta: cfg.autonomy.informationBottleneck.beta,
+			retentionFloor: cfg.autonomy.informationBottleneck.retentionFloor
+		});
+		logger.info("37.0 信息瓶颈内核已挂载：蒸馏信息定价（beta=%s, retentionFloor=%s）", cfg.autonomy.informationBottleneck.beta ?? 5, cfg.autonomy.informationBottleneck.retentionFloor ?? .4);
+	}
+	if (cfg.autonomy?.chaosDiagnostics?.enabled === true) {
+		metaCognition.attachChaosDiagnostics({
+			minPoints: cfg.autonomy.chaosDiagnostics.minPoints,
+			lambdaThreshold: cfg.autonomy.chaosDiagnostics.lambdaThreshold,
+			hurstDelta: cfg.autonomy.chaosDiagnostics.hurstDelta
+		});
+		logger.info("38.0 非线性动力学内核已挂载：KPI 体质分类（minPoints=%s, λ阈值=%s）", cfg.autonomy.chaosDiagnostics.minPoints ?? 96, cfg.autonomy.chaosDiagnostics.lambdaThreshold ?? .05);
+	}
+	if (cfg.autonomy?.spectralRanking?.enabled === true) {
+		memoryGraph.attachInfluenceRanking({ damping: cfg.autonomy.spectralRanking.damping });
+		logger.info("39.0 谱排序内核已挂载：知识图 PageRank 骨架（damping=%s）", cfg.autonomy.spectralRanking.damping ?? .85);
+	}
+	if (cfg.autonomy?.firstPassageCooldown?.enabled === true) {
+		governor.attachFirstPassageAdvisor({ targetProb: cfg.autonomy.firstPassageCooldown.targetProb });
+		logger.info("40.0 首达时间内核已挂载：熔断冷却定价（targetProb=%s）", cfg.autonomy.firstPassageCooldown.targetProb ?? .9);
+	}
+	if (cfg.autonomy?.spectralCalendar?.enabled === true) {
+		worldModel.attachSpectralCalendar({ bins: cfg.autonomy.spectralCalendar.bins });
+		logger.info("42.0 谱周期内核已挂载：FFT 周期图 + Fisher g 节律检验（bins=%s）", cfg.autonomy.spectralCalendar.bins ?? 128);
+	}
+	if (cfg.autonomy?.capacityFrontier?.enabled === true) {
+		modelScheduler.attachCapacityFrontier();
+		logger.info("43.0 最大流内核已挂载：容量前沿诊断（max-flow / min-cut 归因）");
+	}
+	if (cfg.autonomy?.fairBudget?.enabled === true) {
+		curiosity.attachFairBudget();
+		logger.info("44.0 公平分配内核已挂载：探索预算加权极大极小注水");
+	}
+	if (cfg.autonomy?.ocbaAllocator?.enabled === true) {
+		benchmark.attachOcbaAllocator({ confirmationBudget: cfg.autonomy.ocbaAllocator.confirmationBudget });
+		logger.info("45.0 OCBA 内核已挂载：基准瓶颈聚焦（confirmationBudget=%s）", cfg.autonomy.ocbaAllocator.confirmationBudget ?? 200);
+	}
+	if (cfg.autonomy?.waveletView?.enabled === true) {
+		metaCognition.attachWaveletView({ minPoints: cfg.autonomy.waveletView.minPoints });
+		logger.info("49.0 多尺度内核已挂载：KPI 小波视图（minPoints=%s）", cfg.autonomy.waveletView.minPoints ?? 64);
+	}
+	if (cfg.autonomy?.latentFactors?.enabled === true) {
+		modelScheduler.attachLatentFactors({ rank: cfg.autonomy.latentFactors.rank });
+		const report = modelScheduler.getLatentFactorReport();
+		logger.info("50.0 矩阵补全内核已挂载：能力潜因子（rank=%s, lowRankShare=%s）", cfg.autonomy.latentFactors.rank ?? 3, report ? report.lowRankShare.toFixed(2) : "—");
+	}
 	/** KPI 采集器：从真实引擎状态聚合 KPI 快照 */
 	const collectKpi = () => {
 		const modelStatuses = llm.getModelStatuses();
@@ -27249,6 +31031,72 @@ function apply(ctx, config) {
 		return insights;
 	};
 	if (tailRiskEnabled) logger.info("28.0 极值理论内核已启用：心跳 2.7 段 POT/GPD 尾部外推（targetP99Ms=%s, minSamples=%s）", tailRiskTargetMs, tailRiskMinSamples);
+	const rmtEnabled = cfg.autonomy?.randomMatrix?.enabled === true;
+	const systemicRiskMonitor = new SystemicRiskMonitor({
+		window: cfg.autonomy?.randomMatrix?.window,
+		minModels: cfg.autonomy?.randomMatrix?.minModels,
+		edgeFactor: cfg.autonomy?.randomMatrix?.edgeFactor,
+		systemicShare: cfg.autonomy?.randomMatrix?.systemicShare
+	});
+	/** 各模型上期快照（失败计数差分的基准） */
+	const rmtLastSnapshot = /* @__PURE__ */ new Map();
+	const runSystemicRiskAssessment = () => {
+		if (!rmtEnabled) return [];
+		const counts = {};
+		for (const status of llm.getModelStatuses()) {
+			const prev = rmtLastSnapshot.get(status.id);
+			rmtLastSnapshot.set(status.id, {
+				totalCalls: status.totalCalls,
+				successCount: status.successCount
+			});
+			if (!prev || status.totalCalls < prev.totalCalls) continue;
+			const deltaCalls = status.totalCalls - prev.totalCalls;
+			if (deltaCalls <= 0) continue;
+			const deltaSuccess = Math.max(0, status.successCount - prev.successCount);
+			counts[status.id] = deltaCalls - deltaSuccess;
+		}
+		systemicRiskMonitor.observe(counts);
+		const assessment = systemicRiskMonitor.assess();
+		if (!assessment || !assessment.systemic) return [];
+		const ids = systemicRiskMonitor.modelIds;
+		const exposed = assessment.topLoading.slice(0, 3).map((l) => ids[l.index]).filter((id) => Boolean(id));
+		return [{
+			source: "meta-cognition",
+			category: "systemic-risk",
+			taskType: void 0,
+			severity: Math.min(.9, .5 + .4 * Math.min(1, assessment.topShare)),
+			message: `系统性风险：${assessment.models} 个模型的失败相关矩阵头号特征值 ${assessment.topEigenvalue.toFixed(2)} 显著超出 Marchenko–Pastur 噪声带 ${assessment.noiseEdge.toFixed(2)}（解释份额 ${(assessment.topShare * 100).toFixed(0)}%，共同因子暴露最深：${exposed.join(" / ") || "—"}）——这些模型会同沉浮，当前冗余是统计幻觉`,
+			suggestion: "把热备与分流的候选池按共同因子拆开（跨厂商/跨上游各留一席）；对暴露最深的模型降低关键任务的并发占比，防止一个上游故障串联击穿"
+		}];
+	};
+	if (rmtEnabled) logger.info("33.0 随机矩阵内核已启用：心跳 2.8 段 MP 清洗 + 系统性风险（window=%s, minModels=%s）", cfg.autonomy?.randomMatrix?.window ?? 32, cfg.autonomy?.randomMatrix?.minModels ?? 4);
+	const queueingEnabled = cfg.autonomy?.queueingNetwork?.enabled === true;
+	const queueingRhoThreshold = cfg.autonomy?.queueingNetwork?.rhoThreshold ?? .85;
+	const runQueueingAssessment = () => {
+		if (!queueingEnabled) return [];
+		const statuses = llm.getModelStatuses().filter((s) => s.maxConcurrency > 0);
+		if (statuses.length === 0) return [];
+		const horizonMs = 3e5;
+		const predictedPerMs = worldModel.predictArrivals(horizonMs).reduce((s, p) => s + p.expectedCount, 0) / horizonMs;
+		if (!(predictedPerMs > 0)) return [];
+		const totalActive = statuses.reduce((s, st) => s + st.activeRequests, 0);
+		const verdict = bottleneckInsight(tandemNetwork(statuses.map((st) => ({
+			name: st.id,
+			lambdaPerMs: totalActive > 0 ? predictedPerMs * (st.activeRequests / totalActive) : predictedPerMs / statuses.length,
+			muPerMs: 1 / Math.max(1, st.robustAvgLatencyMs ?? st.avgLatency),
+			servers: st.maxConcurrency
+		}))), queueingRhoThreshold);
+		if (!verdict) return [];
+		return [{
+			source: "meta-cognition",
+			category: "capacity-flow",
+			taskType: void 0,
+			severity: verdict.severity,
+			message: verdict.message,
+			suggestion: verdict.suggestion
+		}];
+	};
+	if (queueingEnabled) logger.info("41.0 排队网络内核已启用：心跳 2.9 段瓶颈站评估（rhoThreshold=%s）", queueingRhoThreshold);
 	const autonomyLoop = new AutonomyLoop({
 		config: {
 			...cfg.autonomy?.loop,
@@ -27285,6 +31133,8 @@ function apply(ctx, config) {
 		dispatchExploration,
 		capacityAdvisor: capacityPlanner ? runCapacityPlanning : void 0,
 		tailRiskAdvisor: tailRiskEnabled ? runTailRiskAssessment : void 0,
+		systemicRiskAdvisor: rmtEnabled ? runSystemicRiskAssessment : void 0,
+		networkAdvisor: queueingEnabled ? runQueueingAssessment : void 0,
 		policyEvolution: policyEvolutionEnabled && !futarchyEnabled ? { runEvolutionCycle: runPolicyEvolutionCycle } : void 0,
 		metaCognitionBridge: metaLayerEnabled ? { runMetaCycle: async () => {
 			const adjustment = await metaController.evaluateAndAdjust();
@@ -27762,7 +31612,9 @@ function apply(ctx, config) {
 					"curiosity",
 					"governance",
 					"introspect",
-					"keys"
+					"keys",
+					"topology",
+					"influence"
 				]
 			},
 			limit: {
@@ -27826,6 +31678,12 @@ function apply(ctx, config) {
 					sources: Object.fromEntries(mergedModels.map((m) => [m.id, describeKeySources(m.id)]))
 				};
 				case "introspect": return { introspection: autonomyLoop.introspect() };
+				case "topology": return { topography: memoryGraph.knowledgeTopography(typeof args.limit === "number" && args.limit > 0 && args.limit < 1 ? args.limit : .2) };
+				case "influence": return {
+					influential: memoryGraph.topInfluential(typeof args.limit === "number" ? args.limit : 8),
+					attached: cfg.autonomy?.spectralRanking?.enabled === true,
+					hint: cfg.autonomy?.spectralRanking?.enabled === true ? void 0 : "autonomy.spectralRanking.enabled=true 后 related() 联想序升级为影响力加权"
+				};
 				default: throw new ToolError(`未知 query_type: ${args.query_type}`);
 			}
 		}
@@ -28730,4 +32588,4 @@ Object.defineProperty(pluginEntry, "name", { value: name });
 pluginEntry.Config = Config;
 pluginEntry.provide = ["scheduler", "schedulerTools"];
 //#endregion
-export { AbstractionEngine, AgentBase, AliasMap, AnytimeEvidenceRegistry, AnytimeEvidenceStream, AppError, AutonomyLoop, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, BayesianOptimizer, BeliefMarket, BenchmarkEngine, BwKRouter, CHANNEL_GROUPS, CapacityPlanner, CausalKernel, CellularSheaf, CircuitBreaker, CircuitBreakerRegistry, CognitiveMarket, Config, ConfigError, ConformalIntervalEngine, CoverageDriftMonitor, CryptoEngine, CryptoError, CuriosityEngine, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_GP_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_TAIL_RISK_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_TREND_FILTER_CONFIG, DEFAULT_UCT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, DecisionEngine, DeliberationEngine, DistributedSync, EProcess, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EnergyLedger, EvolverAgent, ExecutionError, FisherGeometryEngine, FreeEnergyEngine, GaussianProcess, GittinsIndexTable, GoalEngine, GpSeriesCalibrator, HotReloadEngine, INCINERATOR, IndexScheduler, JsonMemoryBackend, KalmanFilter, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMError, LocalLinearTrendFilter, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, MapElitesArchive, MemoryAgent, MemoryError, MemoryGraph, MetaCognitionEngine, MetaCognitiveController, MigrationTool, ModelAgent, ModelScheduler, NetworkError, OpportunityStopper, Optimizer, OptimizerAgent, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PolicyEvolver, PolicySimulator, PrivacyAccountant, ProgressBroadcaster, RDP_ORDER, RaftEngine, RationalMetareasoner, ReflectionEngine, Reflector, RobustStream, RuntimeVerifier, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafetyGovernor, SafetyMonitor, Sandbox, ScientistMind, SelfModel, Sentinel, ShapleyAttributionEngine, SqliteMemoryBackend, StrategyEvolutionEngine, SymbiosisBridge, SymbiosisRuntime, TREASURY, TailRiskMonitor, TaskExecutor, TenantManager, TheoristEngine, TimeoutError, ToolError, ToolRegistry, TransportDriftMonitor, UctSearch, WeightedCoverage, WorldModel, abortableSleep, apply, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, brussOddsIndex, bruteForceBest, budgetedGreedy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, catoniMean, chiSquareQuantile, cholesky, choleskyLower, classifyError, coalitionValue, computeHomeostasis, conditionNumber, conformalQuantile, cosineSimilarity, coverageFromTokens, createBaselinePolicy, createMemoryBackend, curvatureEstimate, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, dpHistogram, dpMeanClamped, dpValue, eBenjaminiHochberg, empiricalQuantile, emptyMemoryStore, erlangC, evaluateMemoryCondition, evidenceRankScore, expectedImprovement, extractReplayTasks, fitGpd, fixedSampleUpperBound, gaussianNoise, generateAdversarialTasks, gpdCdf, hillEstimator, initEvidence, isTradeListener, kingmanWq, laplaceNoise, lazyGreedy, lessonsToInsights, listingsOf, littleCheck, lnGamma, madSigma, matchesMemoryConditions, meanExcessCurve, medianOfMeans, modelAgentId, modelSignalKey, mulberry32, name, normalCdf, normalPdf, normalizePolicyParams, observeEvidence, overlapSheaf, parseJSONLoose, participationRatio, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, potQuantiles, prophetValue, quantileSorted, randomWalkSteadyState, rdpToEpsilon, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, shrinkageCovariance, sinkhorn, solveCholesky, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, submodularityCheck, toSparseVector, tokenizeChinese, wasserstein1D, wassersteinBarycenter1D, wilsonLowerBound };
+export { AbstractionEngine, AgentBase, AliasMap, AnytimeEvidenceRegistry, AnytimeEvidenceStream, AppError, AutonomyLoop, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, BayesianOptimizer, BeliefMarket, BenchmarkEngine, BwKRouter, CHANNEL_GROUPS, CapacityPlanner, CausalKernel, CellularSheaf, CircuitBreaker, CircuitBreakerRegistry, CognitiveMarket, Config, ConfigError, ConformalIntervalEngine, CoverageDriftMonitor, CryptoEngine, CryptoError, CuriosityEngine, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_GP_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_TAIL_RISK_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_TREND_FILTER_CONFIG, DEFAULT_UCT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, DecisionEngine, DeliberationEngine, DistributedSync, EProcess, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EnergyLedger, EvolverAgent, ExecutionError, FeedbackController, FisherGeometryEngine, FreeEnergyEngine, GCounter, GaussianProcess, GittinsIndexTable, GoalEngine, GpSeriesCalibrator, Hedge, HotReloadEngine, INCINERATOR, IndexScheduler, JsonMemoryBackend, KalmanFilter, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMError, LWWRegister, LocalLinearTrendFilter, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, MapElitesArchive, MemoryAgent, MemoryError, MemoryGraph, MetaCognitionEngine, MetaCognitiveController, MigrationTool, ModelAgent, ModelScheduler, NetworkError, ORSet, OpportunityStopper, Optimizer, OptimizerAgent, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PolicyEvolver, PolicySimulator, PrivacyAccountant, ProgressBroadcaster, RDP_ORDER, RaftEngine, RationalMetareasoner, ReflectionEngine, Reflector, RobustStream, RuntimeVerifier, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafetyGovernor, SafetyMonitor, Sandbox, ScientistMind, SelfModel, Sentinel, ShapleyAttributionEngine, SqliteMemoryBackend, StrategyEvolutionEngine, SymbiosisBridge, SymbiosisRuntime, SystemicRiskMonitor, TREASURY, TailRiskMonitor, TaskExecutor, TenantManager, TheoristEngine, TimeoutError, ToolError, ToolRegistry, TransportDriftMonitor, UctSearch, WeightedCoverage, WorldModel, abortableSleep, apply, assignBatch, assignmentCertificate, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, bottleneckDistance, bottleneckInsight, brussOddsIndex, bruteForceAssignment, bruteForceBest, bruteForceMinCut, bruteForceMinIntersection, budgetedGreedy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, byzantineFeasible, capacityFrontier, catoniMean, chiSquareQuantile, cholesky, choleskyLower, classifyError, cleanseCorrelation, coalitionValue, completeMatrix, completedEntry, computeHomeostasis, conditionNumber, conformalQuantile, correlationFromSeries, cosineSimilarity, coverageFromTokens, crdtConvergenceAudit, createBaselinePolicy, createMemoryBackend, curvatureEstimate, cvar, cvarCoherenceAudit, cvarMinForm, dareIterate, dareScalarClosedForm, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, determinismScore, digamma, distillRetention, dpHistogram, dpMeanClamped, dpValue, dynamicsRegime, eBenjaminiHochberg, empiricalQuantile, emptyMemoryStore, entropyAudit, erlangC, evaluateMemoryCondition, evidenceRankScore, expectedImprovement, extractReplayTasks, fairDomainBudget, fairnessAudit, fft, firstPassageCooldown, fisherGUpperTail, fitGpd, fixedSampleUpperBound, gamblerRuin, gaussianNoise, generateAdversarialTasks, gpdCdf, h0Persistence, haarDecompose, haarReconstruct, hedgeMultiplier, hillEstimator, hurstExponent, ifft, informationBottleneck, initEvidence, inverseGaussianCdf, inverseGaussianPdf, isTradeListener, jacksonIndependenceAudit, jacobiEigensym, kingmanWq, laplaceNoise, largestLyapunov, lazyGreedy, lessonsToInsights, listingsOf, littleCheck, lnGamma, lqrGain, lyapunovCertificate, madSigma, majorityQuorumAudit, matchesMemoryConditions, maxFlow, maxMinFair, meanExcessCurve, medianOfMeans, minCutCertificate, minimalStableServers, modelAgentId, modelSignalKey, monteCarloCorrectSelection, mpEdges, mulberry32, multiScaleView, name, normalCdf, normalPdf, normalizePolicyParams, observeEvidence, ocbaAllocate, overlapSheaf, pageRank, parseJSONLoose, participationRatio, periodogram, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, potQuantiles, prophetValue, quantile, quantileSorted, raftSafetyAudit, randomWalkSteadyState, rdpToEpsilon, readEvidence, reflectionMaxProb, renderSankeyHtml, resolveEffectiveParams, robustExceedance, robustTimeout, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, seasonalFactor, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shamirCombine, shamirSplit, shapleyValues, shrinkageCovariance, sinkhorn, solveAssignment, solveAssignmentMax, solveCholesky, sqliteAvailable, sqlitePathFor, staticEtaFor, staticRegretBound, stitchedCsRadius, strategyBehaviorDescriptor, submodularityCheck, tandemNetwork, timeVaryingEta, toSparseVector, tokenizeChinese, topInfluential, topographyInsight, trackingRegretBound, wasserstein1D, wassersteinBarycenter1D, wassersteinRobustMean, weightedMaxMinFair, wilsonLowerBound };

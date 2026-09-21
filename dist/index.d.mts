@@ -3316,6 +3316,93 @@ declare class LocalLinearTrendFilter {
   get size(): number;
 }
 //#endregion
+//#region src/core/nonlinear-dynamics.d.ts
+/**
+ * 38.0 非线性动力学内核 —— Lyapunov 指数 + Hurst 标度：系统动力学体质分类
+ *
+ * 动机: KPI 序列的异常检测（z-score / NIS / 形状漂移）都在问「现在
+ * 正常吗」，没有问**这条序列是什么体质**：
+ *
+ *   最大 Lyapunov 指数 λ₁ > 0 ⟹ 混沌（敏感依赖）——误差指数放大，
+ *     任何预测的可用视野只有 ~1/λ₁ 步；λ₁ ≤ 0 ⟹ 轨道稳定。
+ *     Rosenstein 法（1993）：重构空间找最近邻，平均对数分离率的最陡
+ *     段斜率——不重构全谱，只取最大指数，短序列可用。
+ *
+ *   Hurst 指数 H（R/S 分析，1951）——长记忆标度：
+ *     H > 0.5 持续性（趋势自我强化，动量口径）；H ≈ 0.5 无记忆
+ *     （布朗）；H < 0.5 反持续（均值回归，振荡口径）。
+ *     E[R(n)/S(n)] ~ c·n^H。
+ *
+ *   体质分类改变下游口径: 混沌序列上精细预测器（26.0 GP / 世界模型）
+ *     的置信区间应随 1/λ₁ 收窄视野；持续序列的趋势洞察值得加权；
+ *     反持续序列的「突破」多半回归——**同一份 KPI，三种读法**。
+ *
+ *   验证锚点: logistic 映射 x→4x(1−x) 的 λ₁ = ln 2（解析已知）；
+ *     白噪声 H ≈ 0.5；趋势叠加随机游走 H > 0.5。
+ *
+ * 零漂移: 未挂载时元认知输出与升级前逐位一致。
+ */
+interface LyapunovResult {
+  /** 最大 Lyapunov 指数估计（每步，nat） */
+  lambda: number;
+  /** 拟合窗口（用于斜率回归的分离步区间 [0, fitWindow]） */
+  fitWindow: number;
+  /** 平均分离曲线（log 发散 vs 步数；断言单调性的原料） */
+  divergence: number[];
+  usedPairs: number;
+}
+/**
+ * Rosenstein 最大 Lyapunov 指数。
+ *
+ * series: 标量序列（≥ 32 点）；meanGap 排除时间近邻（假最近邻防御）；
+ * fitWindow: 线性拟合的步数上限（缺省 ~ √N）。
+ */
+declare function largestLyapunov(series: ReadonlyArray<number>, options?: {
+  meanGap?: number;
+  fitWindow?: number;
+}): LyapunovResult | undefined;
+interface HurstResult {
+  hurst: number;
+  /** 各窗口的 (log n, log R/S) 点（回归原料） */
+  points: Array<{
+    logN: number;
+    logRS: number;
+  }>;
+}
+/** R/S 分析（多窗口聚合回归；窗口数不足时返回 undefined） */
+declare function hurstExponent(series: ReadonlyArray<number>): HurstResult | undefined;
+type DynamicsRegime = 'chaotic' | 'persistent' | 'mean-reverting' | 'stochastic';
+interface DynamicsAssessment {
+  regime: DynamicsRegime;
+  lyapunov: number | undefined;
+  hurst: number | undefined;
+  /** 混沌视野（步数 ≈ 1/λ₁；λ₁ ≤ 0 时 undefined = 无界） */
+  forecastHorizonSteps: number | undefined;
+  readable: boolean;
+}
+/**
+ * 最近邻一步可预测性（噪声门判据，Casdagli 局部线性预测）。
+ *
+ * 每点取值域最近 m 邻居，用邻居的下一步均值预测：白噪声无增益
+ * （score ≈ 1）；确定性映射近零误差（score ≈ 0）；线性 AR 只有
+ * 线性增益（φ=±0.8 → score ≈ 0.6）。作混沌判定的前置门——白噪声
+ * 对 Rosenstein 是无穷维混沌（最近邻瞬间发散），必须先排除。
+ */
+declare function determinismScore(series: ReadonlyArray<number>, m?: number): number | undefined;
+/**
+ * 动力学体质分类（38.0 接线口径）。
+ *
+ * 判序: 先过**噪声门**（最近邻一步可预测性 determinism < 0.5——白噪声
+ * 无可预测增益，却会被 Rosenstein 判成无穷维混沌）；过门且 λ₁ > λPos
+ * （缺省 0.05 nat/步）→ 混沌；否则 H > 0.5+δ → 持续、H < 0.5−δ →
+ * 反持续、其余 → 随机漫步体质。
+ */
+declare function dynamicsRegime(series: ReadonlyArray<number>, options?: {
+  lambdaThreshold?: number;
+  hurstDelta?: number;
+  determinismGate?: number;
+}): DynamicsAssessment;
+//#endregion
 //#region src/meta-cognition.d.ts
 /** KPI 快照 */
 interface KpiSnapshot {
@@ -3554,6 +3641,10 @@ declare class MetaCognitionEngine {
   private transportDriftState;
   /** 27.0：KPI 局部线性趋势滤波器（挂载后异常判定升级为 NIS 假设检验） */
   private kalmanFilters?;
+  /** 38.0：KPI 动力学体质序列（attachChaosDiagnostics 后积累） */
+  private chaosSeries?;
+  /** 38.0：已确立的动力学体质（翻转沿洞察的去重状态） */
+  private chaosRegimeState;
   /** 27.0：各 KPI 的上次门控态（翻转沿触发洞察） */
   private kalmanGateState;
   /** 12.0：保证层显著性水平（e ≥ 1/α 才确证） */
@@ -3620,6 +3711,51 @@ declare class MetaCognitionEngine {
   }): void;
   /** 27.0：KPI 的当前滤波读数（纯读取；未挂载返回 undefined） */
   kalmanView(kpi: string): TrendStepRead | undefined;
+  /**
+   * 38.0：挂载动力学体质诊断（幂等覆盖，挂载即生效）。
+   *
+   * 每个 KPI 序列积累满 minPoints（缺省 96）后做体质分类：混沌
+   * （λ₁ > 0，预测视野 ~1/λ₁ 步）、持续（H > 0.5+δ，趋势自我强化）、
+   * 反持续（H < 0.5−δ，均值回归）、随机漫步（无结构）。体质确立的
+   * 翻转沿产出洞察——**同一份 KPI，三种读法**：混沌序列上精细预测器
+   * 的置信应随视野收窄、持续序列的趋势洞察加权、反持续序列的「突破」
+   * 多半回归。未挂载零漂移。
+   */
+  attachChaosDiagnostics(options?: {
+    kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+    minPoints?: number;
+    lambdaThreshold?: number;
+    hurstDelta?: number;
+  }): void;
+  private chaosMinPoints;
+  private chaosOptions;
+  /**
+   * 49.0：挂载多尺度小波视图（幂等覆盖，挂载即生效——纯读数口径）。
+   *
+   * KPI 序列经 Haar 小波分解为对数个正交尺度：最粗趋势（长期水平）、
+   * 中尺度细节（漂移带能量）、最细细节（瞬时突发）——单尺度异常检测
+   * 看不见的「慢漂移 vs 快突发」结构分离。waveletView 给出各尺度能量
+   * 落位；洞察消费留给上层（零漂移：仅新增读数）。
+   */
+  attachWaveletView(options?: {
+    kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+    minPoints?: number;
+  }): void;
+  private waveletSeries?;
+  private waveletMinPoints;
+  /** 49.0：KPI 的多尺度读数（纯读取；未挂载/未满窗返回 undefined） */
+  waveletView(kpi: string): {
+    trendLevel: number;
+    burstShare: number;
+    dominantScale: string;
+    driftShare: number;
+  } | undefined;
+  /** 49.0：序列喂入（observe 的 0.9 段调用；未挂载零开销） */
+  private feedWavelet;
+  /** 38.0：KPI 的动力学体质读数（纯读取；未挂载/未满窗返回 undefined） */
+  chaosView(kpi: string): DynamicsAssessment | undefined;
+  /** 38.0：体质分类（满窗后每批快照评估；翻转沿产出洞察） */
+  private checkChaos;
   /** 27.0：NIS 门控检验（每批快照后调用；进入门控的翻转沿产出洞察） */
   private checkKalman;
   /**
@@ -4695,6 +4831,30 @@ declare class CryptoEngine {
    */
   static generateKey(): string;
   /**
+   * 48.0：主密钥阈值分形（Shamir，n 份中任意 t 份可重建、t−1 份
+   * 信息论零泄露）。份额应分存于不同介质/保管人；本方法不落盘。
+   */
+  shardKey(keyHex: string, shares: number, threshold: number): Array<{
+    x: number;
+    y: string;
+  }>;
+  /** 48.0：份额重建（任意 ≥ 阈值份；Lagrange 插值） */
+  combineKeyShares(shareList: ReadonlyArray<{
+    x: number;
+    y: string;
+  }>): string;
+  /**
+   * 48.0：密钥原料随机性审计（频数 + 游程检验，NIST SP 800-22 口径）——
+   * 「密钥的原料合格吗」从信任变成检查（|z| ≤ 3 通过）。
+   */
+  auditKeyEntropy(keyHex: string): {
+    bytes: number;
+    oneRatio: number;
+    frequencyChi: number;
+    runsZ: number;
+    passed: boolean;
+  };
+  /**
    * 获取指定版本密钥的指纹（SHA-256 前 16 位 hex），用于安全展示与比对
    * @param version 密钥版本，缺省为当前版本
    */
@@ -5649,19 +5809,91 @@ declare class LongTermMemory implements IMemoryStore {
   private rollingAvg;
 }
 //#endregion
-//#region src/memory/memory-graph.d.ts
+//#region src/core/persistent-homology.d.ts
 /**
- * memory-graph.ts — 记忆网络与主题树（自主学习建议 2：自定义数据结构序列化）
+ * 36.0 持续同调内核 —— H₀ 持续图 + 瓶颈距离：知识的形状跨尺度可见
  *
- * SQLite 擅长行列存储，但图结构（记忆网络、主题树）是其短板。本组件将复杂关系
- * 保留在内存中管理与检索，定期序列化到本地 JSON 文件，Agent 启动时加载恢复：
+ * 动机: 记忆图（共现网络 + 主题树）只知道「谁连着谁」，不知道**自己在
+ * 什么尺度上是什么形状**。把边权视为相似度、阈值 ε 从高往低扫：
  *
- * - 记忆网络：节点（任务模式 / 蒸馏策略 / 主题）+ 共现边（权重随共现次数增长），
- *   支撑"由一条记忆联想到相关记忆"的图检索（优化器混合检索的联想增强）
- * - 主题树：按 taskType 归类的层级结构（根主题 → 子主题 → 模式叶节点）
+ *   ε = ∞: 每条知识自成一个分量（群岛）；ε 下降: 强相似先合并，
+ *   分量逐个死去——单连接合并过程就是 H₀ 的持久图（persistence diagram）。
  *
- * 持久化：JSON 原子写（与记忆库同目录 memory-graph.json），dispose/flush 时落盘。
+ *   拓扑数据处理（Edelsbrunner–Letscher–Zomorodian 2002）的洞见：
+ *   **只在一个尺度上出现的结构是噪声，跨尺度持久的结构是形状**。
+ *   - 死得早（高 ε 就被吞并）的分量 = 聚类内部的普通成员；
+ *   - 持久到低 ε 的分量 = 稳定的知识大陆；
+ *   - 永不合并（essential class）的分量 = 知识孤岛——与任何主题都不
+ *     共现的记忆，正是好奇心该去的地方（盲区的拓扑定义）。
+ *
+ *   瓶颈距离（Cohen-Steiner–Edelsbrunner–Harer 稳定性定理）:
+ *   两张持久图的瓶颈距离 ≤ 输入度量的扰动——**知识地形的变化本身
+ *   有了 Lipschitz 稳定的度量**：记忆重组前后地形漂移多少，一个数字。
+ *
+ *   实现口径: 并查集单连接（H₀ 精确，O(E log E)）；瓶颈距离用
+ *   阈值化二分 + 增广路匹配（精确，小图适用）。
+ *
+ * 零漂移: 纯分析内核，未挂载时调用方行为与升级前逐位一致。
  */
+/** 一次合并事件（一个 H₀ 类的死亡） */
+interface MergeEvent {
+  /** 合并发生的相似度阈值（该边权重） */
+  epsilon: number;
+  /** 被吞并侧的大小（young 类的成员数——分量大小的「死因」） */
+  absorbedSize: number;
+  /** 存活侧的代表（并查集根，节点 id） */
+  survivor: string;
+}
+interface TopographyReport {
+  /** 节点数 */
+  nodes: number;
+  /** essential 类（永不合并的分量 = 知识孤岛；阈值降到 floor 仍独活） */
+  islands: Array<{
+    members: string[];
+  }>;
+  /** 合并事件按 ε 降序（知识大陆的成形史） */
+  merges: MergeEvent[];
+  /** 有限持久点 (birth, death) = (1, 合并 ε)：death 越小越早被吞并 */
+  diagram: Array<{
+    birth: number;
+    death: number;
+  }>;
+  /** 最持久的合并阈值带（大陆间连接强度分布的分位数） */
+  landscape: {
+    p50: number;
+    p90: number;
+    continentCount: number;
+  };
+}
+/**
+ * H₀ 持续同调（相似度口径：阈值 ε 从 1 降到 floor）。
+ *
+ * nodes: 参与节点 id；edges: {source, target, weight ∈ (0,1]}（相似度）。
+ * essential 类 = 阈值降到 floor 仍独活的分量（含完全孤立的节点）。
+ */
+declare function h0Persistence(nodes: ReadonlyArray<string>, edges: ReadonlyArray<{
+  source: string;
+  target: string;
+  weight: number;
+}>, floor?: number): TopographyReport;
+/**
+ * 瓶颈距离（L∞ 匹配口径，含对角线）。
+ *
+ * ε-匹配可行性：A_i ↔ B_j（‖·‖∞ ≤ ε）或 A_i ↔ 对角线（distToDiag ≤ ε），
+ * B_j 同理可留对角线。二分候选 ε（成对距离 ∪ 对角距离），增广路判可行。
+ * 稳定性定理（Cohen-Steiner et al.）: 输入扰动 δ → 瓶颈距离 ≤ δ。
+ */
+declare function bottleneckDistance(pointsA: ReadonlyArray<{
+  birth: number;
+  death: number;
+}>, pointsB: ReadonlyArray<{
+  birth: number;
+  death: number;
+}>): number;
+/** 知识地形摘要（36.0 接线口径：孤岛 = 盲区的拓扑定义） */
+declare function topographyInsight(report: TopographyReport): string;
+//#endregion
+//#region src/memory/memory-graph.d.ts
 interface MemoryNode {
   id: string;
   /**
@@ -5697,14 +5929,46 @@ declare class MemoryGraph {
   private edges;
   private topics;
   private persistPath;
+  /** 39.0：影响力排序（attachInfluenceRanking 后 related() 按 边权×邻居影响力 排序） */
+  private influence?;
   constructor(persistPath: string);
   private edgeKey;
   /** 确保节点存在（幂等） */
   ensureNode(id: string, kind: MemoryNode['kind'], label: string): void;
   /** 记录共现：边权重随共现次数增长（上限 1） */
   link(a: string, b: string): MemoryEdge;
-  /** 图联想：按边权重返回相邻节点 id（混合检索的联想增强） */
+  /** 图联想：按边权重返回相邻节点 id（混合检索的联想增强）
+   *
+   * 39.0：挂载影响力排序后，联想序从「边权」升维为「边权 × 邻居影响力」
+   * （与枢纽共现的记忆先被想起）；未挂载时与原边权序逐位一致（零漂移）。
+   */
   related(id: string, limit?: number): string[];
+  /**
+   * 39.0：挂载谱排序影响力（幂等覆盖，挂载即生效）。
+   *
+   * PageRank 幂迭代（阻尼 0.85，质量守恒 Σ=1）在共现网络上解出每条
+   * 知识的结构影响力——「被重要者共现者重要」。topInfluential 输出
+   * 知识骨架（蒸馏保骨去肉的依据）；related() 切换影响力加权口径。
+   * 未挂载零漂移。
+   */
+  attachInfluenceRanking(options?: {
+    damping?: number;
+  }): void;
+  /** 39.0：知识骨架清单（未挂载返回空数组） */
+  topInfluential(k?: number): Array<{
+    id: string;
+    score: number;
+  }>;
+  /**
+   * 36.0：知识地形（H₀ 持续同调；纯分析，无副作用）。
+   *
+   * 共现权重视为相似度、阈值从 1 向 floor 扫描：跨尺度持久的分量 =
+   * 稳定知识大陆；永不合并的分量 = 知识孤岛（盲区的拓扑定义——
+   * 与任何主题都不共现的记忆，正是好奇心该去的地方）。
+   */
+  knowledgeTopography(floor?: number): TopographyReport & {
+    summary: string;
+  };
   /** 将模式挂到主题树（根主题 = taskType） */
   attachTopic(patternId: string, topicName: string, parentTopic?: string): TopicNode;
   /** 主题树（仅根节点，含子主题与叶模式） */
@@ -7922,6 +8186,30 @@ declare class WorldModel {
   /** 最近到达率（每毫秒），基于最近 5 分钟窗口 */
   private recentRate;
   /** 时段热度因子：目标时段计数 / 全天均值 */
+  /**
+   * 42.0：挂载谱日历（幂等覆盖，挂载即生效）。
+   *
+   * 时段热度从「预设为一天的小时直方图」升级为谱分析：到达时间戳按
+   * 小时分桶为时间序列，FFT 周期图 + Fisher g 检验判定是否存在显著
+   * 周期（任意周期——分钟回环/小时批处理/昼夜/周节律）；显著时
+   * predictArrivals 的热度因子切换为谐波重构的季节因子（相位感知），
+   * 不显著时逐位回退原直方图口径。未挂载零漂移。
+   */
+  attachSpectralCalendar(options?: {
+    bins?: number;
+  }): void;
+  /** 42.0：谱日历配置（未挂载 undefined） */
+  private spectralCalendar?;
+  /** 42.0：谱季节因子（显著周期时数值；不显著 / 样本不足 → undefined 回退） */
+  private spectralFactorOf;
+  /** 42.0：谱日历状态（纯读取；未挂载/未评估时 undefined） */
+  getSpectralCalendarStatus(): {
+    bins: number;
+    samples: number;
+    significant: boolean;
+    periodHours: number | undefined;
+  } | undefined;
+  private lastSpectral?;
   private hourFactor;
   /** 趋势方向（由斜率判定） */
   private trendOf;
@@ -8115,6 +8403,15 @@ declare class CuriosityEngine {
     coverageStrength?: number;
   }): void;
   private submodularSelector?;
+  /**
+   * 44.0：挂载公平预算（幂等覆盖，挂载即生效）。
+   *
+   * 探索预算按域（taskType）加权极大极小分配（新颖度权重 + 注水算法，
+   * 词典序最优）：热门域可以多拿，但任何活跃域的相对份额不被压扁——
+   * 探索的覆盖有公平定理背书（多样性坍缩在预算层上锁）。未挂载零漂移。
+   */
+  attachFairBudget(): void;
+  private fairBudget;
   /** 30.0：任务类型 → token 集（主题 = 共享 token；camelCase 与连字符统一拆分） */
   private static tokenize;
   /**
@@ -8424,6 +8721,12 @@ declare class SafetyGovernor {
   private circuitState;
   private consecutiveFailures;
   private circuitOpenedAt;
+  /** 40.0：失败时间戳（attachFirstPassageAdvisor 后记录；首达定价原料） */
+  private failureTimestamps;
+  /** 40.0：首达冷却配置（未挂载 undefined——零记录零介入） */
+  private firstPassage?;
+  /** 40.0：最近一次首达定价读数（breaker 打开时刷新） */
+  private lastFirstPassage?;
   /** 4.0：半开试探互斥（探测在途时其余动作继续拒绝） */
   private halfOpenProbeInFlight;
   /** Kill Switch */
@@ -8460,6 +8763,28 @@ declare class SafetyGovernor {
    * @returns 裁决结果
    */
   govern(action: GovernedAction, confidence?: number): GovernanceVerdict;
+  /**
+   * 40.0：挂载首达时间冷却定价（幂等覆盖，挂载即生效）。
+   *
+   * 熔断打开时的冷却从配置魔数升维为概率定价：观察到的相邻失败间隔
+   * （恢复方向的漂移 μ̂ 与波动 σ̂）喂入逆高斯首达模型，二分解出
+   * 「P(失败强度恢复 ≤ cooldown) ≥ targetProb」的最小冷却。μ̂ ≤ 0
+   * （结构性恶化）时诚实给出 undefined——再等也不会自己好。定价为
+   * 建议口径（半开转换时序仍由既有状态机治理）；未挂载零记录零介入。
+   */
+  attachFirstPassageAdvisor(options?: {
+    targetProb?: number;
+  }): void;
+  /** 40.0：最近一次首达定价读数（纯读取；未挂载/未打开过熔断返回 undefined） */
+  firstPassageView(): {
+    recommendedCooldownMs: number;
+    expectedRecoverMs: number;
+    mu: number;
+    sigma: number;
+    targetProb: number;
+  } | undefined;
+  /** 40.0：从失败间隔序列做首达定价（breaker 打开沿调用） */
+  private assessFirstPassage;
   /**
    * 回写动作结果（驱动熔断器与预算统计）
    * @param success 动作是否成功
@@ -8594,6 +8919,25 @@ interface SymbiosisBridgeHook {
 type CapacityAdvisor = () => Insight[] | void;
 /** 28.0：尾部风险顾问（心跳 2.7 段消费，缺省零改动） */
 type TailRiskAdvisor = () => Insight[] | void;
+/**
+ * 33.0：系统性风险顾问（心跳 2.8 段消费，缺省零改动）。
+ *
+ * 由 index.ts 桥接到 SystemicRiskMonitor：每轮心跳喂入各模型本期
+ * 失败计数，窗口攒满后相关矩阵经 Marchenko–Pastur 清洗——伪相关被
+ * 噪声带吸收（不误报），真实共同因子（λ₁ 显著超带 + 解释份额达标）
+ * 产出 systemic-risk 洞察（同一上游/厂商的模型同沉浮，热备是幻觉）。
+ * 失败由调用侧静默隔离，不阻断主链路。
+ */
+type SystemicRiskAdvisor = () => Insight[] | void;
+/**
+ * 41.0：排队网络顾问（心跳 2.9 段消费，缺省零改动）。
+ *
+ * 由 index.ts 桥接到 tandemNetwork：各模型作为独立 M/M/c 站、到达率
+ * 按当前流量份额分摊，Erlang-C 口径解出瓶颈站（ρ 最大）与端到端
+ * 逗留——瓶颈站接近饱和（ρ ≥ 0.85）或不可稳定时产出 capacity-flow
+ * 洞察（Jackson 乘积形式背书）。失败由调用侧静默隔离。
+ */
+type QueueingNetworkAdvisor = () => Insight[] | void;
 /** 自主心跳配置 */
 interface AutonomyLoopConfig {
   /** 心跳间隔（毫秒） */
@@ -8664,6 +9008,10 @@ declare class AutonomyLoop {
   private capacityAdvisor?;
   /** 28.0：尾部风险顾问（可选注入；心跳 2.7 段消费，缺省零改动） */
   private tailRiskAdvisor?;
+  /** 33.0：系统性风险顾问（可选注入；心跳 2.8 段消费，缺省零改动） */
+  private systemicRiskAdvisor?;
+  /** 41.0：排队网络顾问（可选注入；心跳 2.9 段消费，缺省零改动） */
+  private networkAdvisor?;
   private worldModel?;
   private curiosity?;
   private governor?;
@@ -8696,6 +9044,10 @@ declare class AutonomyLoop {
     capacityAdvisor?: CapacityAdvisor;
     /** 28.0：尾部风险顾问（可选，缺省不启用） */
     tailRiskAdvisor?: TailRiskAdvisor;
+    /** 33.0：系统性风险顾问（可选，缺省不启用） */
+    systemicRiskAdvisor?: SystemicRiskAdvisor;
+    /** 41.0：排队网络顾问（可选，缺省不启用） */
+    networkAdvisor?: QueueingNetworkAdvisor;
     worldModel?: WorldModel;
     curiosity?: CuriosityEngine;
     governor?: SafetyGovernor;
@@ -9086,6 +9438,15 @@ interface BenchmarkReport {
   }>;
   overallPassed: boolean;
   totalDuration: number;
+  /** 45.0：OCBA 瓶颈聚焦（attachOcbaAllocator 后附加——下一轮确认预算的最优分配） */
+  bottleneckFocus?: {
+    candidate: string | undefined;
+    rationale: string | undefined;
+    allocation: Array<{
+      name: string;
+      count: number;
+    }>;
+  };
 }
 /** 内置场景上下文 */
 interface BuiltinScenarioContext {
@@ -9155,6 +9516,17 @@ declare class BenchmarkEngine {
    * @param onProgress 进度回调 (scenarioName, done, total)
    */
   runAll(onProgress?: (scenarioName: string, done: number, total: number) => void): Promise<BenchmarkReport>;
+  /**
+   * 45.0：挂载 OCBA 预算分配器（幂等覆盖，挂载即生效——纯报告附加）。
+   *
+   * runAll 结束时以各场景延迟统计为试点，给出「确认瓶颈子系统」的
+   * OCBA 最优重跑预算分配（P(CS) 渐近最优）附在报告 bottleneckFocus；
+   * 不改变场景执行本身（零漂移）。
+   */
+  attachOcbaAllocator(options?: {
+    confirmationBudget?: number;
+  }): void;
+  private ocbaAllocator?;
   /** 加载全部历史报告（按时间倒序） */
   loadReports(): BenchmarkReport[];
   /**
@@ -9411,6 +9783,23 @@ declare class DistributedSync {
   private schedulePersist;
   /** 执行状态持久化 */
   private persistState;
+  /** 47.0：跨节点收敛计数器（G-Counter；按通道隔离） */
+  private crdtCounters;
+  /**
+   * 47.0：CRDT 收敛通道（幂等挂载，挂载即生效——纯增量口径）。
+   *
+   * 网络分区 / 乱序 / 重复送达下的状态收敛从协议希望升级为合并算子
+   * 的代数性质（join-semilattice 三律 ⟹ 强最终一致性，Shapiro 2011）：
+   * 本地递增 incrementCrdtCounter，远端状态经 mergeCrdtState 合入，
+   * crdtState 读取——任何消息顺序都收敛到同一读数。
+   */
+  attachCrdtChannel(channels: ReadonlyArray<string>): void;
+  /** 47.0：本地递增（通道不存在时惰性创建） */
+  incrementCrdtCounter(channel: string, by?: number): void;
+  /** 47.0：合入远端 CRDT 状态（交换/幂等——重复合入无害） */
+  mergeCrdtState(remote: Record<string, Record<string, number>>): void;
+  /** 47.0：CRDT 状态快照（可序列化 gossip 载荷） */
+  crdtState(): Record<string, Record<string, number>>;
 }
 //#endregion
 //#region src/consensus/raft-engine.d.ts
@@ -9586,6 +9975,22 @@ declare class RaftEngine {
   private emitRoleChange;
   /** 加载持久化状态 */
   private loadPersistentState;
+  /**
+   * 46.0：法定人数安全审计（纯读取，零漂移）。
+   *
+   * 多数派交叉 / 容错上界 / 拜占庭可行性 / 负载——共识安全性从
+   * 「被相信」升级为「被检查」（多数派两两相交是 Raft 安全性的
+   * 根基，46.0 内核的闭式口径）。
+   */
+  quorumAudit(): {
+    nodes: number;
+    quorumSize: number;
+    minIntersection: number;
+    crashFaultTolerance: number;
+    byzantineTolerance: number;
+    load: number;
+    verdict: string;
+  };
   /** 持久化状态（原子写入） */
   private persistState;
 }
@@ -9768,6 +10173,100 @@ declare class HotReloadEngine extends EventEmitter {
   /** 持久化版本历史 */
   private persistVersions;
 }
+//#endregion
+//#region src/core/robust-decisions.d.ts
+/**
+ * 34.0 分布鲁棒内核 —— CVaR + Wasserstein 球：最坏情况有了闭式价格
+ *
+ * 动机: 系统里一切「按均值/按经验分位」的决策都隐含一个赌注：未来样本
+ * 来自与历史相同的分布。但模型延迟分布会漂移（上游变慢、配额收紧），
+ * 超时预算按均值设 → 一漂移就雪崩式超时。分布鲁棒优化（DRO）不赌单一
+ * 分布，而是问:
+ *
+ *   sup_{Q: W₁(Q, P̂) ≤ ε} E_Q[ℓ]     （以经验分布为中心、半径 ε 的
+ *                                     Wasserstein 球内的最坏期望）
+ *
+ *   Kantorovich–Rubinstein 对偶: W₁(Q,P̂) = sup{|E_Q φ − E_P̂ φ| : φ 1-Lipschitz}
+ *   → 一维恒等映射是 1-Lipschitz ⟹ |E_Q[X] − E_P̂[X]| ≤ W₁ ≤ ε，且
+ *     上界可达（把 ε 预算全部用于把最低处的质量搬到最高处——单位距离
+ *     单位收益）。于是:
+ *
+ *     sup_{W₁≤ε} E[X] = min(E[X] + ε, b)   （支撑上界 b 已知时；
+ *                                            无界支撑 = E[X] + ε）
+ *     鲁棒均值不是启发式加成，是对偶定理的代数恒等式。
+ *
+ *   尾部风险的凸口径: CVaR（Rockafellar–Uryasev 2002）是唯一同时满足
+ *   凸性 / 单调性 / 平移等变 / 正齐次的**相干风险度量**（与 16.0 Shapley
+ *   的公理化同一品味——四公理不是描述，是唯一性定理）:
+ *
+ *     CVaR_α(X) = min_t { t + E[(X−t)₊]/(1−α) }
+ *              = 最坏 (1−α) 尾部的期望（经验分布上 O(n log n) 精确）
+ *
+ *   超越概率的鲁棒口径: W₁ 球内质量要跨过阈值 t 至少要移动 (t − x)
+ *   的距离 → 从最贴近 t 的下方样本搬起（单位质量成本最小）——精确的
+ *   组合最坏化，worst P(X ≥ t) 有显式有限样本算法。
+ *
+ *   调度语义: 超时预算 = margin × CVaR_α(该模型延迟史)——「按最坏尾部
+ *   的期望定价」而非「按均值加拍脑袋的裕度」；超时率从此有分布口径。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致。
+ */
+/** 样本分位（最近邻下插值；空样本返回 undefined） */
+declare function quantile(samples: ReadonlyArray<number>, p: number): number | undefined;
+/**
+ * CVaR_α（损失口径，越大越坏）：最坏 1−α 尾部的期望。
+ *
+ * Rockafellar–Uryasev min-form 在经验分布上的闭式解（α 为**置信水平**，
+ * α=0.95 即最坏 5% 尾）：k = ⌈(1−α)n⌉，最坏 k−1 个样本全取 + 第 k 个
+ * 取分数权重（权重恰合 1−α）。
+ */
+declare function cvar(samples: ReadonlyArray<number>, alpha: number): number | undefined;
+/** Rockafellar–Uryasev min-form 数值口径（验证锚点：与 cvar() 解析式对账） */
+declare function cvarMinForm(samples: ReadonlyArray<number>, alpha: number): number | undefined;
+/** CVaR 相干性公理审计（与 16.0 Shapley 四公理同一品味的验证锚点） */
+declare function cvarCoherenceAudit(samples: ReadonlyArray<number>, alpha: number): {
+  monotone: boolean;
+  translationEquivariant: boolean;
+  positivelyHomogeneous: boolean;
+  subadditive: boolean;
+};
+/** Wasserstein-1 鲁棒均值（对偶定理的代数恒等式）。
+ *
+ * sup_{W₁(Q,P̂)≤ε} E_Q[X] = min(E_P̂[X] + ε, supportUpper)。
+ * supportUpper 未提供 = 无界支撑（值 = E + ε）。样本为空 → undefined。
+ */
+declare function wassersteinRobustMean(samples: ReadonlyArray<number>, epsilon: number, supportUpper?: number): number | undefined;
+/** 超越概率的最坏化（W₁ 球内 P(X ≥ t) 的精确有限样本最大值）。
+ *
+ * 贪心搬质量：单位质量从 x < t 跨到 t 的运价 = t − x，从最贴近 t 的
+ * 下方样本搬起直到预算耗尽——运输问题的精确解（成本递增序贪心 =
+ * 最小代价流）。返回名义值与最坏值。
+ */
+declare function robustExceedance(samples: ReadonlyArray<number>, threshold: number, epsilon: number): {
+  nominal: number;
+  worst: number;
+  movedMass: number;
+} | undefined;
+interface RobustTimeoutConfig {
+  /** 置信水平 α（CVaR_α 取最坏 1−α 尾；缺省 0.95 即最坏 5% 尾） */
+  alpha?: number;
+  /** 裕度乘数（缺省 1.5——超时预算略高于条件尾部值，容纳批间漂移） */
+  margin?: number;
+  /** 样本下限（不足则不接管；缺省 30） */
+  minSamples?: number;
+  /** 下限（毫秒；缺省 5000） */
+  floorMs?: number;
+  /** 上限（毫秒；缺省 300000） */
+  capMs?: number;
+}
+/**
+ * 鲁棒超时预算（34.0 接线口径）。
+ *
+ * margin × CVaR_α(延迟样本)，钳位 [floor, cap]；样本不足返回 undefined
+ * （调用方回退原口径——零漂移）。比「均值 × 3」好在：尾部的形状直接
+ * 进入价格——重尾模型自动获得更长预算、轻尾模型不被一刀切。
+ */
+declare function robustTimeout(samples: ReadonlyArray<number>, config?: RobustTimeoutConfig): number | undefined;
 //#endregion
 //#region src/llm-client.d.ts
 /** 聊天消息（OpenAI 兼容格式） */
@@ -9965,6 +10464,19 @@ declare class LLMClient {
    * 尾部风险监视器（POT/GPD）与 23.0 稳健估计共用同一条流。
    */
   getLatencySamples(modelId: string): number[] | undefined;
+  /**
+   * 34.0：挂载 CVaR 超时预算（幂等覆盖，挂载即生效）。
+   *
+   * 每模型超时从固定魔数升级为 margin × CVaR_α(该模型延迟史)——按
+   * 「最坏尾部的期望」定价：重尾模型自动获得更长预算、轻尾模型不被
+   * 一刀切。依赖 robustLatency 启用（延迟样本与其共用）；样本不足
+   * minSamples 时该模型回退全局缺省超时（零漂移）。
+   */
+  attachCvarTimeouts(options?: RobustTimeoutConfig): void;
+  /** 34.0：CVaR 超时配置（未挂载 undefined） */
+  private cvarTimeoutConfig?;
+  /** 34.0：模型的 CVaR 超时预算（未挂载 / 样本不足 → undefined 回退缺省） */
+  getCvarTimeout(modelId: string): number | undefined;
   /** 获取并发槽位（必要时排队） */
   private acquireSlot;
   /** 释放并发槽位并唤醒队首 */
@@ -10159,6 +10671,334 @@ declare class BwKRouter {
   route(arms: BwKArmStat[], budgets: BwKBudgets): BwKVerdict;
 }
 //#endregion
+//#region src/core/online-learning.d.ts
+/**
+ * 31.0 在线学习内核 —— Fixed-Share Hedge：对手存在下的无悔学习
+ *
+ * 动机: 系统里一切统计学习（Wilson 下界 / UCB / Gittins / GP）都建立在
+ * **随机性假设**上——世界是平稳的概率分布，样本独立同分布。但多模型调度
+ * 的真实世界是对抗性 / 非平稳的：厂商今天限流明天放开、某模型被静默降级、
+ * 流量模式被人间的周节律扭转。「最优」在对手面前是幻觉，唯一守得住的
+ * 口径是**无悔**（no-regret）:
+ *
+ *   R_T = L(算法) − min_i L_i(事后最优固定专家) ≤ o(T)
+ *
+ *   指数权重（Hedge, Freund–Schapire 1997）:
+ *     ω_i(t+1) = ω_i(t)·e^{−η·ℓ_i(t)},  ℓ_i(t) ∈ [0,1]
+ *
+ *   遗憾定理（切线界 e^{−ηℓ} ≤ 1 − (1−e^{−η})ℓ 的精确推论）:
+ *     R_T ≤ ln N/η + (η/2)·T      （η ∈ (0,1]）
+ *     η = √(2 lnN/T) 时 R_T ≤ √(2T lnN)——**对手无论怎么出招都成立**，
+ *     与分布假设无关。每轮无悔 ⇒ 时间平均收敛到最小最大化均衡
+ *     （folk theorem: 遗憾博弈论的黑斯定理入口）。
+ *
+ *   非平稳世界（模型会漂移）: Fixed-Share（Herbster–Warmuth 1998）
+ *     ω_i ← (1−α)·ω_i·e^{−ηℓ_i}/Z + α/N
+ *   每轮把 α 份额均匀回灌——权重永远保留「翻盘预算」，对**任意 S 次
+ *   切换的最优专家序列**的跟踪遗憾（口径见 trackingRegretBound）:
+ *     R_τ ≤ [lnN + S·ln(1/α) + (τ−S)·ln(1/(1−α))]/η + ητ/2
+ *   平稳世界取 α→0 退化为经典 Hedge（份额泄漏项归零）。
+ *
+ *   本内核的双口径承诺:
+ *   - 任意对抗序列（含自适应对手，先看权重再出招）遗憾不超界；
+ *   - reward 口径（质量 ∈ [0,1]）经 ℓ = 1−r 变换无损进入。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致。
+ */
+/** Hedge 配置 */
+interface HedgeOptions {
+  /** 专家数 N ≥ 1 */
+  experts: number;
+  /** 学习率 η ∈ (0,1]（缺省 0.3；√(2 lnN/T) 调优口径见 staticEtaFor） */
+  eta?: number;
+  /** Fixed-Share 回灌率 α ∈ [0,1)（0 = 经典 Hedge；缺省 0.05） */
+  alpha?: number;
+}
+/** 遗憾审计快照（任何时刻可读——任意时刻有效性） */
+interface HedgeStats {
+  rounds: number;
+  /** 算法累计损失 Σ_t ⟨w_t, ℓ_t⟩（全反馈口径）/ 已实现损失（部分反馈口径） */
+  hedgeLoss: number;
+  /** 事后最优固定专家及其累计损失 min_i Σ_t ℓ_i(t) */
+  bestExpert: number;
+  bestLoss: number;
+  /** R_T = hedgeLoss − bestLoss（部分反馈口径可为负——算法好运气） */
+  regret: number;
+  /** 定理界 lnN/η + ηT/2（regret 应恒 ≤ 此界——对手无关） */
+  regretBound: number;
+  /** 当前权重（归一化） */
+  weights: number[];
+  /** 反馈口径（full = 全专家每轮有观测；partial = 每轮仅被指派专家） */
+  feedback: 'full' | 'partial';
+}
+/**
+ * Fixed-Share 指数权重。
+ *
+ * update(losses) 每轮一次；weights() 只读；stats() 给出与定理界的实时
+ * 对账（验证脚本用它断言「任意对手序列下 regret ≤ bound」）。
+ */
+declare class Hedge {
+  private readonly n;
+  private readonly eta;
+  private readonly alpha;
+  private omega;
+  private cumulative;
+  private hedgeLoss;
+  private rounds;
+  private partial;
+  constructor(options: HedgeOptions);
+  /** 一轮对抗反馈：losses[i] ∈ [0,1]（越低越好；自动钳位） */
+  update(losses: ReadonlyArray<number>): void;
+  /** reward 口径入口（质量 ∈ [0,1]；ℓ = 1 − r 无损变换） */
+  updateRewards(rewards: ReadonlyArray<number>): void;
+  /**
+   * 部分反馈入口（每轮仅一个专家被指派、有观测）。
+   *
+   * 掩码更新：其余专家本轮损失记 0（指数权重下等价于其权重不动，
+   * 仅受 Fixed-Share 回灌微调）；记账切换为**已实现口径**——cumulative
+   * 只累计各专家真实发生的损失，hedgeLoss = 算法实际承受的损失之和。
+   * 全反馈定理界仍作为上界参考（部分信息下界弱化 √N 倍，口径在
+   * stats.feedback 标注——不冒充全反馈保证）。
+   */
+  reportSingle(index: number, reward: number): void;
+  /** 当前归一化权重（拷贝） */
+  weights(): number[];
+  /** 当前最优专家（权重最高者；平手取小下标——确定性） */
+  recommend(): number;
+  stats(): HedgeStats;
+}
+/** 平稳界：R_T ≤ lnN/η + ηT/2（η ∈ (0,1]，Freund–Schapire 切线界推论） */
+declare function staticRegretBound(experts: number, eta: number, rounds: number): number;
+/** 未知视界 T 的时间变学习率 η_t = min(1, √(lnN / t))（√(2T lnN) 阶自适配） */
+declare function timeVaryingEta(experts: number, t: number): number;
+/** Fixed-Share 跟踪遗憾上界（区间长 τ、切换 S 次；Herbster–Warmuth 口径） */
+declare function trackingRegretBound(experts: number, eta: number, tau: number, switches: number, alpha: number): number;
+/** 首步学习率调优建议（视界 T 已知时的最优 η = √(2 lnN/T)） */
+declare function staticEtaFor(experts: number, horizon: number): number;
+/**
+ * 模型组合的 Hedge 乘数（31.0 接线辅助）。
+ *
+ * 权重 → 评分乘数 w_i / mean(w)，钳位 [minMultiplier, maxMultiplier]：
+ * - 对抗口径下持续表现好（对手奈何不了它）的模型最多升 maxMultiplier 倍；
+ * - 被对手打爆的模型最多降 minMultiplier 倍——**有界干预**，Hedge 只在
+ *   证据权重侧表态，不接管评分主体（与经济乘数同一挂载位）。
+ */
+declare function hedgeMultiplier(weights: ReadonlyArray<number>, index: number, minMultiplier?: number, maxMultiplier?: number): number;
+//#endregion
+//#region src/core/feedback-control.d.ts
+/**
+ * 35.0 反馈控制内核 —— 离散 LQR + Lyapunov 证书：并发极限的闭环驾驭
+ *
+ * 动机: 25.0 容量规划用排队论**反解**最优并发（Erlang-C / Kingman）——
+ * 但那是开环的：模型给一个静态建议，世界变了它不知道。真实的负载是
+ * 非平稳的（模型变慢、配额收紧、流量起伏），并发上限需要**闭环**：
+ *
+ *   反馈律: u_k = u_{k−1} + K·(y* − y_k)     （y = 实测利用率，y* = 目标）
+ *   闭环系统 y_{k+1} = (1 − bK)·y_k + bK·y* + 噪声
+ *
+ *   最优 K 从离散代数 Riccati 方程（DARE）解出:
+ *     P = q + a²P − a²b²P²/(r + b²P),   K = abP/(r + b²P)
+ *   a = 1（积分器口径）时有**闭式解**（P² − qP − qr/b² = 0）:
+ *     P = (q + √(q² + 4qr/b²))/2
+ *   ——闭式与不动点迭代逐位对账，控制增益不是调出来的，是解出来的。
+ *
+ *   Lyapunov 证书（与 15.0「证明携带」同一哲学）: 取 V(x) = P x²，则
+ *   DARE 恒等式给出
+ *     V(x_{k+1}) − V(x_k) = −(q x_k² + r u_k²) ≤ 0
+ *   ——闭环的每一步都被李雅普诺夫函数**证明**不发散（数值上逐位可查），
+ *   稳定性不是观察出来的，是代数恒等式。
+ *
+ *   工程加固: 死区（|e| < ε 不动——抗抖振）、输出钳位 [u_min, u_max]、
+ *   增益调度保守化（b 未知时按最坏灵敏度取下界 b_min——保证 0 < bK < 2
+ *   的稳定域对真实 b 稳健）。AIMD 式启发式调参从此退役。
+ *
+ * 零漂移: 未挂载时 computeParallelism 与升级前逐位一致（静态口径）。
+ */
+/** 标量 DARE（a=1 积分器口径）闭式解：P = (q + √(q² + 4qr/b²))/2 */
+declare function dareScalarClosedForm(b: number, q: number, r: number): number;
+/** 标量 DARE 不动点迭代（一般 a；收敛判据 |P_{k+1} − P_k| ≤ tol） */
+declare function dareIterate(a: number, b: number, q: number, r: number, iterations?: number, tol?: number): {
+  p: number;
+  converged: boolean;
+};
+/** LQR 增益 K = abP/(r + b²P)（P 为 DARE 解） */
+declare function lqrGain(a: number, b: number, p: number, r: number): number;
+interface FeedbackControllerConfig {
+  /** 目标利用率 y* ∈ (0,1]（缺省 0.75——留 25% 余量吸收突发） */
+  target?: number;
+  /** 一阶增益标称被控对象系数 b（灵敏度下界；缺省 0.4） */
+  plantGain?: number;
+  /** 状态权重 q（缺省 1.0——误差的代价） */
+  q?: number;
+  /** 控制权重 r（缺省 4.0——动作的代价，越大越保守） */
+  r?: number;
+  /** 死区半宽（|e| < deadband 不动作；缺省 0.05——抗抖振） */
+  deadband?: number;
+  /** 输出下限（缺省 1） */
+  minOutput?: number;
+  /** 输出上限（缺省 16） */
+  maxOutput?: number;
+  /** 初始输出（缺省 = 上限与下限之间靠上（保守起步）） */
+  initialOutput?: number;
+}
+interface ControlStep {
+  /** 控制输出（本周期并发上限） */
+  output: number;
+  /** 误差 e = y* − y（正 = 利用率不足，可放并发；负 = 过载） */
+  error: number;
+  /** 本步增量（死区内为 0） */
+  increment: number;
+  /** Lyapunov 函数值 V = P·e²（单调不增的证明对象） */
+  lyapunov: number;
+  /** 增益与闭环极点（审计口径） */
+  meta: {
+    gainK: number;
+    closedLoopPole: number;
+    p: number;
+    method: 'closed-form';
+  };
+}
+/**
+ * Lyapunov 稳定的并发反馈控制器。
+ *
+ * 被控对象口径（积分器）: y_{k+1} = y_k + b·Δu_k；控制 Δu = K·(y*−y)。
+ * 输出钳位同时充当抗积分饱和（输出到界后误差继续累计不再积深——
+ * 增量直接被钳位截断，无 hidden state）。
+ */
+declare class FeedbackController {
+  private readonly target;
+  private readonly b;
+  private readonly q;
+  private readonly r;
+  private readonly deadband;
+  private readonly minOutput;
+  private readonly maxOutput;
+  private readonly p;
+  private readonly k;
+  private output;
+  private lastError;
+  constructor(config?: FeedbackControllerConfig);
+  /** LQR 增益（审计） */
+  get gain(): number;
+  /** 闭环极点 1 − bK（|·| < 1 即稳定；本口径 ∈ (0,1)） */
+  get closedLoopPole(): number;
+  /** DARE 解 P（Lyapunov 函数的系数） */
+  get dare(): number;
+  /** 当前输出（只读） */
+  get currentOutput(): number;
+  /**
+   * 一步反馈：观测当前利用率 measured，返回新输出。
+   *
+   * Lyapunov: V(e) = P·e²；按被控对象模型 e_{k+1} = (1−bK)e_k，
+   * V(e_{k+1}) − V(e_k) = −(q e² + r u²) ≤ 0 —— DARE 恒等式（数值
+   * 验证见 verify-equilibrium-kernels）。死区/钳位只会让动作更小
+   * （V 降得更慢），不会破坏单调性。
+   */
+  step(measured: number): ControlStep;
+  /** 最近一次误差（未 step 时 undefined） */
+  get lastStepError(): number | undefined;
+}
+/**
+ * Lyapunov 证书审计（验证锚点）: 在被控对象模型 y_{k+1} = y_k + b·Δu 上
+ * 闭环仿真，逐步断言 V(e_{k+1}) − V(e_k) = −(q·e_k² + r·(K·e_k)²)（DARE
+ * 恒等式应到机器精度），返回最大残差。
+ */
+declare function lyapunovCertificate(config: FeedbackControllerConfig, initialY: number, steps?: number): {
+  maxResidual: number;
+  convergedToTarget: boolean;
+  finalError: number;
+  pole: number;
+};
+//#endregion
+//#region src/core/max-flow.d.ts
+/**
+ * 43.0 最大流内核 —— Edmonds-Karp + 最小割证书：吞吐上限与其钳制者
+ *
+ * 动机: 「现在最多能同时派发多少」不是各模型并发上限的简单求和——
+ * 任务有类型偏好、模型有能力画像，可行并发是**流网络**的值:
+ *
+ *   源 → 任务类型节点（容量 = 该类型待执行需求） → 模型节点
+ *        （类型-模型边存在当且仅当评分 > 0） → 汇（容量 = maxConcurrency）
+ *
+ *   Ford–Fulkerson 定理 (1956): 最大流 = 最小割。Edmonds-Karp 用
+ *   BFS 增广（O(VE²)），终止时残量网络中源可达集 S 与不可达集 T̄ 构成
+ *   **最小割**——割容量恰等于流值（弱对偶 + 构造性等式 = 证书：
+ *   最优性可逐位检查，与 32.0 对偶证书同一品味）。
+ *
+ *   调度语义: max-flow = 当前可立即满足的最大并发派发；min-cut 指认
+ *   **钳制者**——割边落在类型侧（需求过剩：该类任务在饿）还是模型侧
+ *   （容量不足：该模型是独木桥）。吞吐上限与瓶颈归因第一次同时可算。
+ *
+ *   验证锚点: 经典 CLRS 网络、随机图与穷举所有割对照（小图精确）、
+ *   割容量 = 流值恒等式。
+ *
+ * 零漂移: 未挂载时调度与执行行为与升级前逐位一致（诊断口径挂载）。
+ */
+/** 流网络（邻接表 + 残量矩阵；节点 0..n-1，source=0，sink=n-1） */
+interface FlowNetwork {
+  nodes: number;
+  source: number;
+  sink: number;
+  /** capacity[u][v] ≥ 0（0 = 无边） */
+  capacity: ReadonlyArray<ReadonlyArray<number>>;
+  /** 节点标签（诊断输出用） */
+  labels?: ReadonlyArray<string>;
+}
+interface MaxFlowResult {
+  /** 最大流值（= 最小割容量——Ford-Fulkerson 定理） */
+  flowValue: number;
+  /** 残量网络（capacity − flow + 反向） */
+  residual: number[][];
+  /** 最小割（源可达集 S；割 = S → V∖S 的满容量边） */
+  minCut: {
+    sourceSide: number[];
+    sinkSide: number[];
+    edges: Array<{
+      from: string;
+      to: string;
+      capacity: number;
+    }>;
+  };
+  augmentingPaths: number;
+}
+/** Edmonds-Karp 最大流（BFS 增广；返回残量网络与最小割） */
+declare function maxFlow(network: FlowNetwork): MaxFlowResult;
+/** 割证书审计（验证锚点）：割边全饱和（残量 0）且割容量 = 流值 */
+declare function minCutCertificate(network: FlowNetwork, result: MaxFlowResult): {
+  saturated: boolean;
+  cutCapacity: number;
+  equalsFlow: boolean;
+};
+/** 穷举最小割（验证锚点；2^n 枚举，n ≤ 16 适用） */
+declare function bruteForceMinCut(network: FlowNetwork): number;
+interface CapacityFrontier {
+  /** 可立即满足的最大并发派发（max-flow 值） */
+  maxDispatch: number;
+  /** 割边归因（哪些类型在饿 / 哪些模型是独木桥） */
+  bindingConstraints: Array<{
+    from: string;
+    to: string;
+    capacity: number;
+  }>;
+  /** 归因侧统计 */
+  demandStarved: number;
+  modelLimited: number;
+}
+/**
+ * 类型需求 × 模型容量的流前沿（43.0 接线口径）。
+ *
+ * demands: taskType → 待执行数量；modelCapacities: modelId → maxConcurrency；
+ * eligibility: (taskType, modelId) => boolean（评分 > 0 视为可达）。
+ * 网络: 源 → 类型（容量 = 需求）→ 模型（可达边容量 ∞）→ 汇（容量 = 并发）。
+ */
+declare function capacityFrontier(demands: ReadonlyArray<{
+  type: string;
+  count: number;
+}>, modelCapacities: ReadonlyArray<{
+  id: string;
+  capacity: number;
+}>, eligibility: (taskType: string, modelId: string) => boolean): CapacityFrontier;
+//#endregion
 //#region src/model-scheduler.d.ts
 /** 模型调度配置 */
 interface ModelSchedulerConfig {
@@ -10243,6 +11083,20 @@ declare class ModelScheduler {
   private bwKBudgetProvider?;
   /** 22.0：最近一次路由裁决（诊断口径；getAttachedDiagnostics 消费） */
   private lastBwKVerdict?;
+  /** 31.0：对抗组合（Fixed-Share Hedge；未挂载零漂移） */
+  private hedge?;
+  /** 31.0：专家下标 ↔ 模型 id 映射（挂载时刻的注册模型快照） */
+  private hedgeModelIds;
+  /** 35.0：并发反馈控制器（未挂载零漂移——静态口径） */
+  private concurrencyController?;
+  /** 43.0：容量前沿挂载标志（未挂载零记录零介入） */
+  private capacityFrontierEnabled;
+  /** 43.0：最近一次容量前沿（max-flow 值 + min-cut 归因；诊断口径） */
+  private lastCapacityFrontier?;
+  /** 50.0：潜因子挂载标志（未挂载零介入——纯诊断口径） */
+  private latentFactorsEnabled;
+  /** 50.0：最近一次矩阵补全报告（冷启动能力预测的原料） */
+  private lastCompletion?;
   constructor(params: {
     llm: LLMClient;
     memory: LongTermMemory;
@@ -10288,11 +11142,97 @@ declare class ModelScheduler {
     tokensRemaining: number;
     costRemaining: number;
   } | undefined): void;
-  /** 21.0/22.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
+  /** 21.0/22.0/31.0/35.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现） */
   getAttachedDiagnostics(): {
     indexScheduling?: GittinsSnapshot;
     lastBwK?: BwKVerdict;
+    hedge?: HedgeStats;
+    concurrencyControl?: ControlStep;
   };
+  /**
+   * 31.0：挂载对抗组合（Fixed-Share Hedge，幂等覆盖，挂载即生效）。
+   *
+   * 专家 = 挂载时刻的注册模型快照；执行侧每节点完成时经
+   * reportHedgeOutcome(modelId, reward∈[0,1]) 回报质量。权重经
+   * hedgeMultiplierOf 以有界乘数（[0.25, 4]）作用于利用端评分——
+   * 统计学习口径（Wilson/UCB/Gittins）之上叠加**对抗口径**：无论世界
+   * 怎么漂移（限流、静默降级），对事后最优固定模型的遗憾 ≤ √(2T lnN)。
+   * 未挂载时乘数恒 1（评分逐位零漂移）。
+   */
+  attachHedgePortfolio(options?: {
+    eta?: number;
+    alpha?: number;
+  }): void;
+  /**
+   * 31.0：执行结果回报（reward = 成功质量 ∈ [0,1]，失败 = 0；未挂载为空操作）。
+   *
+   * 部分反馈口径：本轮仅被指派模型有观测（掩码更新——未被指派的专家
+   * 权重不动，只受 Fixed-Share 回灌微调）。对手把某模型打爆时，其权重
+   * 以每失败一轮 e^{−η} 的速度衰减——比统计口径（Wilson 时间衰减）快
+   * 一个数量级的对抗性降权。
+   */
+  reportHedgeOutcome(modelId: string, reward: number): void;
+  /** 31.0：对抗组合对模型的有界评分乘数（未挂载恒 1；零漂移） */
+  hedgeMultiplierOf(modelId: string): number;
+  /**
+   * 35.0：挂载并发反馈控制器（幂等覆盖，挂载即生效）。
+   *
+   * computeParallelism 从静态口径（总并发容量钳位）升级为闭环：每次
+   * 被调用即一步反馈（观测当前总利用率 → LQR 增益 → 新上限），目标
+   * 利用率缺省 0.75。稳定性由 DARE/Lyapunov 证书背书（35.0 内核），
+   * 死区抗抖振、输出钳位即抗饱和。未挂载时与原静态口径逐位一致。
+   */
+  attachConcurrencyController(options?: FeedbackControllerConfig): void;
+  /** 35.0：最近一次控制步（诊断口径） */
+  private lastControlStep?;
+  /**
+   * 43.0：挂载容量前沿（幂等覆盖，挂载即生效——纯诊断口径）。
+   *
+   * 「类型需求 × 模型容量」流网络（源→类型（需求）→模型（评分>0 可达
+   * 边）→汇（maxConcurrency））上解 Edmonds-Karp 最大流 = 可立即满足
+   * 的最大并发派发；最小割指认钳制者（类型在饿还是模型是独木桥）——
+   * 割容量 = 流值（Ford-Fulkerson 证书）。执行器每批回写待执行需求；
+   * 不改变任何派发行为（零漂移），吞吐上限与瓶颈归因经
+   * getAttachedDiagnostics / query_memory capacity 可读。
+   */
+  attachCapacityFrontier(): void;
+  /** 43.0：执行批回写待执行需求（未挂载为空操作；类型计数 × 候选容量 → 流前沿） */
+  updateCapacityFrontier(demands: ReadonlyArray<{
+    type: string;
+    count: number;
+  }>): void;
+  /**
+   * 50.0：挂载潜因子补全（幂等覆盖，挂载即生效——纯诊断口径）。
+   *
+   * 「模型 × 任务类型」能力矩阵经 ALS 低秩补全（rank 缺省 3）：观测
+   * 条目（各模型 taskScores 已有值的部分）拟合 U·Vᵀ，未观测条目由
+   * 潜因子外推——新模型的冷启动选型从零样本瞎选升级为潜维度预测
+   * （Candès–Recht 恢复条件背书）。lowRankShare 读出低秩假设的成色；
+   * 不改变任何评分路径（零漂移），coldStartEstimate 按需读取。
+   */
+  attachLatentFactors(options?: {
+    rank?: number;
+  }): void;
+  private latentRank;
+  /** 50.0：重算能力矩阵补全（观测 = 各模型 taskScores 的非空条目，行=模型 列=任务类型并集） */
+  private refreshLatentFactors;
+  private latentTypeIndex;
+  private latentModelIndex;
+  /**
+   * 50.0：冷启动能力预测（观测未覆盖的 model×taskType 条目由潜因子
+   * 外推；未挂载/未覆盖返回 undefined——诚实降级）
+   */
+  coldStartEstimate(modelId: string, taskType: string): number | undefined;
+  /** 50.0：补全报告快照（纯读取） */
+  getLatentFactorReport(): {
+    rank: number;
+    trainRmse: number;
+    observedRatio: number;
+    lowRankShare: number;
+    converged: boolean;
+  } | undefined;
+  /** 43.0：最近一次容量前沿（纯读取；未挂载/未回写返回 undefined） */
+  getCapacityFrontier(): CapacityFrontier | undefined;
   /** 模型的当前经济乘数（无信号 = 中性 1；economicFeedbackEnabled 关闭时恒为 1） */
   economicMultiplierOf(modelId: string): number;
   /**
@@ -10383,8 +11323,24 @@ declare class ModelScheduler {
   /**
    * 动态并行度：依据已注册模型的总并发容量计算同层最大并行数
    * （避免同层节点数超过模型并发容量导致全部排队）
+   *
+   * 35.0：挂载反馈控制器后升级为闭环口径——每次调用即一步反馈
+   * （观测总利用率 activeRequests / 总容量 → LQR 增益步 → 新上限，
+   * 死区抗抖振、钳位 [1,16] 抗饱和，稳定性由 Lyapunov 证书背书）。
+   * 未挂载时与原静态口径逐位一致（零漂移）。
    */
   computeParallelism(): number;
+  /**
+   * 32.0：候选评分公开口径（批量全局指派的收益矩阵原料）。
+   *
+   * 与 assignModelWithInsight 同一评分路径（含 UCB/EFE 加成与经济/
+   * 对抗乘数），返回 (id, total) 降序排列——供执行侧构造批内收益矩阵，
+   * 匈牙利算法在「同一批节点 × 全体候选」上求全局最优指派。
+   */
+  rankCandidateScores(taskType: string, context?: SchedulerTaskContext, exclude?: string[]): Array<{
+    id: string;
+    score: number;
+  }>;
 }
 //#endregion
 //#region src/task-executor.d.ts
@@ -10432,6 +11388,10 @@ declare class TaskExecutor {
   private breakers?;
   /** 2.0：最近一次计划执行的调度决策洞察（校准闭环素材，getAndClearDecisionInsights 取走） */
   private decisionInsights;
+  /** 32.0：批内全局最优指派（匈牙利算法；未挂载时逐节点选型原样） */
+  private batchAssignmentEnabled;
+  /** 32.0：批内指派的候选池上限（每任务类型取评分前 K） */
+  private batchCandidateCap;
   constructor(params: {
     config: TaskExecutorConfig;
     llm: LLMClient;
@@ -10446,6 +11406,29 @@ declare class TaskExecutor {
    * @param patch 配置补丁（仅覆盖提供的字段）
    */
   updateConfig(patch: Partial<TaskExecutorConfig>): void;
+  /**
+   * 32.0：挂载批内全局最优指派（幂等，挂载即生效）。
+   *
+   * 挂载后每个执行批（同层就绪节点 × 并发上限切片）中的**动态选型节点**
+   * 不再逐个调用调度器（局部贪心），而是构造「节点 × 候选模型」收益
+   * 矩阵（与逐节点路径同一评分口径），经匈牙利算法求**全局总收益最优**
+   * 的一对一指派（O(n³) 精确解，携带对偶证书）——最优模型不再被同批
+   * 节点重复超订，次优模型不再闲置。计划指定 / 优化器推荐的节点不受
+   * 影响（约束优先，只对无约束节点做全局协调）。未挂载时逐位零漂移。
+   */
+  attachOptimalAssignment(options?: {
+    candidateCap?: number;
+  }): void;
+  /** 32.0：批内指派断开（诊断/回退口径） */
+  detachOptimalAssignment(): void;
+  /**
+   * 32.0：为执行批计算全局指派（节点 id → 模型 id；无指派必要的批返回 undefined）。
+   *
+   * 只有批内「动态选型节点」（无计划指定模型、无可执行推荐模型）≥ 2 且
+   * 候选模型 ≥ 2 时才升级为全局口径；被约束节点占用的模型从候选池剔除
+   * （一对一语义）。返回的 map 缺席 = 该节点走原动态路径（诚实降级）。
+   */
+  private planBatchAssignment;
   /**
    * 取走最近一次计划执行的调度决策洞察（2.0：校准闭环桥接）
    *
@@ -10590,6 +11573,10 @@ declare class Reflector implements IReflector {
   private onMemoryChange?;
   /** 蒸馏进行中标志（阈值自动触发的防抖，避免并发重复蒸馏） */
   private distilling;
+  /** 37.0：信息瓶颈蒸馏定价（attachBottleneckDistiller 后生效；未挂载零漂移） */
+  private bottleneck?;
+  /** 37.0：最近一次瓶颈定价读数（审计口径） */
+  private lastBottleneck?;
   /** 2.0：校准滑动窗口（Brier 残差滚动统计） */
   private calibrationWindow;
   constructor(params: {
@@ -10710,6 +11697,26 @@ declare class Reflector implements IReflector {
    * @param options.force 强制蒸馏（Tool 按需调用 / 首次蒸馏时使用）
    * @returns 蒸馏报告（含本次产出的语义/程序记忆与兼容策略）
    */
+  /**
+   * 37.0：挂载信息瓶颈蒸馏定价（幂等覆盖，挂载即生效）。
+   *
+   * 蒸馏门槛从纯水位（样本计数）升维为水位 + 信息量双门：X = 任务位型
+   * （类型 × 质量档 × 延迟档），Y = 成败；Blahut–Arimoto IB 压缩后的
+   * 保留率 retention = I(T;Y)/I(X;Y) < retentionFloor 时，样本与既有
+   * 知识同构——水位再高也只产出重复知识，诚实跳过（below-information）。
+   * 未挂载零漂移（原水位单门）。
+   */
+  attachBottleneckDistiller(options?: {
+    beta?: number;
+    retentionFloor?: number;
+  }): void;
+  /** 37.0：最近一次瓶颈定价读数（未挂载/未评估时 undefined） */
+  getBottleneckView(): {
+    retention: number;
+    iXY: number;
+    clusters: number;
+    sampleCount: number;
+  } | undefined;
   distillKnowledge(options?: {
     force?: boolean;
   }): Promise<DistillationReport>;
@@ -11814,6 +12821,1024 @@ interface CurvatureReport {
  * 保守口径：真实曲率 ≤ 估计值，保证因子按估计值陈述仍然成立的方向）。
  */
 declare function curvatureEstimate(f: SubmodularFunction, samples?: number, seed?: number): CurvatureReport;
+//#endregion
+//#region src/core/optimal-assignment.d.ts
+/**
+ * 32.0 全局指派内核 —— 匈牙利算法（Kuhn–Munkres）：批内全局最优匹配 + 对偶证书
+ *
+ * 动机: 计划执行按「就绪层」分批并行，批内每个节点各自调用调度器选型——
+ * **逐节点贪心**。三个同层节点都看到「模型 A 最优」，就都拿 A：最优模型
+ * 被超订（并发挤兑）、次优模型闲置，批的总质量/成本是局部视角的拼贴。
+ * 线性和指派问题（LSAP）问的是全局:
+ *
+ *   max Σ_i P_{i,σ(i)}   （批内节点 i 指派给模型 σ(i)，互不冲突）
+ *
+ *   匈牙利算法在 O(n³) 内**精确**求解（Kuhn 1955 / Munkres 1957；
+ *   Jonker–Volgenant 最短增广路 + 位势实现）。贪心没有任何近似比——
+ *   反例可以任意坏（所有节点挤同一个模型）；精确解自带最优性。
+ *
+ *   证明携带（与 15.0 同一哲学）: 算法维护 LP 对偶位势 (u, v) 满足
+ *     u_i + v_j ≤ c_ij（对偶可行性）且匹配边上 u_i + v_j = c_ij（互补松弛）
+ *   → 弱对偶: 任意可行指派成本 ≥ Σu + Σv = 本算法成本 —— **对偶证书**。
+ *   验证脚本逐位断言对偶可行性，最优性不靠信任，靠检查。
+ *
+ *   语义: 批量分配是「一次装袋」而不是「逐个抢座位」——同一批任务在
+ *   模型组合上的总收益先全局最优，再谈个体；模型并发容量、批质量、
+ *   调度评分全部进入收益矩阵，一视同仁。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致（逐节点贪心原样）。
+ */
+interface AssignmentResult {
+  /** row → col（-1 = 未指派，行数超过列数时剩余行留给原路径） */
+  assignment: number[];
+  /** 指派边的代价总和（min 口径） */
+  totalCost: number;
+  rows: number;
+  cols: number;
+  /** 对偶位势（互补松弛证书的原料；undefined = 未求解对偶） */
+  dual?: {
+    u: number[];
+    v: number[];
+  };
+}
+interface AssignmentCertificate {
+  /** 对偶可行性：∀i,j u_i + v_j ≤ c_ij + tol */
+  dualFeasible: boolean;
+  /** 互补松弛：匹配边 u_i + v_j = c_ij（±tol） */
+  complementarySlackness: boolean;
+  /** 弱对偶间隙（应为 0：Σu + Σv = 指派成本） */
+  dualityGap: number;
+  /** 证书成立 = 指派最优性被证明 */
+  optimal: boolean;
+  maxConstraintViolation: number;
+}
+/**
+ * 线性和指派（最小化）——Jonker–Volgenant 风格 O(n³)。
+ *
+ * cost 为 rows × cols 矩阵（rows ≤ cols 直接解；rows > cols 自动转置后
+ * 原地还原）。空矩阵 / 零行零列安全返回。
+ */
+declare function solveAssignment(cost: ReadonlyArray<ReadonlyArray<number>>): AssignmentResult;
+/** 最大化指派（收益矩阵 → 取负 → 最小化）。
+ *
+ * 返回的 dual 为**最大化口径**证书：u_i + v_j ≥ p_ij 对一切 (i,j) 成立、
+ * 匹配边上取等（弱对偶：任意指派的收益 ≤ Σu + Σv = 本解收益）。
+ * 最小化口径的 assignmentCertificate 请与 solveAssignment 配套使用。
+ */
+declare function solveAssignmentMax(profit: ReadonlyArray<ReadonlyArray<number>>): AssignmentResult & {
+  totalProfit: number;
+};
+/**
+ * 对偶证书检查（证明携带）:
+ *   可行 ∀i,j: u_i + v_j ≤ c_ij + tol；松弛：匹配边等号；间隙 = |Σu+Σv−成本|。
+ * 三项全过 → optimal = true：本次指派的最优性被数学证明，而非被声称。
+ */
+declare function assignmentCertificate(cost: ReadonlyArray<ReadonlyArray<number>>, result: AssignmentResult, tol?: number): AssignmentCertificate;
+/** 穷举最优（验证锚点；n ≤ 8 适用，排列枚举） */
+declare function bruteForceAssignment(cost: ReadonlyArray<ReadonlyArray<number>>): {
+  assignment: number[];
+  totalCost: number;
+};
+/**
+ * 批内收益矩阵 → 全局指派（32.0 接线辅助）。
+ *
+ * profit[i][j] = 节点 i 给模型 j 的调度评分；返回 节点 → 模型 指派
+ * （未覆盖节点返回 -1，交还逐节点原路径——行数超过列数时的诚实降级）。
+ */
+declare function assignBatch(profit: ReadonlyArray<ReadonlyArray<number>>): {
+  modelOfNode: number[];
+  totalProfit: number;
+};
+//#endregion
+//#region src/core/random-matrix.d.ts
+/**
+ * 33.0 随机矩阵内核 —— Marchenko–Pastur 噪声边界 + 特征值清洗 + 系统性风险
+ *
+ * 动机: 多模型系统的「相关性」是排险与分流的依据——两个模型同挂才需要
+ * 热备，彼此独立的模型才构成真正的冗余。但**样本相关矩阵的大多数特征
+ * 结构是纯噪声**：p 个模型 × n 个观测的 iid 噪声，其相关谱不是集中于 1，
+ * 而是铺满一整条带——
+ *
+ *   Marchenko–Pastur (1967): p×n iid（方差 σ²/n 口径）样本协方差的谱
+ *   渐近支撑于 [σ²(1−√γ)², σ²(1+√γ)²]，γ = p/n。
+ *   → **λ > λ+ 的特征值在纯噪声下几乎不可能出现**（大偏差指数衰减）：
+ *   噪声带以上 = 信号（真实的相关结构），以下 = 不可区分于噪声。
+ *
+ *   RMT 清洗（Laloux et al. 1999 / Plerou et al. 2002, 「noise dressing」）:
+ *   谱分解 → λ < λ+ 的特征值替换为其均值（保迹）→ 重组 → 对角归一。
+ *   被清洗的矩阵把「伪相关」抹掉、把真结构保留——相关性从统计幻觉
+ *   升级为可证伪的结构断言。
+ *
+ *   系统性风险判据（本内核的调度语义）: 模型失败序列的相关矩阵经清洗后，
+ *   若头号特征值仍显著超出 MP 边界（解释份额 λ₁/Σλ 超阈值），说明存在
+ *   **共同因子**（同厂商 / 同上游 / 同配额池）——一个因子倒下会同时击穿
+ *   一串「看起来分散」的模型。伪相关则会被清洗到边界内——不误报。
+ *
+ *   特征分解: 循环 Jacobi 旋转（对称矩阵，二次收敛，纯 TS 零依赖），
+ *   A = QΛQᵀ 正交到机器精度——谱的每个数字都是可复算的。
+ *
+ * 零漂移: 未挂载时一切路径与升级前逐位一致。
+ */
+/** 对称矩阵特征分解结果（特征值降序；列 vectors[k] 为对应单位特征向量） */
+interface EigenResult {
+  values: number[];
+  vectors: number[][];
+}
+/**
+ * 循环 Jacobi 对称特征分解。
+ *
+ * 每轮扫描所有非对角 (p,q)，用 Givens 旋转把 A[p][q] 消零；非对角能量
+ * 单调下降且二次收敛（经典结果，~6-10 轮到机器精度）。
+ */
+declare function jacobiEigensym(input: ReadonlyArray<ReadonlyArray<number>>, maxSweeps?: number, tol?: number): EigenResult;
+/** Marchenko–Pastur 谱边界：γ = p/n ∈ (0,1] 口径（γ > 1 时取 1/γ 的对偶带；σ² 缺省 1） */
+declare function mpEdges(gamma: number, sigma2?: number): {
+  lambdaMinus: number;
+  lambdaPlus: number;
+};
+/** 相关系数矩阵（Pearson；零方差序列 → 与一切不相关，行/列置 0、对角 1） */
+declare function correlationFromSeries(series: ReadonlyArray<ReadonlyArray<number>>): number[][];
+/** 谱清洗报告 */
+interface CleansingReport {
+  /** 降序特征值（清洗前的样本谱） */
+  eigenvalues: number[];
+  /** MP 噪声上边界 λ+（γ = p/n） */
+  noiseEdge: number;
+  /** 落入噪声带的特征值个数（含 γ>1 口径下的零谱） */
+  noiseCount: number;
+  /** 头号特征值的解释份额 λ₁ / Σλ（相关矩阵 Σλ = p） */
+  topShare: number;
+  /** λ₁ 是否超出 edgeFactor × λ+（信号判定） */
+  signal: boolean;
+  /** 清洗后的相关矩阵（对角 ≈ 1） */
+  cleaned: number[][];
+}
+/**
+ * RMT 特征值清洗（Laloux–Cizeau–Bouchaud / Plerou et al.）。
+ *
+ * 步骤: 谱分解 → λ < λ+ 的特征值替换为其均值（保迹）→ 重组 → 对角
+ * 归一化到 1。输入应已是（准）相关矩阵；ratio = p/n（模型数 / 观测数）。
+ */
+declare function cleanseCorrelation(matrix: ReadonlyArray<ReadonlyArray<number>>, ratio: number, edgeFactor?: number): CleansingReport;
+/** 系统性风险评估快照 */
+interface SystemicRiskAssessment {
+  /** 参与评估的模型数（≥ minModels 才有意义） */
+  models: number;
+  /** 头号特征值（清洗前样本谱） */
+  topEigenvalue: number;
+  /** MP 噪声上界 */
+  noiseEdge: number;
+  /** 头号特征值解释份额 */
+  topShare: number;
+  /** 与头号特征向量对齐最深的模型（共同因子暴露最深者，按 |载荷| 降序） */
+  topLoading: Array<{
+    index: number;
+    loading: number;
+  }>;
+  /** 是否判定系统性相关（信号在噪声带之上） */
+  systemic: boolean;
+  /** 窗口内观测数 */
+  observations: number;
+}
+interface SystemicRiskConfig {
+  /** 滚动窗口长度（观测数；缺省 32） */
+  window?: number;
+  /** 参与评估的最少模型数（缺省 4） */
+  minModels?: number;
+  /** 信号判定倍数：λ₁ > factor × λ+（缺省 1.1） */
+  edgeFactor?: number;
+  /** 系统性洞察的解释份额门槛（缺省 0.35） */
+  systemicShare?: number;
+}
+/**
+ * 系统性风险监视器（33.0 接线桥）。
+ *
+ * 每个观测周期 observe() 一份「各模型本期失败计数」快照；窗口攒满后
+ * 每次 assess() 对失败序列做相关矩阵 → RMT 清洗 → 共同因子判定。
+ * 纯噪声的伪相关被 MP 边界吸收（不误报）；真因子结构触发 systemic，
+ * 头号特征向量给出「谁在同一艘船上」的排序。
+ */
+declare class SystemicRiskMonitor {
+  private readonly window;
+  private readonly minModels;
+  private readonly edgeFactor;
+  private readonly systemicShare;
+  private readonly ids;
+  private series;
+  private filled;
+  constructor(config?: SystemicRiskConfig);
+  /** 一期观测：counts 里只登记有活动（Δcalls > 0）的模型，缺席记 null */
+  observe(counts: Record<string, number | null>): void;
+  /** 当前窗口是否已攒满（未满时 assess 返回 undefined——先验无知） */
+  get ready(): boolean;
+  /** 观测数（窗口内） */
+  get observations(): number;
+  /**
+   * 评估系统性风险（窗口未满 / 活跃模型不足 → undefined）。
+   *
+   * 缺席（NaN）以该模型窗口均值插补（等价于「本期无信息」的中性口径），
+   * 保证相关矩阵总是良定义。
+   */
+  assess(): SystemicRiskAssessment | undefined;
+  /** 模型 id（下标口径） */
+  get modelIds(): string[];
+}
+//#endregion
+//#region src/core/information-bottleneck.d.ts
+/**
+ * 37.0 信息瓶颈内核 —— Blahut-Arimoto：理解即压缩的算法化
+ *
+ * 动机: 知识蒸馏的门槛是水位魔数（样本计数 ≥ N 才蒸馏）。但「值得
+ * 蒸馏」的本质是信息论问题——Tishby 信息瓶颈（1999）把「压缩 X 的
+ * 表征 T 同时保留与目标 Y 相关的信息」写成变分问题：
+ *
+ *   min_{q(t|x)}  I(X;T) − β·I(T;Y)
+ *
+ *   I(T;Y) ≤ I(X;Y)（数据处理不等式——任何压缩都不可能增加信息）；
+ *   β → 0: T 塌缩为常数（什么都不值得记）；β → ∞: T = X（全保留）。
+ *   最优解由自洽方程刻画（Blahut-Arimoto 迭代收敛）：
+ *
+ *     q(y|t) ∝ Σ_x p(x) q(t|x) p(y|x)
+ *     q(t|x) ∝ q(t)·exp(−β·D_KL[p(y|x) ‖ q(y|t)])
+ *
+ *   蒸馏语义: X = 候选记忆的特征位型，Y = 任务成败结果。IB 最优压缩
+ *   保留的是「对预测成败有信息量的结构」——**保留率 retention =
+ *   I(T;Y)/I(X;Y) 是「这批样本携带多少值得蒸馏的信息」的定价**：
+ *   retention 低于阈值 → 样本与既有知识同构，水位再高也不该重复蒸馏；
+ *   retention 高 → 少量样本也值得立即固化。
+ *
+ *   MDL（11.0 理论家）说「理解即压缩」；IB 给出**压缩-相关**帕累托
+ *   前沿上的可计算最优点——蒸馏从经验水位升维为信息论定价。
+ *
+ * 零漂移: 未挂载时蒸馏门槛与升级前逐位一致。
+ */
+/** 经验联合分布（X 离散特征 × Y 离散结果） */
+interface JointDistribution {
+  /** p(x,y)（行 x 列 y；自动归一化） */
+  pxy: number[][];
+  /** 行标签（特征位型，聚类输出用；可选） */
+  xLabels?: string[];
+  /** 列标签（结果档位，如 ['fail', 'pass']；可选） */
+  yLabels?: string[];
+}
+interface BottleneckReport {
+  /** 压缩道数 |T|（实际存活的道） */
+  clusters: number;
+  /** I(X;Y)（nat）——源数据关于结果的信息上限 */
+  iXY: number;
+  /** I(T;Y)（nat）——压缩表征保留的信息 */
+  iTY: number;
+  /** 保留率 I(T;Y)/I(X;Y) ∈ [0,1]（数据处理不等式保证 ≤ 1） */
+  retention: number;
+  /** I(X;T)（nat）——压缩的复杂度代价 */
+  iXT: number;
+  /** 拉格朗日量 L = I(X;T) − β·I(T;Y)（迭代单调不增——验证锚点） */
+  lagrangian: number;
+  /** 每个特征位型 → 压缩道（argmax_t q(t|x)） */
+  assignment: number[];
+  /** 每道的后验 q(y|t) */
+  clusterPosteriors: number[][];
+  iterations: number;
+  converged: boolean;
+}
+interface BottleneckOptions {
+  /** 压缩-相关权衡 β（缺省 5；小 = 激进压缩，大 = 忠实保留） */
+  beta?: number;
+  /** 压缩道数上限 |T|（缺省 = min(|X|, 6)） */
+  clusterCap?: number;
+  maxIterations?: number;
+  tol?: number;
+  seed?: number;
+}
+/**
+ * 信息瓶颈（Blahut–Arimoto / Tishby 1999）。
+ *
+ * 迭代自洽方程至收敛；拉格朗日量单调不增（验证锚点）。|X|=1 或
+ * I(X;Y)=0 时诚实返回 retention=0（无信息可保留——不值得蒸馏）。
+ */
+declare function informationBottleneck(joint: ReadonlyArray<ReadonlyArray<number>>, options?: BottleneckOptions): BottleneckReport;
+/**
+ * 蒸馏信息定价（37.0 接线口径）。
+ *
+ * 样本形如 { features: 位型标签数组（如 ['code', 'slow']）, success }。
+ * 特征位型做 X、成败做 Y 聚合经验分布 → IB 压缩 → retention 为
+ * 「这批样本携带的值得蒸馏的信息比例」。
+ */
+declare function distillRetention(samples: ReadonlyArray<{
+  features: ReadonlyArray<string>;
+  success: boolean;
+}>, options?: BottleneckOptions): BottleneckReport & {
+  sampleCount: number;
+};
+//#endregion
+//#region src/core/spectral-ranking.d.ts
+/**
+ * 39.0 谱排序内核 —— PageRank 幂迭代：知识图的影响力从结构里涌现
+ *
+ * 动机: 记忆图的联想检索（related()）按边权排序——**局部口径**：一条
+ * 记忆与谁共现强就先想起谁。但「哪条知识重要」是全局结构性质：枢纽
+ * 记忆（与很多重要记忆共现）才是检索的骨架。PageRank（Brin–Page 1998）
+ * 把「重要性 = 被重要者指向」写成不动点：
+ *
+ *   r = d·M·r + (1−d)·v
+ *
+ *   M 为行随机转移（无向图取对称归一），d 阻尼（缺省 0.85），
+ *   v 均匀个人化向量。|λ₂(M)| ≤ 1 且谱隙 ≥ 1−d ⟹ 幂迭代线性收敛
+ *   （速率 ~ dⁿ，20 余次迭代到 1e-9）；悬挂质量守恒重分配，
+ *   Σr ≡ 1（质量守恒断言——谱的正确性可逐位检查）。
+ *
+ *   检索语义: related() 从「边权序」升维为「边权 × 邻居影响力」——
+ *   与枢纽共现的记忆先被想起；枢纽本身沉淀为知识图的骨架清单
+ *   （topInfluential）——蒸馏与遗忘的「保骨去肉」有了结构依据。
+ *
+ *   验证锚点: 环图 → 均匀分布（精确，任何阻尼）；星图 → 中心最高；
+ *   双子图 → 与度结构一致；质量总和恒 1。
+ *
+ * 零漂移: 未挂载时 related() 与升级前逐位一致。
+ */
+interface PageRankOptions {
+  /** 阻尼系数（缺省 0.85） */
+  damping?: number;
+  /** 收敛容差（L1；缺省 1e-10） */
+  tol?: number;
+  maxIterations?: number;
+}
+interface PageRankResult {
+  /** 节点 id（输入顺序） */
+  ids: string[];
+  /** 排序值（Σ = 1） */
+  scores: number[];
+  iterations: number;
+  converged: boolean;
+}
+/**
+ * 加权 PageRank（无向图：对称权重矩阵按行归一）。
+ *
+ * ids 与 weights（|ids|×|ids|，非负）由调用方给出；悬挂节点（全零行）
+ * 的质量均匀重分配（守恒）。空图安全返回。
+ */
+declare function pageRank(ids: ReadonlyArray<string>, weights: ReadonlyArray<ReadonlyArray<number>>, options?: PageRankOptions): PageRankResult;
+/** 按 PageRank 降序的前 k 节点（39.0 接线口径：知识骨架清单） */
+declare function topInfluential(result: PageRankResult, k: number): Array<{
+  id: string;
+  score: number;
+}>;
+//#endregion
+//#region src/core/first-passage.d.ts
+/**
+ * 40.0 首达时间内核 —— 反射原理 + 逆高斯 + 赌徒破产：等待恢复有了概率价格
+ *
+ * 动机: 熔断器打开后的冷却时间是配置魔数（cooldownMs 定值）。但「多久
+ * 才敢再试」是随机过程的首达问题——失败率的恢复是带漂移的随机游走，
+ * 过早重试 = 高概率再次击穿（熔断风暴），过晚 = 无谓的可用性损失。
+ *
+ *   反射原理（Brownian 对称性）: P(sup_{s≤t} W_s ≥ a) = 2·P(W_t ≥ a)
+ *     —— 最大值分布从端点分布一步读出；无漂移随机游走重越阈值 a 的
+ *     概率 = 2(1 − Φ(a/(σ√t)))，闭式。
+ *
+ *   带漂移首达（逆高斯）: dX = μ ds + σ dW 从 0 出发首达 a > 0 的
+ *     时间 T ~ IG(均值 a/μ, 形状 a²/σ²)——密度闭式、期望闭式；
+ *     μ ≤ 0 时首达概率 < 1（可能永不到达——诚实区分「会恢复」与
+ *     「结构性恶化」）。
+ *
+ *   离散口径（赌徒破产）: 每步 ±1 概率 p/q，从 i 出发触 N 先于 0 的
+ *     概率（p≠q 闭式 (1−(q/p)^i)/(1−(q/p)^N)；p=1/2 时 i/N——公平
+ *     游走的经典）。
+ *
+ *   冷却定价: 从观察到的失败间隔估计 (μ̂, σ̂)，解首达概率
+ *     P(T_recover ≤ cooldown) ≥ target 的最小 cooldown——熔断冷却从
+ *     魔数升维为「以 target 概率确信已恢复」的定价。
+ *
+ * 零漂移: 未挂载时熔断与治理行为与升级前逐位一致。
+ */
+/**
+ * 反射原理: 无漂移 Brownian（方差率 σ²）在 (0, t] 内上穿阈值 a > 0 的概率。
+ *
+ * P(sup W_s ≥ a) = 2(1 − Φ(a/(σ√t)))——与端点分布的解析恒等式
+ * （验证脚本用离散模拟对照）。
+ */
+declare function reflectionMaxProb(threshold: number, horizon: number, sigma?: number): number;
+/** 逆高斯密度: dX = μ ds + σ dW 首达 a > 0 的时间分布（μ > 0） */
+declare function inverseGaussianPdf(t: number, mean: number, shape: number): number;
+/** 逆高斯 CDF（闭式，Chhikara–Folks）：F(t) = Φ(√(λ/t)(t−μ)/μ) + e^{2λ/μ}Φ(−√(λ/t)(t+μ)/μ) */
+declare function inverseGaussianCdf(t: number, mean: number, shape: number): number;
+/** 赌徒破产: 从 i 出发、触 N 先于 0 的概率（步进 ±1，上行概率 p） */
+declare function gamblerRuin(i: number, n: number, p: number): number;
+interface FirstPassageEstimate {
+  /** 漂移估计 μ̂（每单位时间步长；≤ 0 = 结构性恶化，恢复不保证） */
+  mu: number;
+  /** 波动估计 σ̂ */
+  sigma: number;
+  /** 首达概率 P(T ≤ horizon)（μ̂ > 0 时逆高斯 CDF；≤ 0 时 1 − 破产反转口径） */
+  probByHorizon: number;
+  /** 期望恢复时间 a/μ̂（μ̂ > 0；否则 undefined） */
+  expectedTime: number | undefined;
+  /** 推荐冷却（P(恢复 ≤ cooldown) ≥ target 的最小 horizon；μ̂ ≤ 0 时 undefined） */
+  recommendedCooldown: number | undefined;
+}
+/**
+ * 冷却定价（40.0 接线口径）。
+ *
+ * failureIntervals: 观察到的相邻失败间隔（时间单位任意，一致即可）。
+ * 「恢复」被建模为失败强度游走下行首达阈值 a（缺省 = 间隔均值的一半，
+ * 即失败频率减半）：μ̂/σ̂ 由间隔序列的均值/标准差估计（间隔上升 =
+ * 恢复方向）。recommendedCooldown 二分求解。
+ */
+declare function firstPassageCooldown(failureIntervals: ReadonlyArray<number>, options?: {
+  targetProb?: number;
+  threshold?: number;
+}): FirstPassageEstimate | undefined;
+//#endregion
+//#region src/core/queueing-network.d.ts
+/**
+ * 41.0 排队网络内核 —— Jackson 乘积形式 + 串联逗留 + 瓶颈站：吞吐链路成为网络
+ *
+ * 动机: 25.0 容量规划把「一个模型」当一台 M/M/c 排队机反解并发；但一次
+ * 调度要穿过**一条链**：入队 → 模型调用 → 反思回流——端到端延迟与吞吐
+ * 上限由整条串联网络决定，瓶颈站在哪一站是排队网络的问题。
+ *
+ *   Jackson 定理 (1957): 串联（更一般地，乘积形式网络）各站的稳态
+ *   边际分布相互独立、每站各自是 M/M/c：
+ *     π(n₁,…,n_K) = Π_k π_k(n_k)，π_k 为该站独立的 M/M(c_k) 稳态
+ *   → 端到端逗留时间 = Σ_k (Wq_k + 1/μ_k)；**瓶颈站 = ρ 最大者**，
+ *     ρ_k = λ/(c_k μ_k) → 1 时全网排队爆炸（其他站再快也无济于事）。
+ *
+ *   单站口径复用 25.0 的 erlangC（等待概率 / 平均等待闭式）——内核间
+ *   协同：25.0 反解「要多少并发」，41.0 回答「链路瓶颈在哪、端到端
+ *   要多久」。验证锚点: 两站串联 M/M/1 的边际独立性（模拟对照乘积
+ *   形式）、端到端逗留 = 各站之和。
+ *
+ * 零漂移: 未挂载时心跳与调度行为与升级前逐位一致。
+ */
+/** 网络中的一站（M/M/c 口径） */
+interface QueueStation {
+  /** 站名（诊断输出用） */
+  name: string;
+  /** 到达率 λ（每毫秒；串联网络各站同 λ） */
+  lambdaPerMs: number;
+  /** 单服务员服务率 μ（每毫秒；1/平均服务时长） */
+  muPerMs: number;
+  /** 并行服务员数（并发容量） */
+  servers: number;
+}
+interface StationMetrics {
+  name: string;
+  rho: number;
+  stable: boolean;
+  /** 平均等待 Wq（毫秒） */
+  avgWaitMs: number;
+  /** 平均逗留 Wq + 1/μ（毫秒） */
+  avgSojournMs: number;
+  /** 等待概率（Erlang-C） */
+  waitProbability: number;
+}
+interface NetworkReport {
+  stations: StationMetrics[];
+  /** 端到端平均逗留（Σ 各站，Jackson 乘积形式下各站独立） */
+  endToEndSojournMs: number;
+  /** 瓶颈站（ρ 最大；不稳定站优先） */
+  bottleneck: StationMetrics | undefined;
+  /** 全网是否稳定（所有站 ρ < 1） */
+  stable: boolean;
+}
+/** 串联排队网络分析（Jackson 乘积形式；各站独立 M/M/c 边际） */
+declare function tandemNetwork(stations: ReadonlyArray<QueueStation>): NetworkReport;
+/** 网络可稳定的最小服务员配置（逐站反解 ⌈λ/μ⌉ + 1，与 25.0 反解同口径） */
+declare function minimalStableServers(stations: Omit<QueueStation, 'servers'>[]): number[];
+/**
+ * Jackson 乘积形式审计（验证锚点）：给定各站队长样本，检验两站边际
+ * 的经验相关性 ≈ 0（独立性的有限样本读数）。
+ */
+declare function jacksonIndependenceAudit(queueSamples: ReadonlyArray<[number, number]>): {
+  correlation: number;
+  samples: number;
+};
+/** 瓶颈站洞察构造（autonomy-loop 2.9 段消费） */
+declare function bottleneckInsight(report: NetworkReport, rhoThreshold?: number): {
+  message: string;
+  suggestion: string;
+  severity: number;
+} | undefined;
+//#endregion
+//#region src/core/spectral-periodicity.d.ts
+/**
+ * 42.0 谱周期内核 —— FFT 周期图 + Fisher g 检验：节律从数据里解出来
+ *
+ * 动机: 世界模型的「时段热度」是 24 小时直方图——周期被**预设**为一天。
+ * 但多模型调度面对的节律不止昼夜：分钟级突发回环、小时级批处理、
+ * 周节律——预设直方图看不见它们。谱分析把周期问题变成数据问题:
+ *
+ *   离散傅里叶变换（Cooley–Tukey 1965, O(n log n)）:
+ *     X_k = Σ_t x_t e^{−2πikt/n}
+ *   周期图 I_k = |X_k|²——信号能量在频率上的分布（Parseval: ΣI = nΣx²）。
+ *
+ *   Fisher g 检验（1929）: g = max_k I_k / Σ_k I_k——最大周期图份额；
+ *   白噪声下 g 的精确分布已知（P(g > g₀) 递推式），g 显著大 ⟹ 序列
+ *   含有**真实周期**而不是抖动。显著周期经谐波重构给出相位感知的
+ *   季节因子——「现在处于周期的哪个相位」成为可计算的读数。
+ *
+ *   调度语义: 到达历史的显著周期 + 相位 → 预测乘上季节因子（该相位
+ *   的历史期望权重），时段热度从「预设的小时直方图」升级为「从数据
+ *   里解出的频谱」；无显著周期时因子恒 1（诚实无节律）。
+ *
+ *   验证锚点: FFT 往返恒等（x ↔ FFT⁻¹FFT(x)）、Parseval 定理、已知
+ *   周期的频率恢复、纯噪声 g 检验不显著 / 注入周期显著。
+ *
+ * 零漂移: 未挂载时预测路径与升级前逐位一致。
+ */
+/** 迭代 radix-2 FFT（n 为 2 的幂；原地蝶形，bit 反转重排） */
+declare function fft(input: ReadonlyArray<number>): Array<{
+  re: number;
+  im: number;
+}>;
+/** 逆 FFT（共轭法：IFFT(X) = conj(FFT(conj(X)))/n，实序列取实部） */
+declare function ifft(spectrum: ReadonlyArray<{
+  re: number;
+  im: number;
+}>): number[];
+interface SpectralPeak {
+  /** 周期图份额（I_k / ΣI） */
+  share: number;
+  /** 周期（ bins；period = n / k） */
+  period: number;
+  /** 频率 index k */
+  frequency: number;
+  /** 相位（弧度，x_t ≈ A·cos(2πkt/n + φ)） */
+  phase: number;
+  /** 振幅（2|X_k|/n，实信号口径） */
+  amplitude: number;
+}
+interface PeriodogramReport {
+  /** 周期图（前 n/2+1 个 bin） */
+  periodogram: number[];
+  /** Fisher g 统计量（最大份额） */
+  g: number;
+  /** g 的上侧 p 值（白噪声零假设；精确分布递推） */
+  pValue: number;
+  /** 是否存在显著周期（p < alpha） */
+  significant: boolean;
+  /** 降序前 k 个谱峰（只报显著时） */
+  peaks: SpectralPeak[];
+  bins: number;
+}
+/**
+ * Fisher g 检验上侧概率（精确递推，n_bins = n/2）:
+ *   P(g > g₀) = Σ_j (-1)^{j+1} C(m, j) (1 - j·g₀)^{m-1}，j ≤ 1/g₀
+ * （Fisher 1929；只取 1 - j·g₀ > 0 的项）
+ */
+declare function fisherGUpperTail(g: number, m: number): number;
+/**
+ * 周期图 + Fisher g 检验 + 谱峰提取。
+ *
+ * series: 等间隔采样序列（自动去均值）；lengthPad: 补零目标长度（2 的幂，
+ * 缺省不补）。alpha 显著水平（缺省 0.05）。
+ */
+declare function periodogram(series: ReadonlyArray<number>, options?: {
+  alpha?: number;
+  topPeaks?: number;
+}): PeriodogramReport;
+/**
+ * 季节因子（42.0 接线口径）：给定历史等间隔序列与当前相位 bin，
+ * 显著周期时返回「该相位的历史期望权重」（谐波重构，缺省平滑到 1），
+ * 无显著周期 / 样本不足返回 1（诚实无节律——零介入）。
+ */
+declare function seasonalFactor(history: ReadonlyArray<number>, phaseBin: number): {
+  factor: number;
+  significant: boolean;
+  period: number | undefined;
+};
+//#endregion
+//#region src/core/fair-division.d.ts
+/**
+ * 44.0 公平分配内核 —— 极大极小公平 + 注水算法：没有谁被饿死是定理
+ *
+ * 动机: 探索预算分给哪些知识域？按新颖度比例分会让冷门域长期饿死
+ * （新颖度高的域永远拿走大头），均分又浪费（有的域根本没有盲区）。
+ * 网络工程的经典答案——**极大极小公平**（max-min fairness）:
+ *
+ *   分配 x 在「不减少更穷者」的意义下不可改进：
+ *     ∀i: 增加 x_i 必然存在 j，x_j ≤ x_i 且 x_j 减少
+ *   → 词典序最大：先尽量抬高最小的份额，再抬高次小的……（Bertsekas–
+ *     Gallager–Tsitsiklis 1992）。注水算法（water-filling）O(n log n)
+ *   精确求解：需求低于水位的拿满需求，剩余容量在超额需求者间均摊。
+ *
+ *   加权口径（progressive filling，weights w_i）: 份额按权重比例增长
+ *   直到容量耗尽——权重公平同时保底「最穷相对份额」。
+ *
+ *   调度语义: 探索预算按域分配从「新颖度 top-k 的赢者通吃」升级为
+ *   加权极大极小：热门域可以多拿，但任何活跃域的相对份额不被压扁——
+ *   **探索的覆盖有公平定理背书**（多样性坍缩在预算层再上一道锁）。
+ *
+ *   验证锚点: 教科书例（demands [2, 4, 2.4, 1] / 容量 5 → 前两个均摊
+ *   2.5 的经典）、公平支配性审计（不可改进性逐位检查）、加权口径
+ *   按权重比例、需求全小于容量时各取所需。
+ *
+ * 零漂移: 未挂载时探索预算分配与升级前逐位一致。
+ */
+interface FairAllocation {
+  /** 各方份额 */
+  shares: number[];
+  /** 注水水位（需求超额者共同的水位；全需求内则 = ∞ 语义，此处 = max(share)） */
+  waterLevel: number;
+  /** 未满足的总需求 */
+  deficit: number;
+}
+/**
+ * 极大极小公平分配（注水算法）。
+ *
+ * demands: 各方需求（≥ 0）；capacity ≥ 0。需求 ≤ 水位者拿满需求，
+ * 超额者在剩余容量中均摊。词典序最优性是构造性保证。
+ */
+declare function maxMinFair(demands: ReadonlyArray<number>, capacity: number): FairAllocation;
+/**
+ * 加权极大极小公平（progressive filling：各方按权重比例注水）。
+ *
+ * 份额增长率 ∝ w_i；某方到达需求后退出，其余继续。w_i 全相等时退化为
+ * 经典 max-min（等权重是特例——验证锚点之一）。
+ */
+declare function weightedMaxMinFair(demands: ReadonlyArray<number>, weights: ReadonlyArray<number>, capacity: number): FairAllocation;
+/**
+ * 公平支配性审计（验证锚点）: 极大极小的定义性检查——
+ * ∀i: x_i < demand_i（未拿满）⟹ ∃j≠i: x_j/w_j ≤ x_i/w_i 且 x_j > 0
+ * （i 的任何增长必挤占一个相对份额不高于自己的持有者）。
+ */
+declare function fairnessAudit(demands: ReadonlyArray<number>, allocation: ReadonlyArray<number>, weights?: ReadonlyArray<number>): {
+  fair: boolean;
+  violations: number;
+};
+/** 域预算接线口径：需求（各域盲区数 × 新颖度权重）→ 加权公平份额（整数保底：活跃域优先各得 1，再按权重注水） */
+declare function fairDomainBudget(domains: ReadonlyArray<{
+  id: string;
+  demand: number;
+  weight: number;
+}>, budget: number): Array<{
+  id: string;
+  share: number;
+}>;
+//#endregion
+//#region src/core/budget-allocation.d.ts
+/**
+ * 45.0 预算分配内核 —— OCBA 最优计算预算：找最优者的每一步都花在刀刃上
+ *
+ * 动机: 基准测试与 A/B 比较的资源分配是均匀的——每个候配置跑同样
+ * 多次。但「确认谁最优」不需要均匀：差距大的候选早早出局、方差大的
+ * 候选需要更多样本。Chen 等人的最优计算预算分配（OCBA, 2000）把
+ * 「以最小总预算最大化正确选出最优者的概率 P(CS)」近似成渐近有效
+ * 的闭式分配:
+ *
+ *   n_i / n_j = (σ_i/δ_i)² / (σ_j/δ_j)²        （i, j 非最优候选间）
+ *   n_b = σ_b · sqrt(Σ_{i≠b} n_i²/σ_i²)         （最优者基准样本）
+ *   δ_i = |μ_i − μ_b|（与最优者的差距）
+ *
+ *   渐近最优性 (Glynn–Juneja 2004): 该分配在 budget → ∞ 时最大化
+ *   P(CS) 的指数衰减率——**每一步采样都花在刀刃上**。贝叶斯最优实验
+ *   设计（10.0 科学家）面向「知识获取」，OCBA 面向「择优确认」——
+ *   两者互补。
+ *
+ *   调度语义: 基准预算在场景间的分配从均匀升级为 OCBA——多花样本在
+ *   「不确定是否最差」的场景上（找瓶颈子系统），差距明确的场景早停。
+ *   验证锚点: Monte Carlo 对照（OCBA vs 均匀的 P(CS)）、固定分配的
+ *   渐近比例与公式一致、预算守恒。
+ *
+ * 零漂移: 未挂载时基准执行与升级前逐位一致。
+ */
+interface OcbaCandidate {
+  /** 候选名（诊断输出用） */
+  name: string;
+  /** 试点均值估计（越大越优或越小越优，由 biggerIsBetter 统一口径） */
+  mean: number;
+  /** 试点标准差估计 */
+  std: number;
+}
+interface OcbaAllocation {
+  /** 各候选分配的样本数（整数，总和 = budget） */
+  counts: number[];
+  /** 最优者下标（按试点均值） */
+  best: number;
+  /** 分配依据的差距 δ_i */
+  gaps: number[];
+  total: number;
+}
+/**
+ * OCBA 迭代分配（Chen et al. 2000）。
+ *
+ * candidates: 试点统计；budget: 总样本预算；biggerIsBetter: 均值大者优
+ * （缺省 true——如吞吐；false 用于延迟类越小越优）。
+ * 试点 std ≤ 0 时给最小噪声下限（方差为零的候选按公式退化，防除零）。
+ */
+declare function ocbaAllocate(candidates: ReadonlyArray<OcbaCandidate>, budget: number, options?: {
+  biggerIsBetter?: boolean;
+  minSamples?: number;
+}): OcbaAllocation;
+/**
+ * Monte Carlo P(CS) 对照（验证锚点）: 按给定分配重复模拟「采样 → 选
+ * 经验最优」的正确概率。用于断言 OCBA 分配的 P(CS) ≥ 均匀分配。
+ */
+declare function monteCarloCorrectSelection(trueMeans: ReadonlyArray<number>, trueStds: ReadonlyArray<number>, counts: ReadonlyArray<number>, biggerIsBetter: boolean, reps?: number, seed?: number): number;
+//#endregion
+//#region src/core/quorum-systems.d.ts
+/**
+ * 46.0 法定人数内核 —— Quorum 交叉 + 拜占庭口径 + 负载：共识安全性可检查
+ *
+ * 动机: Raft 的安全性靠「多数派两两相交」这条组合性质——但它从未被
+ * 系统检查过，只是被相信。法定人数系统（quorum systems）把共识安全
+ * 变成可验证的组合对象:
+ *
+ *   交叉性质: 任意两个法定人数相交 ⟹ 读到的写者集合非空
+ *   （一致性）。多数派 quorum 交 |V|/2（崩溃容错 f < n/2 的根源）。
+ *
+ *   拜占庭口径: 任意两个 quorum 相交于 ≥ f+1 个节点 ⟹ 交集含至少
+ *   一个诚实节点（谎言无法同时骗过两个 quorum）——Q² 系统
+ *   （n > 3f 时的经典构造）。f ≥ n/3 时不存在这样的系统——
+ *   「3f+1 下界」不是工程建议，是不存在性定理。
+ *
+ *   负载 (Naor–Wool): 系统负载 L = max_Q |Q|/n——读放大的稳态代价；
+ *   多数派系统 L = (⌊n/2⌋+1)/n，值得知道而非接受。
+ *
+ *   验证锚点: 多数派两两相交（枚举）、奇偶 n 的界、拜占庭 n>3f 可行/
+ *   n≤3f 不可行的判别、负载闭式。
+ *
+ * 零漂移: 纯分析内核（引擎只读方法），未挂载零介入。
+ */
+interface QuorumAudit {
+  nodes: number;
+  /** 法定人数大小（多数派口径 ⌊n/2⌋+1） */
+  quorumSize: number;
+  /** 容错上界 f = quorumSize − 1（崩溃口径：非交集部分全坏仍安全） */
+  crashFaultTolerance: number;
+  /** 两两 quorum 的最小交集大小 */
+  minIntersection: number;
+  /** 交集性质是否成立 */
+  intersects: boolean;
+  /** 拜占庭口径：最小交集 ≥ f_byz+1 所容许的最大 f_byz */
+  byzantineTolerance: number;
+  /** 系统负载 max|Q|/n（多数派闭式） */
+  load: number;
+}
+/**
+ * 多数派法定人数审计（n ≥ 1）。
+ *
+ * minIntersection = 2q − n（q = ⌊n/2⌋+1）；拜占庭容错 = minIntersection−1
+ * （交集 ≥ f+1 ⟺ f ≤ 交−1）；n ≤ 3f ⟹ 拜占庭容错 < f——诚实给出。
+ */
+declare function majorityQuorumAudit(n: number): QuorumAudit;
+/** 枚举所有 ⌊n/2⌋+1 子集的两两最小交集（验证锚点；n ≤ 15 适用） */
+declare function bruteForceMinIntersection(n: number, quorumSize?: number): number;
+/**
+ * 拜占庭可行性判别（n > 3f 存在性口径）：给定 n 与目标拜占庭容错 f，
+ * 最优 quorum 构造 q = ⌈(n+f+1)/2⌉ 是否给出 ≥ f+1 交集——n ≥ 3f+1
+ * 时可行（经典构造）；n ≤ 3f 时诚实 false——3f+1 下界（不存在性定理，
+ * 换任何 quorum 系统都救不了）。
+ */
+declare function byzantineFeasible(n: number, f: number): boolean;
+/**
+ * Raft 集群安全审计（46.0 接线口径，纯读取）。
+ *
+ * members: 集群节点数（Raft 配置口径）；产出多数派交叉、容错上界与
+ * 负载——共识安全性从「被相信」升级为「被检查」。
+ */
+declare function raftSafetyAudit(members: number): QuorumAudit & {
+  verdict: string;
+};
+//#endregion
+//#region src/core/crdt.d.ts
+/**
+ * 47.0 无冲突复制内核 —— CRDT 三定律：副本收敛是代数性质
+ *
+ * 动机: 分布式同步的合并语义若不满足代数定律，副本在网络分区/乱序
+ * 送达下发散且不可检测。CRDT（Shapiro et al. 2011）把「收敛」从协议
+ * 希望变成**合并算子的代数性质**:
+ *
+ *   强最终一致性定理: 合并 ⋃ 满足交换/结合/幂等三律（join-semilattice）
+ *   ⟹ 任意乱序/重复送达的消息流之后，所有活跃副本状态相等——
+ *   不需要共识、不需要协调、不需要可信信道。
+ *
+ *   - G-Counter: 每节点只加自己的分量，合并 = 逐分量 max
+ *   - OR-Set (add-win): 元素带唯一标签，add 打标签 / remove 摘标签，
+ *     合并 = 标签并集；并发 add+remove 中 add 胜（语义选择，非歧义）
+ *   - LWW-Register: 时间戳偏序 + 节点 id 平局仲裁（全序保证合并唯一）
+ *
+ *   验证锚点: 随机操作流的任意置换应用 → 状态逐位相等（收敛定理的
+ *   有限样本验证）；三律逐位检查。
+ *
+ * 零漂移: 纯数据结构内核（引擎按需使用），未挂载零介入。
+ */
+/** G-Counter（增长计数器；merge = 逐分量 max） */
+declare class GCounter {
+  private counts;
+  increment(nodeId: string, by?: number): void;
+  value(): number;
+  state(): Record<string, number>;
+  merge(other: GCounter): void;
+  clone(): GCounter;
+}
+/** OR-Set（add-win 观察者集；标签唯一 → 并发 add 胜 remove） */
+declare class ORSet {
+  private added;
+  private removed;
+  add(element: string, tag?: string): void;
+  remove(element: string): void;
+  has(element: string): boolean;
+  elements(): string[];
+  merge(other: ORSet): void;
+  clone(): ORSet;
+}
+/** LWW-Register（时间戳 + 节点 id 仲裁的全序最后写胜） */
+declare class LWWRegister<T> {
+  private readonly nodeId;
+  private value?;
+  private stamp;
+  private writer;
+  constructor(nodeId: string);
+  set(value: T, stamp: number): void;
+  get(): T | undefined;
+  state(): {
+    value?: T;
+    stamp: number;
+    writer: string;
+  };
+  merge(other: {
+    value?: T;
+    stamp: number;
+    writer: string;
+  }): void;
+}
+/**
+ * 收敛审计（验证锚点）: 两副本各自应用同批操作的任意置换，再互相
+ * 合并（含重复合并）——三律成立 ⟹ 状态逐位相等（强最终一致性的
+ * 有限样本验证）。返回最大状态偏差（应恒 0）。
+ */
+declare function crdtConvergenceAudit(ops: ReadonlyArray<{
+  node: 'a' | 'b';
+  kind: 'inc';
+  by: number;
+} | {
+  node: 'a' | 'b';
+  kind: 'add' | 'remove';
+  element: string;
+}>, permutation: ReadonlyArray<number>): {
+  counterDelta: number;
+  setSymmetricDiff: number;
+};
+//#endregion
+//#region src/core/secret-sharing.d.ts
+/**
+ * 48.0 秘密共享内核 —— Shamir 阈值 + 随机性审计：信任被分形，密钥被检验
+ *
+ * 动机: 主密钥单点保管 = 单点沦陷即全失。Shamir 秘密共享（1979）把
+ * 秘密拆成 n 份、任意 t 份可重建、t−1 份**信息论零泄露**:
+ *
+ *   秘密 = 域 GF(p) 上 t−1 次多项式 f 的常数项，份额 = f(x_i)。
+ *   重建 = t 个点上的 Lagrange 插值（任意 t 个点唯一确定 f ⟹ f(0)
+ *   唯一）；t−1 个点对 f(0) 的每种猜测都存在唯一一致的多项式——
+ *   **完备保密**（不是计算难度，是信息论意义：t−1 份与秘密统计独立）。
+ *
+ *   随机性审计（NIST SP 800-22 的两个核心检验）:
+ *   - 频数检验: 1 的占比偏离 1/2 的 |χ| 口径（渐近 N(0,1)）
+ *   - 游程检验: 游程数偏离期望（同值段切换次数的 χ² 口径）
+ *   好的 PRNG 通过、偏置源被拒绝——「密钥的原料合格吗」可检查。
+ *
+ *   验证锚点: 任意 t 份子集重建成功（枚举）、t−1 份子集重建出
+ *   随机等可能值（零泄露的实验读数）、Lagrange 恒等式、
+ *   均匀字节通过审计 / 偏置字节被拒。
+ *
+ * 零漂移: 纯函数内核（引擎按需使用），未挂载零介入。
+ */
+interface ShamirShare {
+  /** 份额点 x（非 0） */
+  x: number;
+  /** f(x)（域元素，字符串化 BigInt） */
+  y: string;
+}
+/** Shamir 拆分：secret（UTF-8）→ n 份，阈值 t ≤ n 重建 */
+declare function shamirSplit(secret: string, n: number, threshold: number, rng?: () => number): ShamirShare[];
+/** Shamir 重建：任意 ≥ 阈值份额 → 秘密（Lagrange 插值 f(0)） */
+declare function shamirCombine(shares: ReadonlyArray<ShamirShare>): string;
+interface EntropyAudit {
+  bytes: number;
+  /** 频数检验：1 的占比（应 ≈ 0.5） */
+  oneRatio: number;
+  /** 频数 χ 统计量（渐近 N(0,1)；|χ| > 3 拒绝） */
+  frequencyChi: number;
+  /** 游程数（同值段数；期望 ≈ n/2） */
+  runs: number;
+  /** 游程偏离 z 口径 */
+  runsZ: number;
+  /** 综合判定（两项 |z| ≤ 3 通过） */
+  passed: boolean;
+}
+/** 随机性审计（频数 + 游程检验；NIST SP 800-22 口径） */
+declare function entropyAudit(bytes: ReadonlyArray<number>): EntropyAudit;
+//#endregion
+//#region src/core/multiscale-wavelet.d.ts
+/**
+ * 49.0 多尺度内核 —— Haar 小波：趋势与突发在不同尺度上分离
+ *
+ * 动机: KPI 异常检测都在**单一时间尺度**上看序列（窗口 z-score、NIS、
+ * 形状漂移）——缓慢漂移被当作背景，尖锐突发被当作噪声。Haar 小波
+ * 把序列分解为**对数个尺度**的正交分量（Mallat 1989）:
+ *
+ *   H = I ⊗ ... 正交矩阵（能量守恒 ‖Hx‖ = ‖x‖，完美重构 H⁻¹ = Hᵀ）
+ *   每层：近似分量（趋势/2 尺度）+ 细节分量（该尺度的突发）
+ *
+ *   读法: 最粗尺度的近似 = 长期水平；最细尺度的细节能量 = 瞬时抖动；
+ *   中间尺度的细节尖峰 = 特定周期的异常。**同一份 KPI，对数个透镜**。
+ *
+ *   验证锚点: 完美重构（Hᵀ·Hx = x 机器精度）、能量守恒（Parseval）、
+ *   合成「慢趋势 + 快突发」的双尺度分离（各尺度能量落位）。
+ *
+ * 零漂移: 未挂载时元认知输出与升级前逐位一致。
+ */
+interface WaveletDecomposition {
+  /** 每层细节系数（从最细到最粗：scale 1, 2, ..., n/2） */
+  details: number[][];
+  /** 最粗尺度近似（趋势水平） */
+  approximation: number[];
+  /** 各尺度能量占比（细节 + 近似，和 = 1） */
+  energyShares: Array<{
+    scale: string;
+    share: number;
+  }>;
+  length: number;
+}
+/** Haar 离散小波变换（n 为 2 的幂；O(n log n)） */
+declare function haarDecompose(series: ReadonlyArray<number>): WaveletDecomposition;
+/** Haar 逆变换（完美重构验证锚点） */
+declare function haarReconstruct(decomposition: WaveletDecomposition): number[];
+interface MultiScaleView {
+  /** 最粗趋势水平（去尺度化：近似系数 / 2^(levels/2) 语义上即长期均值口径） */
+  trendLevel: number;
+  /** 最细尺度（逐点）细节能量占比 */
+  burstShare: number;
+  /** 能量最集中的非趋势尺度 */
+  dominantScale: string;
+  /** 中尺度（8-32 点）细节能量占比（漂移带） */
+  driftShare: number;
+}
+/** 多尺度读数（49.0 接线口径：元认知 KPI 的尺度透镜） */
+declare function multiScaleView(series: ReadonlyArray<number>): MultiScaleView;
+//#endregion
+//#region src/core/matrix-completion.d.ts
+/**
+ * 50.0 矩阵补全内核 —— 低秩交替最小二乘：冷启动能力从潜维度涌现
+ *
+ * 动机: 新模型注册时 taskScores 一片空白——要积累多少次调用才能
+ * 知道它擅长什么？如果「模型 × 任务类型」的能力矩阵是**低秩**的
+ * （少数几个潜能力维度决定一切——语言能力/推理能力/长文本能力…），
+ * 那么观测到的少量条目就足以**补全**整个矩阵:
+ *
+ *   低秩模型: M ≈ U·Vᵀ（rank r ≪ min(n,m)）；观测 Ω 上的条目
+ *   最小化 Σ_{(i,j)∈Ω} (M_ij − (UVᵀ)_ij)² —— 交替最小二乘（ALS）:
+ *   固定 V 解 U（每行闭式线性解）、固定 U 解 V，交替至收敛。
+ *   恢复条件（Candès–Recht 2009）: 秩 r 与相干性温和、观测密度
+ *   |Ω| ≳ r·n·log n 量级时精确恢复（定理背书，非祈祷）。
+ *
+ *   调度语义: 新模型在若干任务类型上的早期成绩 → ALS 潜因子 →
+ *   未测任务类型上的能力预测——**冷启动选型从「零样本瞎选」升级
+ *   为潜维度外推**；同时低秩残差大的模型是「能力异常」（不适合
+ *   潜维度解释，需单独画像）。
+ *
+ *   验证锚点: 合成低秩矩阵 + 噪声的部分观测 → 恢复误差 ≪ 观测噪声
+ *   的若干倍；满秩随机矩阵诚实高残差（不强行低秩解释）。
+ *
+ * 零漂移: 纯诊断口径（getAttachedDiagnostics / coldStartEstimate），
+ *   未挂载时评分路径逐位一致。
+ */
+interface MatrixCompletionOptions {
+  /** 潜维数 r（缺省 3） */
+  rank?: number;
+  maxIterations?: number;
+  tol?: number;
+  /** L2 正则（缺省 1e-3，防过拟合小样本行） */
+  lambda?: number;
+  seed?: number;
+}
+interface CompletionReport {
+  /** 因子矩阵（n×r 与 m×r） */
+  rowFactors: number[][];
+  colFactors: number[][];
+  /** 观测条目上的 RMSE（拟合度） */
+  trainRmse: number;
+  /** 观测数 / 全矩阵 */
+  observedRatio: number;
+  iterations: number;
+  converged: boolean;
+  /** 有效秩读数：拟合能量 / 总能量（低秩假设的成色） */
+  lowRankShare: number;
+}
+/**
+ * 低秩矩阵补全（ALS；行/列闭式岭回归交替）。
+ *
+ * observed: 观测条目列表 [{i, j, value}]；n/m 为矩阵维度。
+ * 行/列因子以确定性小扰动初始化（对称破缺）。
+ */
+declare function completeMatrix(observed: ReadonlyArray<{
+  i: number;
+  j: number;
+  value: number;
+}>, n: number, m: number, options?: MatrixCompletionOptions): CompletionReport;
+/** 补全预测：M_ij ≈ u_i · v_j（观测未覆盖的条目外推） */
+declare function completedEntry(report: CompletionReport, i: number, j: number): number | undefined;
 //#endregion
 //#region src/core/resilience.d.ts
 /**
@@ -14045,6 +16070,220 @@ interface SchedulerConfig {
       /** 主题覆盖强度 c ∈ (0,1]（缺省 0.7） */
       coverageStrength?: number;
     };
+    /**
+     * 31.0：对抗组合配置（调度权重的无悔学习口径）。
+     * enabled 时模型评分叠加 Fixed-Share Hedge 有界乘数（[0.25,4]）：
+     * 每次节点完成回报质量（成功 = 质量，失败 = 0），被对手打爆的模型
+     * 以每失败一轮 e^{−η} 的速度降权——比统计口径（Wilson 时间衰减）
+     * 快一个数量级；α 份额回灌保证漂移世界（模型能力翻转）可跟踪。
+     * 对事后最优固定模型遗憾 ≤ √(2T lnN)（对手无关）。缺省关闭（零漂移）。
+     */
+    hedgePortfolio?: {
+      enabled: boolean;
+      /** 学习率 η ∈ (0,1]（缺省 0.3） */
+      eta?: number;
+      /** Fixed-Share 回灌率 α ∈ [0,1)（缺省 0.05；0 = 经典 Hedge） */
+      alpha?: number;
+    };
+    /**
+     * 32.0：批内全局最优指派配置（匈牙利算法）。
+     * enabled 时同批动态选型节点（≥2 个且候选 ≥2）不再逐节点贪心，
+     * 而是构造「节点 × 候选」评分矩阵求**全局总收益最优**一对一指派
+     * （O(n³) 精确解 + 对偶证书）——最优模型不被同批节点重复超订。
+     * 计划指定/优化器推荐的节点不受影响（约束优先）。缺省关闭（零漂移）。
+     */
+    optimalAssignment?: {
+      enabled: boolean;
+      /** 每任务类型进入候选池的评分前 K（缺省 8） */
+      candidateCap?: number;
+    };
+    /**
+     * 33.0：随机矩阵配置（失败相关性的噪声清洗与系统性风险）。
+     * enabled 时心跳 2.8 段把各模型每期失败计数喂入滚动窗口，攒满后
+     * 相关矩阵经 Marchenko–Pastur 边界清洗：伪相关被噪声带吸收（不
+     * 误报），头号特征值显著超带且解释份额达标 → systemic-risk 洞察
+     * （共同因子暴露：同一上游/厂商的模型会同沉浮，热备冗余是幻觉）。
+     * 缺省关闭（零漂移）。
+     */
+    randomMatrix?: {
+      enabled: boolean;
+      /** 滚动窗口长度（心跳期数；缺省 32） */
+      window?: number;
+      /** 参与评估的最少活跃模型数（缺省 4） */
+      minModels?: number;
+      /** 信号判定倍数 λ₁ > factor × λ+（缺省 1.1） */
+      edgeFactor?: number;
+      /** 系统性洞察的解释份额门槛（缺省 0.35） */
+      systemicShare?: number;
+    };
+    /**
+     * 34.0：CVaR 超时预算配置（超时的最坏尾部定价）。
+     * enabled 时每模型超时 = margin × CVaR_α(该模型延迟史)（α 为置信
+     * 水平，缺省 0.95 即最坏 5% 尾），钳位 [floorMs, capMs]——「按最坏
+     * 尾部的期望定价」取代固定魔数：重尾模型自动获得更长预算、轻尾模型
+     * 不被一刀切。依赖 robustStatistics 启用（延迟样本流共用）；样本不足
+     * minSamples 回退全局缺省。缺省关闭。
+     */
+    cvarTimeouts?: {
+      enabled: boolean;
+      /** 置信水平 α（CVaR_α 取最坏 1−α 尾；缺省 0.95） */
+      alpha?: number;
+      /** 裕度乘数（缺省 1.5） */
+      margin?: number;
+      /** 样本下限（缺省 30） */
+      minSamples?: number;
+      /** 下限毫秒（缺省 5000） */
+      floorMs?: number;
+      /** 上限毫秒（缺省 300000） */
+      capMs?: number;
+    };
+    /**
+     * 35.0：并发反馈控制配置（并发的闭环 LQR 驾驭）。
+     * enabled 时 computeParallelism 从静态口径（总容量钳位）升级为闭环：
+     * 每次调用观测总利用率 → LQR 增益步（DARE 闭式解出的增益，Lyapunov
+     * 证书背书稳定）→ 新上限 [1,16]；死区抗抖振、钳位抗饱和。25.0 排队论
+     * 反解给的是静态目标，本内核让系统在非平稳负载下自动追踪它。缺省关闭。
+     */
+    concurrencyControl?: {
+      enabled: boolean;
+      /** 目标利用率 ∈ (0,1]（缺省 0.75） */
+      target?: number;
+      /** 标称被控增益 b（缺省 0.4） */
+      plantGain?: number;
+      /** 控制权重 r（缺省 4；越大越保守） */
+      r?: number;
+      /** 死区半宽（缺省 0.05） */
+      deadband?: number;
+    };
+    /**
+     * 37.0：信息瓶颈蒸馏定价配置（理解即压缩的算法化）。
+     * enabled 时知识蒸馏门槛从纯水位升维为水位 + 信息量双门：候选
+     * 样本（任务位型 × 成败）经 Blahut-Arimoto IB 压缩，保留率
+     * I(T;Y)/I(X;Y) 低于 retentionFloor → 样本同构，水位再高也只产出
+     * 重复知识，诚实跳过（below-information）。缺省关闭（零漂移）。
+     */
+    informationBottleneck?: {
+      enabled: boolean;
+      /** 压缩-相关权衡 β（缺省 5） */
+      beta?: number;
+      /** 保留率下限（缺省 0.4） */
+      retentionFloor?: number;
+    };
+    /**
+     * 38.0：动力学体质诊断配置（KPI 的混沌/持续/反持续分类）。
+     * enabled 时元认知对每个 KPI 序列积累窗口，满窗后做 Rosenstein
+     * Lyapunov + R/S Hurst 体质分类；体质确立的翻转沿产出洞察（混沌
+     * → 预测视野 ~1/λ₁ 步；持续 → 趋势加权；反持续 → 突破降权）。
+     * 缺省关闭（零漂移）。
+     */
+    chaosDiagnostics?: {
+      enabled: boolean;
+      /** 分类前最少样本点（缺省 96） */
+      minPoints?: number;
+      /** 混沌判定阈值 λ₁（缺省 0.05 nat/步） */
+      lambdaThreshold?: number;
+      /** Hurst 偏离半宽 δ（缺省 0.08） */
+      hurstDelta?: number;
+    };
+    /**
+     * 39.0：谱排序影响力配置（知识图的 PageRank 骨架）。
+     * enabled 时记忆图共现网络经 PageRank 幂迭代解出每条知识的结构
+     * 影响力：related() 联想序升维为「边权 × 邻居影响力」（与枢纽
+     * 共现者先被想起），topInfluential 输出知识骨架清单。缺省关闭。
+     */
+    spectralRanking?: {
+      enabled: boolean;
+      /** 阻尼系数（缺省 0.85） */
+      damping?: number;
+    };
+    /**
+     * 40.0：首达时间冷却定价配置（熔断恢复的概率口径）。
+     * enabled 时治理器记录失败时间戳；熔断打开沿按逆高斯首达模型定价
+     * 「以 target 概率确信失败强度已恢复」的最小冷却建议（μ̂ ≤ 0 的
+     * 结构性恶化诚实给出不可达）。建议口径，不改既有状态机时序。
+     * 缺省关闭（零记录零介入）。
+     */
+    firstPassageCooldown?: {
+      enabled: boolean;
+      /** 恢复置信目标（缺省 0.9） */
+      targetProb?: number;
+    };
+    /**
+     * 41.0：排队网络配置（心跳 2.9 段的串联瓶颈洞察）。
+     * enabled 时各模型作为独立 M/M/c 站、到达率按当前流量份额分摊，
+     * Erlang-C 口径解出瓶颈站（ρ 最大）——单站反解（25.0）看不到的
+     * 「哪一站钳制整条链路」成为可计算读数，接近饱和产出洞察。
+     * 缺省关闭（零漂移）。
+     */
+    queueingNetwork?: {
+      enabled: boolean;
+      /** 瓶颈站告警利用率阈值（缺省 0.85） */
+      rhoThreshold?: number;
+    };
+    /**
+     * 42.0：谱日历配置（到达节律的频谱解出）。
+     * enabled 时世界模型的热度因子从「预设为一天的小时直方图」升级为
+     * FFT 周期图 + Fisher g 检验：存在显著周期（任意周期——分钟回环/
+     * 昼夜/周节律）时切换为相位感知的谐波季节因子；不显著时逐位回退
+     * 原直方图口径。缺省关闭（零漂移）。
+     */
+    spectralCalendar?: {
+      enabled: boolean;
+      /** 小时分桶数（2 的幂最优；缺省 128） */
+      bins?: number;
+    };
+    /**
+     * 43.0：容量前沿配置（类型需求 × 模型容量的最大流诊断）。
+     * enabled 时执行批回写待执行需求，流网络上解 max-flow（可立即满足
+     * 的最大并发派发）与 min-cut（钳制者归因：类型在饿还是模型是独木
+     * 桥，割容量 = 流值证书）。纯诊断口径，不改变派发行为。缺省关闭。
+     */
+    capacityFrontier?: {
+      enabled: boolean;
+    };
+    /**
+     * 44.0：公平预算配置（探索预算的域级极大极小分配）。
+     * enabled 时探索预算按域（taskType）加权极大极小注水（新颖度权重）
+     * ——热门域可以多拿，但任何活跃域的相对份额不被压扁（词典序最优，
+     * Bertsekas–Gallager）。缺省关闭（零漂移——原 top-k / 次模路径）。
+     */
+    fairBudget?: {
+      enabled: boolean;
+    };
+    /**
+     * 45.0：OCBA 预算分配配置（基准瓶颈确认的最优预算）。
+     * enabled 时 runAll 报告附加 bottleneckFocus——以各场景延迟统计为
+     * 试点，按 OCBA（P(CS) 渐近最优）给出下一轮确认预算的最优分配。
+     * 纯报告口径。缺省关闭（零漂移）。
+     */
+    ocbaAllocator?: {
+      enabled: boolean;
+      /** 下一轮确认预算（缺省 200） */
+      confirmationBudget?: number;
+    };
+    /**
+     * 49.0：多尺度小波视图配置（元认知 KPI 的尺度透镜）。
+     * enabled 时 KPI 序列经 Haar 小波分解为对数个正交尺度——趋势水平/
+     * 漂移带能量/瞬时突发分离（单尺度异常检测看不见的结构）。纯读数
+     * 口径（waveletView），缺省关闭（零漂移）。
+     */
+    waveletView?: {
+      enabled: boolean;
+      /** 补全读数前最少样本点（缺省 64） */
+      minPoints?: number;
+    };
+    /**
+     * 50.0：潜因子补全配置（模型能力的冷启动外推）。
+     * enabled 时「模型 × 任务类型」能力矩阵经 ALS 低秩补全：未观测
+     * 条目由潜因子外推（Candès–Recht 恢复条件），新模型冷启动选型
+     * 从零样本升级为潜维度预测。纯诊断口径（coldStartEstimate），
+     * 缺省关闭（零漂移）。
+     */
+    latentFactors?: {
+      enabled: boolean;
+      /** 潜维数 r（缺省 3） */
+      rank?: number;
+    };
     /** 目标分解器注入（测试离线模拟） */
     decomposer?: GoalDecomposer;
   };
@@ -14373,4 +16612,4 @@ declare const pluginEntry: typeof apply & {
   provide: string[];
 };
 //#endregion
-export { AbstractSkillEntry, AbstractionConfig, AbstractionEngine, AbstractionStats, AccountId, ActionResult, ActiveTask, AdjustmentKnob, AdjustmentReport, AgentBase, AgentGoal, AgentKind, AgentMeta, AgentMode, AgentProposal, AgentReputation, AliasMap, AnytimeEvidenceConfig, AnytimeEvidenceRegistry, AnytimeEvidenceRegistryReport, AnytimeEvidenceStream, AnytimeEvidenceView, AnytimeVerdict, AppError, ArbitrationResult, ArchiveReport, ArmIndex, ArmStats, ArrivalPrediction, ArrivalStats, AssetKind, AuditEntry, AutonomyLoop, AutonomyLoopConfig, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, type BackoffConfig, BayesianEstimate, BayesianOptimizer, BeliefAsset, BeliefMarket, BeliefMarketConfig, BeliefOutcome, BeliefPosition, type SettlementReport as BeliefSettlementReport, BeliefStatus, BeliefView, BenchmarkEngine, BenchmarkReport, BenchmarkResult, BenchmarkScenario, BenchmarkStats, BetReceipt, BidOrder, BoState, BoSuggestion, type BreakerProbe, type BreakerState, type BreakerStatus, BuiltinScenarioContext, BwKArmStat, BwKBudgets, BwKCandidateView, BwKConfig, BwKRouter, BwKVerdict, CHANNEL_GROUPS, CalibrationRecord, CalibrationStatus, CanaryState, CancelReport, CapacityAdvisor, CapacityPlan, CapacityPlanner, CapacityPlannerConfig, CascadeHandler, CausalEdge, CausalEdgeEvidence, CausalEffect, CausalExperiment, CausalExplorationRecord, CausalKernel, CausalKernelConfig, CausalNode, CausalNodeKind, CausalQuestion, CellularSheaf, ChangeEntry, ChangePayload, ChannelGroup, ChatMessage, ChatOptions, CircuitBreaker, type CircuitBreakerConfig, CircuitBreakerInfo, CircuitBreakerRegistry, CircuitState, ClusterNodeConfig, ClusterStatus, CoalitionValueFunction, CognitiveEconomy, CognitiveMarket, ConfidenceSequenceView, Config, ConfigError, ConformalInterval, ConformalIntervalConfig, ConformalIntervalEngine, ConformalStatus, ConsensusLogEntry, ConstructorOptionsGpSeries, ContributorProb, CounterfactualInsight, CoverageDriftMonitor, CoverageDriftView, CryptoEngine, CryptoError, CryptoResult, CuriosityEngine, CuriosityEngineConfig, CurvatureReport, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_GP_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_TAIL_RISK_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_TREND_FILTER_CONFIG, DEFAULT_UCT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, Decision, DecisionAction, DecisionAuditEntry, DecisionEngine, DecisionEngineConfig, DecisionEngineStats, DecisionFeedback, DecisionInsightRecord, DecisionMode, DeliberationConfig, DeliberationEngine, DeliberationResult, type SettlementReport$1 as DeliberationSettlementReport, SettlementReport$1 as SettlementReport, DesignedExperiment, DistillationReport, DistilledStrategy, DistributedSync, DistributionReport, EBHEntry, EFEAction, EFEEvaluation, EProcess, EProcessSide, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EmpiricalBernsteinSequence, EncryptedField, EncryptedFile, EncryptionConfig, EnergyLedger, EnergySankeyReport, EnergyTransfer, type ErrorClassification, EvaluationReport, EvidenceCensus, EvidenceCensusLayer, type EvidenceView, EvolutionCycleOutcome, EvolutionCycleReport, EvolutionReport, EvolutionStatusReport, EvolverAgent, EvolverAgentConfig, EvolverEfficiencySummary, EvolverMetrics, ExecutionError, ExecutionGrant, ExecutionPlan, ExperienceLookup, ExperimentLedgerEntry, ExplorationDispatcher, ExplorationProposal, ExplorationRecord, ExportOptions, FailureRecord, FisherGeometryEngine, FreeEnergyConfig, FreeEnergyEngine, GaussianProcess, GaussianProcessConfig, GittinsConfig, GittinsIndexTable, GittinsSnapshot, Goal, GoalDecomposer, GoalEngine, GoalEngineConfig, GoalStatus, GoalSubtask, GovernanceAuditEntry, GovernanceGate, GovernanceVerdict, GovernedAction, GovernorPersistState, GpCorrection, GpFitReport, GpKernelKind, GpPredict, GpSeriesCalibrator, GpdFit, GrantOutcome, GreedyResult, Habit, HealthReport, HierarchicalPrior, HillEstimate, HomeostasisBands, HomeostasisStatus, HotReloadConfig, HotReloadEngine, HotReloadEvent, HotReloadStatus, IAgent, IMemoryStore, IMetaCognitiveController, INCINERATOR, IOptimizer, IPolicyEvolver, IReflector, ISandbox, ISelfModel, ImaginationReport, ImprovementEvidence, IndexArm, IndexScheduler, InformationGeometryConfig, InformationGeometryReport, Insight, InterventionRecord, JsonMemoryBackend, JudgeMetric, JudgeModel, KalmanFilter, KalmanModel, KalmanStepResult, KnobEffectiveness, KnowledgeAsset, KnowledgeFrontier, KnowledgeGap, KnowledgeProvider, KpiAnomaly, KpiCollector, KpiSnapshot, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMClientConfig, LLMError, LLMResponse, LedgerConfig, LedgerSnapshot, LedgerStats, Lesson, LessonExtractor, LessonProvider, ListError, ListingView, LocalLinearTrendFilter, LongTermMemory, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, ManagedAgent, MapElitesArchive, MapElitesConfig, MarketConfig, MarketSnapshot, MctsChildStat, MctsDomain, MctsResult, MemoryAgent, MemoryAgentConfig, MemoryBackend, MemoryCondition, MemoryEdge, MemoryError, type MemoryEvidence, MemoryGraph, MemoryLayer, MemoryMaintainer, MemoryMatchContext, MemoryMetrics, MemoryNode, MemoryQualitySummary, MemorySearchHit, MemoryStore, MentalReport, MergeStrategy, MetaCognitionBridge, MetaCognitionConfig, MetaCognitionEngine, MetaCognitiveController, MetaControllerConfig, MetaControllerState, MetaDecision, MetaStabilitySummary, MetareasoningConfig, MetricForecast, MigrationConflict, MigrationPackage, MigrationRecordVersion, MigrationReport, MigrationTool, ModelAgent, ModelConfig, ModelLongTermProfile, ModelRuntimeStatus, ModelScheduler, ModelSchedulerConfig, ModelScoreInput, ModelTaskStats, MonitorStatus, NaturalMutationResult, NetworkError, NodeResult, NodeRole, NodeRunner, OperationalMetrics, OpportunityStopper, OptimalStoppingConfig, Optimizer, OptimizerAgent, OptimizerAgentConfig, OptimizerConfig, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, Perception, PerformanceThreshold, PlacementOutcome, PlanExecutionResult, PlanNode, PluginVersion, Policy, PolicyEvaluationMetrics, PolicyEvolutionBridge, PolicyEvolver, PolicyEvolverConfig, PolicyEvolverStatus, PolicyFitness, PolicyMatchContext, PolicyRule, PolicySimulator, PrivacyAccountant, PrivacyConfig, PrivacyRelease, PrivacyStatus, ProactiveRisk, ProceduralAction, ProceduralCondition, ProceduralConditionDimension, ProceduralMemory, ProgressBroadcaster, ProgressEvent, ProposalKind, QualityDiversityMetrics, QualityTrendPoint, QueueMetrics, RDP_ORDER, RaftConfig, RaftEngine, RationalMetareasoner, RecommendedAdjustment, RecordDecisionFeedbackParams, RecordFailureParams, RecordSuccessParams, ReflectionEngine, ReflectionEngineConfig, ReflectionVerdict, Reflector, ReflectorConfig, ReputationTier, type RetryClass, RiskControlResult, Rng, RobustMethod, RobustRead, RobustStatisticsConfig, RobustStream, RollbackResult, RootCauseCategory, RoyaltyPayout, RuntimeEvent, RuntimeVerifier, RuntimeVerifierStatus, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafeEnvelopeInfo, SafetyGovernor, SafetyGovernorConfig, SafetyMonitor, SafetyPattern, SafetySpec, Sandbox, SandboxConfig, SandboxTask, SankeyLink, SankeyNode, SankeyTotals, ScalarGeneKey, SchedulerConfig, SchedulerPolicyParams, SchedulerService, SchedulerTaskContext, SchedulingInsight, ScientistConfig, ScientistMind, SelfModel, SelfModelCollectors, SelfModelConfig, SemanticConclusion, SemanticCondition, SemanticConditionDimension, SemanticMemory, Sentinel, SentinelConfig, SentinelStatus, ShapleyAttribution, ShapleyAttributionEngine, ShapleyConfig, ShapleyReport, SheafAnchorSpec, SheafConsensusReport, SheafEdgeSpec, SheafVertexSpec, Signal, SignalBatch, SignalEnrichment, SignalHistoryStats, SignalSourceConfig, SimCalibration, SimCalibrationEntry, SimModelStatus, SinkhornConfig, SinkhornResult, Skill, SmoothedPoint, SqliteMemoryBackend, StepEvaluation, StoppingVerdict, StrategistVerdict, StrategyApplier, StrategyBehaviorDim, StrategyEvolutionConfig, StrategyEvolutionEngine, StrategyGenes, StrategyGenesLike, StrategyGenome, StrategyPerformanceSummary, SubmodularFunction, SubmodularityAudit, SubtaskDispatcher, SuccessfulPlanRecord, SymbiosisBridge, SymbiosisBridgeConfig, SymbiosisBridgeHook, SymbiosisConfig, SymbiosisRuntime, SymbiosisTickReport, SyncBatch, SyncConflict, SyncLogEntry, SyncNodeConfig, SyncState, SynergyPair, SystemMetrics, SystemStabilitySummary, TREASURY, TailQuantiles, TailRiskAdvisor, TailRiskConfig, TailRiskMonitor, TailRiskReport, TaskExecutor, TaskExecutorConfig, TaskPatternMemory, TenantConfig, TenantManager, TenantRegistry, TenantRuntime, TheoristConfig, TheoristEngine, Theory, TheoryFrontier, TheoryMember, TheoryPrediction, TickReport, TimeoutError, ToolDefinition, ToolError, ToolRegistry, TopicNode, TradeListener, TradeRecord, TransferError, TransferReceipt, TransitionPosterior, TransportDriftConfig, TransportDriftEvent, TransportDriftMonitor, TransportDriftView, TrendFilterConfig, TrendMetric, TrendStepRead, TrendSummary, TuningAction, TypeCorrelation, UctConfig, UctSearch, VariationalReport, ViolationReport, ViolationSeverity, WeightedCoverage, WorldModel, WorldModelConfig, WorldModelSummary, abortableSleep, apply, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, brussOddsIndex, bruteForceBest, budgetedGreedy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, catoniMean, chiSquareQuantile, cholesky, choleskyLower, classifyError, coalitionValue, computeHomeostasis, conditionNumber, conformalQuantile, cosineSimilarity, coverageFromTokens, createBaselinePolicy, createMemoryBackend, curvatureEstimate, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, digamma, dpHistogram, dpMeanClamped, dpValue, eBenjaminiHochberg, empiricalQuantile, emptyMemoryStore, erlangC, evaluateMemoryCondition, evidenceRankScore, expectedImprovement, extractReplayTasks, fitGpd, fixedSampleUpperBound, gaussianNoise, generateAdversarialTasks, gpdCdf, hillEstimator, initEvidence, isTradeListener, kingmanWq, laplaceNoise, lazyGreedy, lessonsToInsights, listingsOf, littleCheck, lnGamma, madSigma, matchesMemoryConditions, meanExcessCurve, medianOfMeans, modelAgentId, modelSignalKey, mulberry32, name, normalCdf, normalPdf, normalizePolicyParams, observeEvidence, overlapSheaf, parseJSONLoose, participationRatio, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, potQuantiles, prophetValue, quantileSorted, randomWalkSteadyState, rdpToEpsilon, readEvidence, renderSankeyHtml, resolveEffectiveParams, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shapleyValues, shrinkageCovariance, sinkhorn, solveCholesky, sqliteAvailable, sqlitePathFor, stitchedCsRadius, strategyBehaviorDescriptor, submodularityCheck, toSparseVector, tokenizeChinese, wasserstein1D, wassersteinBarycenter1D, wilsonLowerBound };
+export { AbstractSkillEntry, AbstractionConfig, AbstractionEngine, AbstractionStats, AccountId, ActionResult, ActiveTask, AdjustmentKnob, AdjustmentReport, AgentBase, AgentGoal, AgentKind, AgentMeta, AgentMode, AgentProposal, AgentReputation, AliasMap, AnytimeEvidenceConfig, AnytimeEvidenceRegistry, AnytimeEvidenceRegistryReport, AnytimeEvidenceStream, AnytimeEvidenceView, AnytimeVerdict, AppError, ArbitrationResult, ArchiveReport, ArmIndex, ArmStats, ArrivalPrediction, ArrivalStats, AssetKind, AssignmentCertificate, AssignmentResult, AuditEntry, AutonomyLoop, AutonomyLoopConfig, BASELINE_POLICY_PARAMS, BAYES_PRIOR_STRENGTH, BELIEF_POOL, type BackoffConfig, BayesianEstimate, BayesianOptimizer, BeliefAsset, BeliefMarket, BeliefMarketConfig, BeliefOutcome, BeliefPosition, type SettlementReport as BeliefSettlementReport, BeliefStatus, BeliefView, BenchmarkEngine, BenchmarkReport, BenchmarkResult, BenchmarkScenario, BenchmarkStats, BetReceipt, BidOrder, BoState, BoSuggestion, BottleneckOptions, BottleneckReport, type BreakerProbe, type BreakerState, type BreakerStatus, BuiltinScenarioContext, BwKArmStat, BwKBudgets, BwKCandidateView, BwKConfig, BwKRouter, BwKVerdict, CHANNEL_GROUPS, CalibrationRecord, CalibrationStatus, CanaryState, CancelReport, CapacityAdvisor, CapacityFrontier, CapacityPlan, CapacityPlanner, CapacityPlannerConfig, CascadeHandler, CausalEdge, CausalEdgeEvidence, CausalEffect, CausalExperiment, CausalExplorationRecord, CausalKernel, CausalKernelConfig, CausalNode, CausalNodeKind, CausalQuestion, CellularSheaf, ChangeEntry, ChangePayload, ChannelGroup, ChatMessage, ChatOptions, CircuitBreaker, type CircuitBreakerConfig, CircuitBreakerInfo, CircuitBreakerRegistry, CircuitState, CleansingReport, ClusterNodeConfig, ClusterStatus, CoalitionValueFunction, CognitiveEconomy, CognitiveMarket, CompletionReport, ConfidenceSequenceView, Config, ConfigError, ConformalInterval, ConformalIntervalConfig, ConformalIntervalEngine, ConformalStatus, ConsensusLogEntry, ConstructorOptionsGpSeries, ContributorProb, ControlStep, CounterfactualInsight, CoverageDriftMonitor, CoverageDriftView, CryptoEngine, CryptoError, CryptoResult, CuriosityEngine, CuriosityEngineConfig, CurvatureReport, DECAY_HALF_LIFE_DAYS, DEFAULT_ABSTRACTION_CONFIG, DEFAULT_ANYTIME_EVIDENCE_CONFIG, DEFAULT_AUTONOMY_LOOP_CONFIG, DEFAULT_BACKOFF_CONFIG, DEFAULT_BWK_CONFIG, DEFAULT_CAPACITY_CONFIG, DEFAULT_CAUSAL_CONFIG, DEFAULT_CIRCUIT_BREAKER_CONFIG, DEFAULT_CONFORMAL_CONFIG, DEFAULT_CURIOSITY_CONFIG, DEFAULT_DECISION_ENGINE_CONFIG, DEFAULT_DELIBERATION_CONFIG, DEFAULT_FREE_ENERGY_CONFIG, DEFAULT_GITTINS_CONFIG, DEFAULT_GOAL_ENGINE_CONFIG, DEFAULT_GP_CONFIG, DEFAULT_INFORMATION_GEOMETRY_CONFIG, DEFAULT_LLM_CLIENT_CONFIG, DEFAULT_METAREASONING_CONFIG, DEFAULT_META_COGNITION_CONFIG, DEFAULT_OPTIMAL_STOPPING_CONFIG, DEFAULT_PRIVACY_CONFIG, DEFAULT_REFLECTION_CONFIG, DEFAULT_ROBUST_CONFIG, DEFAULT_SAFETY_GOVERNOR_CONFIG, DEFAULT_SCIENTIST_CONFIG, DEFAULT_SHAPLEY_CONFIG, DEFAULT_SINKHORN_CONFIG, DEFAULT_STRATEGY_EVOLUTION_CONFIG, DEFAULT_TAIL_RISK_CONFIG, DEFAULT_THEORIST_CONFIG, DEFAULT_TRANSPORT_DRIFT_CONFIG, DEFAULT_TREND_FILTER_CONFIG, DEFAULT_UCT_CONFIG, DEFAULT_WORLD_MODEL_CONFIG, Decision, DecisionAction, DecisionAuditEntry, DecisionEngine, DecisionEngineConfig, DecisionEngineStats, DecisionFeedback, DecisionInsightRecord, DecisionMode, DeliberationConfig, DeliberationEngine, DeliberationResult, type SettlementReport$1 as DeliberationSettlementReport, SettlementReport$1 as SettlementReport, DesignedExperiment, DistillationReport, DistilledStrategy, DistributedSync, DistributionReport, DynamicsAssessment, DynamicsRegime, EBHEntry, EFEAction, EFEEvaluation, EProcess, EProcessSide, ESCROW, EVIDENCE_MIN_SAMPLES, EVIDENCE_RANK_BLEND, EigenResult, EmpiricalBernsteinSequence, EncryptedField, EncryptedFile, EncryptionConfig, EnergyLedger, EnergySankeyReport, EnergyTransfer, EntropyAudit, type ErrorClassification, EvaluationReport, EvidenceCensus, EvidenceCensusLayer, type EvidenceView, EvolutionCycleOutcome, EvolutionCycleReport, EvolutionReport, EvolutionStatusReport, EvolverAgent, EvolverAgentConfig, EvolverEfficiencySummary, EvolverMetrics, ExecutionError, ExecutionGrant, ExecutionPlan, ExperienceLookup, ExperimentLedgerEntry, ExplorationDispatcher, ExplorationProposal, ExplorationRecord, ExportOptions, FailureRecord, FairAllocation, FeedbackController, FeedbackControllerConfig, FirstPassageEstimate, FisherGeometryEngine, FlowNetwork, FreeEnergyConfig, FreeEnergyEngine, GCounter, GaussianProcess, GaussianProcessConfig, GittinsConfig, GittinsIndexTable, GittinsSnapshot, Goal, GoalDecomposer, GoalEngine, GoalEngineConfig, GoalStatus, GoalSubtask, GovernanceAuditEntry, GovernanceGate, GovernanceVerdict, GovernedAction, GovernorPersistState, GpCorrection, GpFitReport, GpKernelKind, GpPredict, GpSeriesCalibrator, GpdFit, GrantOutcome, GreedyResult, Habit, HealthReport, Hedge, HedgeOptions, HedgeStats, HierarchicalPrior, HillEstimate, HomeostasisBands, HomeostasisStatus, HotReloadConfig, HotReloadEngine, HotReloadEvent, HotReloadStatus, HurstResult, IAgent, IMemoryStore, IMetaCognitiveController, INCINERATOR, IOptimizer, IPolicyEvolver, IReflector, ISandbox, ISelfModel, ImaginationReport, ImprovementEvidence, IndexArm, IndexScheduler, InformationGeometryConfig, InformationGeometryReport, Insight, InterventionRecord, JointDistribution, JsonMemoryBackend, JudgeMetric, JudgeModel, KalmanFilter, KalmanModel, KalmanStepResult, KnobEffectiveness, KnowledgeAsset, KnowledgeFrontier, KnowledgeGap, KnowledgeProvider, KpiAnomaly, KpiCollector, KpiSnapshot, LEGACY_EVIDENCE_DISCOUNT, LLMClient, LLMClientConfig, LLMError, LLMResponse, LWWRegister, LedgerConfig, LedgerSnapshot, LedgerStats, Lesson, LessonExtractor, LessonProvider, ListError, ListingView, LocalLinearTrendFilter, LongTermMemory, LyapunovResult, MAX_POLICY_RULES, MIN_CALIBRATION_SAMPLES, ManagedAgent, MapElitesArchive, MapElitesConfig, MarketConfig, MarketSnapshot, MatrixCompletionOptions, MaxFlowResult, MctsChildStat, MctsDomain, MctsResult, MemoryAgent, MemoryAgentConfig, MemoryBackend, MemoryCondition, MemoryEdge, MemoryError, type MemoryEvidence, MemoryGraph, MemoryLayer, MemoryMaintainer, MemoryMatchContext, MemoryMetrics, MemoryNode, MemoryQualitySummary, MemorySearchHit, MemoryStore, MentalReport, MergeEvent, MergeStrategy, MetaCognitionBridge, MetaCognitionConfig, MetaCognitionEngine, MetaCognitiveController, MetaControllerConfig, MetaControllerState, MetaDecision, MetaStabilitySummary, MetareasoningConfig, MetricForecast, MigrationConflict, MigrationPackage, MigrationRecordVersion, MigrationReport, MigrationTool, ModelAgent, ModelConfig, ModelLongTermProfile, ModelRuntimeStatus, ModelScheduler, ModelSchedulerConfig, ModelScoreInput, ModelTaskStats, MonitorStatus, MultiScaleView, NaturalMutationResult, NetworkError, NetworkReport, NodeResult, NodeRole, NodeRunner, ORSet, OcbaAllocation, OcbaCandidate, OperationalMetrics, OpportunityStopper, OptimalStoppingConfig, Optimizer, OptimizerAgent, OptimizerAgentConfig, OptimizerConfig, POLICY_GENE_BOUNDS, POLICY_RULE_DELTA_BOUNDS, PageRankOptions, PageRankResult, Perception, PerformanceThreshold, PeriodogramReport, PlacementOutcome, PlanExecutionResult, PlanNode, PluginVersion, Policy, PolicyEvaluationMetrics, PolicyEvolutionBridge, PolicyEvolver, PolicyEvolverConfig, PolicyEvolverStatus, PolicyFitness, PolicyMatchContext, PolicyRule, PolicySimulator, PrivacyAccountant, PrivacyConfig, PrivacyRelease, PrivacyStatus, ProactiveRisk, ProceduralAction, ProceduralCondition, ProceduralConditionDimension, ProceduralMemory, ProgressBroadcaster, ProgressEvent, ProposalKind, QualityDiversityMetrics, QualityTrendPoint, QueueMetrics, QueueStation, QueueingNetworkAdvisor, QuorumAudit, RDP_ORDER, RaftConfig, RaftEngine, RationalMetareasoner, RecommendedAdjustment, RecordDecisionFeedbackParams, RecordFailureParams, RecordSuccessParams, ReflectionEngine, ReflectionEngineConfig, ReflectionVerdict, Reflector, ReflectorConfig, ReputationTier, type RetryClass, RiskControlResult, Rng, RobustMethod, RobustRead, RobustStatisticsConfig, RobustStream, RobustTimeoutConfig, RollbackResult, RootCauseCategory, RoyaltyPayout, RuntimeEvent, RuntimeVerifier, RuntimeVerifierStatus, SIGNAL_GLOBAL_SUCCESS, SIGNAL_GLOBAL_SUCCESS_ALIAS, STRATEGY_BEHAVIOR_SPACE, SafeEnvelopeInfo, SafetyGovernor, SafetyGovernorConfig, SafetyMonitor, SafetyPattern, SafetySpec, Sandbox, SandboxConfig, SandboxTask, SankeyLink, SankeyNode, SankeyTotals, ScalarGeneKey, SchedulerConfig, SchedulerPolicyParams, SchedulerService, SchedulerTaskContext, SchedulingInsight, ScientistConfig, ScientistMind, SelfModel, SelfModelCollectors, SelfModelConfig, SemanticConclusion, SemanticCondition, SemanticConditionDimension, SemanticMemory, Sentinel, SentinelConfig, SentinelStatus, ShamirShare, ShapleyAttribution, ShapleyAttributionEngine, ShapleyConfig, ShapleyReport, SheafAnchorSpec, SheafConsensusReport, SheafEdgeSpec, SheafVertexSpec, Signal, SignalBatch, SignalEnrichment, SignalHistoryStats, SignalSourceConfig, SimCalibration, SimCalibrationEntry, SimModelStatus, SinkhornConfig, SinkhornResult, Skill, SmoothedPoint, SpectralPeak, SqliteMemoryBackend, StationMetrics, StepEvaluation, StoppingVerdict, StrategistVerdict, StrategyApplier, StrategyBehaviorDim, StrategyEvolutionConfig, StrategyEvolutionEngine, StrategyGenes, StrategyGenesLike, StrategyGenome, StrategyPerformanceSummary, SubmodularFunction, SubmodularityAudit, SubtaskDispatcher, SuccessfulPlanRecord, SymbiosisBridge, SymbiosisBridgeConfig, SymbiosisBridgeHook, SymbiosisConfig, SymbiosisRuntime, SymbiosisTickReport, SyncBatch, SyncConflict, SyncLogEntry, SyncNodeConfig, SyncState, SynergyPair, SystemMetrics, SystemStabilitySummary, SystemicRiskAdvisor, SystemicRiskAssessment, SystemicRiskConfig, SystemicRiskMonitor, TREASURY, TailQuantiles, TailRiskAdvisor, TailRiskConfig, TailRiskMonitor, TailRiskReport, TaskExecutor, TaskExecutorConfig, TaskPatternMemory, TenantConfig, TenantManager, TenantRegistry, TenantRuntime, TheoristConfig, TheoristEngine, Theory, TheoryFrontier, TheoryMember, TheoryPrediction, TickReport, TimeoutError, ToolDefinition, ToolError, ToolRegistry, TopicNode, TopographyReport, TradeListener, TradeRecord, TransferError, TransferReceipt, TransitionPosterior, TransportDriftConfig, TransportDriftEvent, TransportDriftMonitor, TransportDriftView, TrendFilterConfig, TrendMetric, TrendStepRead, TrendSummary, TuningAction, TypeCorrelation, UctConfig, UctSearch, VariationalReport, ViolationReport, ViolationSeverity, WaveletDecomposition, WeightedCoverage, WorldModel, WorldModelConfig, WorldModelSummary, abortableSleep, apply, assignBatch, assignmentCertificate, attachDashboard, backoffDelayMs, backwardInduction, bernoulliKL, betaEntropy, bottleneckDistance, bottleneckInsight, brussOddsIndex, bruteForceAssignment, bruteForceBest, bruteForceMinCut, bruteForceMinIntersection, budgetedGreedy, buildCalibrationFromMemory, buildEnergySankey, buildPatternFingerprint, byzantineFeasible, capacityFrontier, catoniMean, chiSquareQuantile, cholesky, choleskyLower, classifyError, cleanseCorrelation, coalitionValue, completeMatrix, completedEntry, computeHomeostasis, conditionNumber, conformalQuantile, correlationFromSeries, cosineSimilarity, coverageFromTokens, crdtConvergenceAudit, createBaselinePolicy, createMemoryBackend, curvatureEstimate, cvar, cvarCoherenceAudit, cvarMinForm, dareIterate, dareScalarClosedForm, decayFactor, decompose, pluginEntry as default, defaultSafetySpecs, determinismScore, digamma, distillRetention, dpHistogram, dpMeanClamped, dpValue, dynamicsRegime, eBenjaminiHochberg, empiricalQuantile, emptyMemoryStore, entropyAudit, erlangC, evaluateMemoryCondition, evidenceRankScore, expectedImprovement, extractReplayTasks, fairDomainBudget, fairnessAudit, fft, firstPassageCooldown, fisherGUpperTail, fitGpd, fixedSampleUpperBound, gamblerRuin, gaussianNoise, generateAdversarialTasks, gpdCdf, h0Persistence, haarDecompose, haarReconstruct, hedgeMultiplier, hillEstimator, hurstExponent, ifft, informationBottleneck, initEvidence, inverseGaussianCdf, inverseGaussianPdf, isTradeListener, jacksonIndependenceAudit, jacobiEigensym, kingmanWq, laplaceNoise, largestLyapunov, lazyGreedy, lessonsToInsights, listingsOf, littleCheck, lnGamma, lqrGain, lyapunovCertificate, madSigma, majorityQuorumAudit, matchesMemoryConditions, maxFlow, maxMinFair, meanExcessCurve, medianOfMeans, minCutCertificate, minimalStableServers, modelAgentId, modelSignalKey, monteCarloCorrectSelection, mpEdges, mulberry32, multiScaleView, name, normalCdf, normalPdf, normalizePolicyParams, observeEvidence, ocbaAllocate, overlapSheaf, pageRank, parseJSONLoose, participationRatio, periodogram, perturbNumbers, policyParamsWithinBounds, policyRuleMatches, potQuantiles, prophetValue, quantile, quantileSorted, raftSafetyAudit, randomWalkSteadyState, rdpToEpsilon, readEvidence, reflectionMaxProb, renderSankeyHtml, resolveEffectiveParams, robustExceedance, robustTimeout, round, sampleBeta, samuelCahnRule, sanitizeMemoryStore, scalarAgreementSheaf, scoreModelWithPolicy, seasonalFactor, secretarySkipCount, segment, selectRiskControlledThreshold, setChineseTokenizer, shamirCombine, shamirSplit, shapleyValues, shrinkageCovariance, sinkhorn, solveAssignment, solveAssignmentMax, solveCholesky, sqliteAvailable, sqlitePathFor, staticEtaFor, staticRegretBound, stitchedCsRadius, strategyBehaviorDescriptor, submodularityCheck, tandemNetwork, timeVaryingEta, toSparseVector, tokenizeChinese, topInfluential, topographyInsight, trackingRegretBound, wasserstein1D, wassersteinBarycenter1D, wassersteinRobustMean, weightedMaxMinFair, wilsonLowerBound };

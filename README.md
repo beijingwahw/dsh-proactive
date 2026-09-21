@@ -5,7 +5,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-339933?logo=nodedotjs&logoColor=white)](#安装)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-8250df)](https://github.com/topics/dsh-plugin)
 
-> **主动智能（Proactive Intelligence）调度插件** —— DeepSeek Harness（DSH）生态中的多模型协同调度系统：自主感知、自主决策、自主进化，内置**科学家 / 理论家双心智**、**认知能量共生经济**与**二十八质变内核（证据 → 几何拓扑 / 创世 / 先知层：任意时刻有效 / 保形 / 最优传输 / 信息几何 / 层论共识 / Gittins / 稳健统计 / 差分隐私 / 容量规划 / 高斯过程 / 卡尔曼滤波 / 极值理论 / 蒙特卡洛树搜索 / 次模优化）**。
+> **主动智能（Proactive Intelligence）调度插件** —— DeepSeek Harness（DSH）生态中的多模型协同调度系统：自主感知、自主决策、自主进化，内置**科学家 / 理论家双心智**、**认知能量共生经济**与**四十八质变内核（证据 → 几何拓扑 / 创世 / 先知 / 均衡 / 觉醒 / 川流 / 经纬层：任意时刻有效 / 保形 / 最优传输 / 信息几何 / 层论共识 / Gittins / 稳健统计 / 差分隐私 / 容量规划 / 高斯过程 / 卡尔曼滤波 / 极值理论 / 蒙特卡洛树搜索 / 次模优化 / 对抗无悔学习 / 匈牙利全局指派 / 随机矩阵 / CVaR 分布鲁棒 / LQR 反馈控制 / 持续同调 / 信息瓶颈 / 非线性动力学 / PageRank 谱排序 / 首达时间 / Jackson 排队网络 / FFT 谱周期 / 最大流 / 极大极小公平 / OCBA 预算分配 / 法定人数交叉 / CRDT 收敛 / Shamir 秘密共享 / Haar 小波 / 低秩矩阵补全）**。
 >
 > [English](./README.en.md) | 中文
 
@@ -31,7 +31,7 @@
 │  操作环：信号→决策→执行→反思 10 步主链路（index.ts）             │
 │  进化环：策略进化器 + 安全沙盒 + 金丝雀部署（policy/）            │
 │  元认知外环：自我建模 → 保守调整 → 观察/回滚（meta/）             │
-├─ 质变内核（core/）3.0 → 30.0 二十八内核 ──────────────────────┤
+├─ 质变内核（core/）3.0 → 50.0 四十八内核 ─────────────────────┤
 │  证据 3.0  弹性 4.0  因果 5.0  自由能 6.0  深思 7.0             │
 │  元推理 8.0  抽象 9.0  科学家 10.0  理论家 11.0                 │
 │  任意时刻证据 12.0  保形预测 13.0  质量-多样性 14.0              │
@@ -41,6 +41,14 @@
 │  稳健统计 23.0  差分隐私 24.0  容量规划 25.0（创世层）           │
 │  高斯过程 26.0  卡尔曼滤波 27.0  极值理论 28.0（先知层）         │
 │  蒙特卡洛树搜索 29.0  次模优化 30.0（先知层）                    │
+│  对抗无悔学习 31.0  全局指派 32.0  随机矩阵 33.0（均衡层）       │
+│  CVaR 分布鲁棒 34.0  LQR 反馈控制 35.0（均衡层）                 │
+│  持续同调 36.0  信息瓶颈 37.0  非线性动力学 38.0（觉醒层）       │
+│  PageRank 谱排序 39.0  首达时间 40.0（觉醒层）                   │
+│  Jackson 排队网络 41.0  FFT 谱周期 42.0  最大流 43.0（川流层）   │
+│  极大极小公平 44.0  OCBA 预算分配 45.0（川流层）                 │
+│  法定人数 46.0  CRDT 47.0  Shamir 共享 48.0（经纬层）           │
+│  Haar 小波 49.0  矩阵补全 50.0（经纬层）                        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,7 +92,47 @@
 - **蒙特卡洛树搜索内核**（[core/mcts.ts](./src/core/mcts.ts)）：UCT + 折扣回报——**搜索预算的分配本身成为序贯决策**。转移边按 Beta 后验采样成败，UCB1 平衡利用/探索，节点本地回报回传（无深度偏置），迭代/时间预算耗尽即读出（任意时刻性）；深思引擎 `searchMcts` 与 beam search 同口径互查
 - **次模优化内核**（[core/submodular.ts](./src/core/submodular.ts)）：加权覆盖 + 惰性贪心（CELF）——**探索预算的分配第一次有近似比保证**（≥ (1−1/e)·OPT，Nemhauser–Wolsey–Fisher）。知识项自身为主题、相似项部分覆盖：冗余第二选的边际衰减到 (1−c)·w，互补盲区优先入选；曲率修正把保证收紧到 (1−e^{−c})/c·OPT
 
-### 质变内核（core/，3.0 → 30.0）
+### 均衡层（31.0 → 35.0）
+
+> 先知层预测世界的未来；**均衡层承认世界会反击**——对手、全局约束、噪声、最坏情况、反馈失稳。五个数学支柱把调度系统从「预测最优」升维到「对抗均衡」。
+
+- **在线学习内核**（[core/online-learning.ts](./src/core/online-learning.ts)）：Fixed-Share Hedge——**对手无论怎么出招都不后悔**。系统里一切统计学习（Wilson / UCB / Gittins）都假设世界是平稳概率分布；本内核叠加对抗口径：模型评分乘以有界 Hedge 乘数（[0.25,4]），对事后最优固定模型的遗憾 ≤ √(2T lnN)（Freund–Schapire，分布假设无关）；α 份额回灌保证模型能力翻转可跟踪（Herbster–Warmuth），被打爆的模型以每失败一轮 e^{−η} 的速度降权——比统计口径快一个数量级
+- **全局指派内核**（[core/optimal-assignment.ts](./src/core/optimal-assignment.ts)）：匈牙利算法（Jonker–Volgenant O(n³)）——**批内选型从局部贪心到全局最优**。同批动态选型节点构造「节点 × 候选」评分矩阵求线性和指派精确解：最优模型不再被同批节点重复超订、次优不再闲置；**对偶证书**（u_i+v_j ≤ c_ij + 互补松弛 + 零间隙）让最优性可被逐位检查而非被声称（与 15.0 同一「证明携带」哲学）
+- **随机矩阵内核**（[core/random-matrix.ts](./src/core/random-matrix.ts)）：Marchenko–Pastur 噪声边界 + 特征值清洗——**相关性从统计幻觉升级为可证伪的结构断言**。模型失败序列的样本相关矩阵大部分谱结构是纯噪声（MP 带）；循环 Jacobi 特征分解 + Laloux/Bouchaud 清洗把伪相关吸收进噪声带（不误报），头号特征值显著超带且解释份额达标 → systemic-risk 洞察：同厂商/同上游的模型会同沉浮，「看起来分散」的热备冗余是幻觉
+- **分布鲁棒内核**（[core/robust-decisions.ts](./src/core/robust-decisions.ts)）：CVaR + Wasserstein 球——**最坏情况有了闭式价格**。超时预算 = margin × CVaR_α(该模型延迟史)（Rockafellar–Uryasev 精确式，相干风险度量四公理背书）：重尾模型自动获得更长预算、轻尾模型不被一刀切；Wasserstein-1 鲁棒均值是 KR 对偶的代数恒等式（sup = E + ε），超越概率的球内最坏化有精确有限样本算法
+- **反馈控制内核**（[core/feedback-control.ts](./src/core/feedback-control.ts)）：离散 LQR + Lyapunov 证书——**并发上限的闭环驾驭**。25.0 排队论反解给出静态目标，本内核让 computeParallelism 成为追踪目标的反馈控制器：增益从 DARE 闭式解出（与不动点迭代逐位对账），闭环每一步的稳定性被李雅普诺夫函数**证明**（V(e_{k+1}) − V(e_k) = −(qe²+ru²) 到机器精度）；死区抗抖振、钳位抗饱和，AIMD 式启发式调参退役
+
+### 觉醒层（36.0 → 40.0）
+
+> 均衡层与世界博弈；**觉醒层看见自己的形状**——知识的拓扑、蒸馏的信息价格、KPI 的动力学体质、影响力的结构涌现、恢复等待的概率定价。五个数学支柱把「自我认知」从报告口径升维为可计算的数学对象。
+
+- **持续同调内核**（[core/persistent-homology.ts](./src/core/persistent-homology.ts)）：H₀ 持续图 + 瓶颈距离——**知识的形状跨尺度可见**。共现权重视为相似度、阈值扫描给出大陆（稳定知识簇）/孤岛（与任何主题不共现的记忆——盲区的拓扑定义）；瓶颈距离带 Cohen-Steiner–Edelsbrunner–Harer 稳定性定理（输入扰动 δ ⟹ 地形漂移 ≤ δ）。`query_memory` 新增 `topology` 动作直接查询知识地形
+- **信息瓶颈内核**（[core/information-bottleneck.ts](./src/core/information-bottleneck.ts)）：Blahut–Arimoto / Tishby——**蒸馏的信息论定价**。X = 任务位型、Y = 成败，IB 最优压缩的保留率 I(T;Y)/I(X;Y) 是「这批样本携带多少值得蒸馏的新信息」：同构批（保留率 < 下限或 I(X;Y) < 0.05 nat）诚实跳过——水位再高也只产出重复知识；数据处理不等式保证保留率 ≤ 1（三次确定性重启逃离硬指派冻结）
+- **非线性动力学内核**（[core/nonlinear-dynamics.ts](./src/core/nonlinear-dynamics.ts)）：Rosenstein Lyapunov + R/S Hurst——**KPI 的体质分类**。混沌（λ₁ > 0，最近邻可预测性门控排除白噪声伪混沌）→ 预测视野 ~1/λ₁ 步；持续（H > 0.5）→ 趋势加权；反持续（H < 0.5）→ 突破降权；logistic 映射 λ₁ = ln2 解析对照
+- **谱排序内核**（[core/spectral-ranking.ts](./src/core/spectral-ranking.ts)）：PageRank 幂迭代——**知识图的影响力从结构涌现**。「被重要者共现者重要」写成不动点，线性收敛 + 质量守恒可逐位检查；related() 联想序升维为「边权 × 邻居影响力」，topInfluential 输出知识骨架（蒸馏保骨去肉的依据）；环图精确均匀是验证锚点
+- **首达时间内核**（[core/first-passage.ts](./src/core/first-passage.ts)）：反射原理 + 逆高斯 + 赌徒破产——**熔断恢复的概率定价**。失败间隔的漂移/波动喂入首达模型，二分解出「以 target 概率确信失败强度已恢复」的最小冷却；μ̂ ≤ 0 的结构性恶化诚实给出不可达；Brownian 反射恒等式与 2 万路径模拟对照
+
+### 川流层（41.0 → 45.0）
+
+> 先知预见、均衡博弈、觉醒自视；**川流层让吞吐、周期、公平与预算成为流数学的对象**——瓶颈站在哪、节律是什么、上限被谁钳制、名额怎么分、确认花给谁，五个经典问题五个定理背书。
+
+- **排队网络内核**（[core/queueing-network.ts](./src/core/queueing-network.ts)）：Jackson 乘积形式 + Erlang-C——**瓶颈站第一次可算**。25.0 反解单站并发；41.0 把各模型作为独立 M/M(c) 站（乘积形式下边际独立），心跳 2.9 段解出 ρ 最大的瓶颈站——「其他站再快也无济于事」的钳制者。验证：12 万事件串联 M/M/1 模拟对照端到端逗留解析值 8/3、稳态队长边际相关性 ≈ 0
+- **谱周期内核**（[core/spectral-periodicity.ts](./src/core/spectral-periodicity.ts)）：FFT 周期图 + Fisher g 检验——**节律从数据里解出来**。时段热度是「周期被预设为一天」的直方图；radix-2 FFT + Fisher g 精确分布让任意周期（分钟回环/昼夜/周节律）成为假设检验，显著时相位感知的谐波季节因子接管预测。验证：FFT 往返恒等、Parseval、注入周期恢复、白噪声不显著
+- **最大流内核**（[core/max-flow.ts](./src/core/max-flow.ts)）：Edmonds-Karp + 最小割证书——**吞吐上限与钳制者同时可算**。类型需求 × 模型容量的流网络上，max-flow = 可立即满足的最大并发派发，min-cut 指认钳制者（类型在饿还是模型是独木桥）；割容量 = 流值是 Ford-Fulkerson 证书（与 15.0/32.0 同一「证明携带」哲学）。验证：随机 200 例与穷举最小割同解
+- **公平分配内核**（[core/fair-division.ts](./src/core/fair-division.ts)）：加权极大极小注水——**没有谁被饿死是定理**。探索预算按任务家族分配从「新颖度赢者通吃」升级为 progressive filling（Bertsekas–Gallager 词典序最优 + 整数保底）：热门家族可以多拿，但任何活跃家族的相对份额不被压扁。验证：教科书注水解 [4/3,4/3,4/3,1] 与公平支配性审计
+- **预算分配内核**（[core/budget-allocation.ts](./src/core/budget-allocation.ts)）：OCBA 最优计算预算——**找瓶颈的每一步都花在刀刃上**。基准重跑预算从均匀升级为 Chen et al. 闭式分配（n_i ∝ (σ_i/δ_i)²），P(正确选中瓶颈) 的指数衰减率最优（Glynn–Juneja）；报告附加 bottleneckFocus。验证：Monte Carlo P(CS) OCBA ≥ 均匀
+
+### 经纬层（46.0 → 50.0）
+
+> 川流层让吞吐成为流数学；**经纬层编织系统的底层织物**——共识的交叉、副本的收敛、密钥的分形、尺度的分解、能力的潜维度。五个支柱落在最后五个未升级的模块上。
+
+- **法定人数内核**（[core/quorum-systems.ts](./src/core/quorum-systems.ts)）：quorum 交叉 + 拜占庭 3f+1 下界——**共识安全性被检查而非被相信**。多数派最小交集闭式 2q−n 与穷举枚举逐位一致；Raft `quorumAudit()` 在真实集群配置上输出交叉/容错/负载读数；n ≤ 3f 时诚实判不可行（不存在性定理）
+- **无冲突复制内核**（[core/crdt.ts](./src/core/crdt.ts)）：CRDT 三定律——**副本收敛是代数性质**。G-Counter/OR-Set/LWW 的合并满足交换/结合/幂等 ⟹ 乱序+重复 gossip 后状态逐位一致（Shapiro 强最终一致性定理）；DistributedSync 的 CRDT 通道双实例实测收敛
+- **秘密共享内核**（[core/secret-sharing.ts](./src/core/secret-sharing.ts)）：Shamir 阈值 + 随机性审计——**信任被分形，密钥被检验**。任意 t 份枚举重建精确成功、t−1 份信息论零泄露（重建值随机等可能）；CryptoEngine `shardKey/combineKeyShares` 真实分形；NIST 频数+游程审计密钥原料
+- **多尺度内核**（[core/multiscale-wavelet.ts](./src/core/multiscale-wavelet.ts)）：Haar 小波——**慢漂移与快突发在不同尺度上分离**。正交分解（完美重构 + Parseval 能量守恒到机器精度）给出趋势水平/漂移带能量/瞬时突发的尺度读数；元认知 `waveletView` 挂载后可读
+- **矩阵补全内核**（[core/matrix-completion.ts](./src/core/matrix-completion.ts)）：ALS 低秩潜因子——**冷启动能力从潜维度涌现**。「模型 × 任务」能力矩阵部分观测经交替最小二乘补全（Candès–Recht 恢复条件），未测类型的能力由潜因子外推；调度器 `coldStartEstimate` 让新模型选型从零样本升级为潜维度预测
+
+### 质变内核（core/，3.0 → 50.0）
 | 内核 | 版本 | 一句话 |
 |------|------|--------|
 | evidence.ts | 3.0 | 统一证据语言：Wilson 界 / 时间衰减 / 证据排序，铺满所有记忆层 |
@@ -115,6 +163,26 @@
 | extreme-value.ts | 28.0 | 极值理论：POT/GPD 尾部外推 + Hill 估计 + 风险度量（见上） |
 | mcts.ts | 29.0 | 蒙特卡洛树搜索：UCT + 折扣回报 + 任意时刻可读（见上） |
 | submodular.ts | 30.0 | 次模优化：加权覆盖 + CELF 惰性贪心 + 曲率修正保证（见上） |
+| online-learning.ts | 31.0 | 在线学习：Fixed-Share Hedge，对手无关遗憾 ≤ √(2T lnN)（见上） |
+| optimal-assignment.ts | 32.0 | 全局指派：匈牙利 O(n³) 精确解 + 对偶最优性证书（见上） |
+| random-matrix.ts | 33.0 | 随机矩阵：Marchenko–Pastur 清洗 + 系统性风险监视（见上） |
+| robust-decisions.ts | 34.0 | 分布鲁棒：CVaR 精确式 + Wasserstein KR 对偶（见上） |
+| feedback-control.ts | 35.0 | 反馈控制：DARE 闭式增益 + Lyapunov 稳定证书（见上） |
+| persistent-homology.ts | 36.0 | 持续同调：H₀ 持续图 + 瓶颈距离稳定性（见上） |
+| information-bottleneck.ts | 37.0 | 信息瓶颈：Blahut-Arimoto，蒸馏保留率定价（见上） |
+| nonlinear-dynamics.ts | 38.0 | 非线性动力学：Lyapunov + Hurst 体质分类（见上） |
+| spectral-ranking.ts | 39.0 | 谱排序：PageRank 幂迭代 + 知识骨架（见上） |
+| first-passage.ts | 40.0 | 首达时间：反射原理 + 逆高斯冷却定价（见上） |
+| queueing-network.ts | 41.0 | 排队网络：Jackson 乘积形式 + 瓶颈站（心跳 2.9 段） |
+| spectral-periodicity.ts | 42.0 | 谱周期：FFT 周期图 + Fisher g 检验（谱日历） |
+| max-flow.ts | 43.0 | 最大流：Edmonds-Karp + 最小割证书（容量前沿） |
+| fair-division.ts | 44.0 | 公平分配：加权极大极小注水（探索家族预算） |
+| budget-allocation.ts | 45.0 | OCBA：最优计算预算（基准瓶颈聚焦） |
+| quorum-systems.ts | 46.0 | 法定人数：quorum 交叉 + 拜占庭 3f+1 下界（Raft 安全审计） |
+| crdt.ts | 47.0 | CRDT：G-Counter/OR-Set/LWW 收敛三定律（分布式同步通道） |
+| secret-sharing.ts | 48.0 | 秘密共享：Shamir 阈值 + 随机性审计（密钥分形） |
+| multiscale-wavelet.ts | 49.0 | 小波：Haar 多尺度分解（KPI 尺度透镜） |
+| matrix-completion.ts | 50.0 | 矩阵补全：ALS 低秩潜因子（冷启动能力外推） |
 
 ### 认知能量共生经济（symbiosis/）
 - **能量账本**（ledger.ts）：认知能量不可伪造，复式记账全局守恒，每笔转账 sha256 链式可审计可回放，基尼系数度量生态健康
@@ -151,7 +219,7 @@
 
 1. **元认知观察** —— 采集 KPI，发现异常洞察
 2. **1.5 共生心跳** —— KPI 注入能量经济 + 信念市场
-3. **世界模型预见** —— 预测信号到达，捕捉上升趋势；2.5 段容量规划（25.0）反解最小并发，2.7 段尾部风险评估（28.0）POT/GPD 外推 p99.9
+3. **世界模型预见** —— 预测信号到达，捕捉上升趋势；2.5 段容量规划（25.0）反解最小并发，2.7 段尾部风险评估（28.0）POT/GPD 外推 p99.9，2.8 段系统性风险评估（33.0）失败相关矩阵经 Marchenko–Pastur 清洗侦测共同因子暴露
 4. **汇总反思教训** —— 合并反思引擎经验教训，去重已消化项
 5. **目标生成** —— 从洞察自动生成改进目标并分解子任务
 6. **子任务派发** —— 经安全治理审查后注入执行
@@ -205,7 +273,7 @@ dsh web
 - **多密钥故障转移**：同一厂商存在多个候选密钥时，认证失败（401/403）或配额耗尽（429）会自动轮换到下一个候选密钥重试，并升级为**健康感知路由**——按成功/失败统计选择最优密钥，429 冷却 1 分钟、401/403 冷却 5 分钟，成功后自动恢复；用户可通过 `manage_keys` 工具调整密钥使用顺序（持久化，重启保留），启动日志输出每个模型的密钥来源（不含密钥值），运行时可用 `query_memory keys` 查看各密钥健康状态；
 - 若只需单一厂商，可改用 `patches/domestic-models/` 下按厂商拆分的 patch；重新生成：`pnpm generate:patches`。
 
-完整运行配置项（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主循环 `autonomy` / 宿主融合 `hostFusion`）同样内置于 [cordis.patch.yml](./cordis.patch.yml)，无需改动；共生经济子项位于 `autonomy.symbiosis`（futarchy 表决、能量反哺等，缺省关闭）。保证层内核 12.0-16.0、几何/拓扑层内核 17.0-20.0 与最优调度层内核 21.0-22.0 子项同样缺省关闭（零漂移）：`autonomy.anytimeEvidence`（α / 水位线）、`autonomy.conformal`（α / 校准容量 / 阈值风险与置信）、`autonomy.qualityDiversity`（探索率）、`autonomy.runtimeVerification`（附加规约 `specs`）、`autonomy.optimalTransport`（监测 KPI / 窗口 / 阈值分位）、`autonomy.informationGeometry`（KL 信任域 / 步长尺度）、`autonomy.optimalStopping`（机会视野 / 最小样本）、`autonomy.sheafConsensus`（障碍失配容差）、`autonomy.indexScheduling`（贴现 / 网格）、`autonomy.banditKnapsack`（UCB α / 可行性松弛 / 视界）、`autonomy.robustStatistics`（α）、`autonomy.privacy`（ε / δ）、`autonomy.capacityPlanning`（目标等待 / SCV）；先知层 26.0-30.0 子项同样缺省关闭（零漂移）：`autonomy.gaussianProcess`（校准点数 / 最小点数）、`autonomy.kalmanFilter`（过程噪声 / 观测噪声 / 门控分位）、`autonomy.extremeValue`（p99 目标 / 最小样本 / 阈值分位）、`autonomy.mcts`（迭代 / 探索常数 / 折扣）、`autonomy.submodular`（主题覆盖强度）。
+完整运行配置项（哨兵 / 加密 / 同步 / 共识 / 热更新 / 租户 / 自主循环 `autonomy` / 宿主融合 `hostFusion`）同样内置于 [cordis.patch.yml](./cordis.patch.yml)，无需改动；共生经济子项位于 `autonomy.symbiosis`（futarchy 表决、能量反哺等，缺省关闭）。保证层内核 12.0-16.0、几何/拓扑层内核 17.0-20.0 与最优调度层内核 21.0-22.0 子项同样缺省关闭（零漂移）：`autonomy.anytimeEvidence`（α / 水位线）、`autonomy.conformal`（α / 校准容量 / 阈值风险与置信）、`autonomy.qualityDiversity`（探索率）、`autonomy.runtimeVerification`（附加规约 `specs`）、`autonomy.optimalTransport`（监测 KPI / 窗口 / 阈值分位）、`autonomy.informationGeometry`（KL 信任域 / 步长尺度）、`autonomy.optimalStopping`（机会视野 / 最小样本）、`autonomy.sheafConsensus`（障碍失配容差）、`autonomy.indexScheduling`（贴现 / 网格）、`autonomy.banditKnapsack`（UCB α / 可行性松弛 / 视界）、`autonomy.robustStatistics`（α）、`autonomy.privacy`（ε / δ）、`autonomy.capacityPlanning`（目标等待 / SCV）；先知层 26.0-30.0 子项同样缺省关闭（零漂移）：`autonomy.gaussianProcess`（校准点数 / 最小点数）、`autonomy.kalmanFilter`（过程噪声 / 观测噪声 / 门控分位）、`autonomy.extremeValue`（p99 目标 / 最小样本 / 阈值分位）、`autonomy.mcts`（迭代 / 探索常数 / 折扣）、`autonomy.submodular`（主题覆盖强度）；均衡层 31.0-35.0 子项同样缺省关闭（零漂移）：`autonomy.hedgePortfolio`（学习率 η / 回灌率 α）、`autonomy.optimalAssignment`（候选池上限）、`autonomy.randomMatrix`（窗口 / 最少模型 / 边界倍数 / 份额门槛）、`autonomy.cvarTimeouts`（置信水平 α / 裕度 / 样本下限）、`autonomy.concurrencyControl`（目标利用率 / 被控增益 / 控制权重 / 死区）；觉醒层 37.0-40.0 子项同样缺省关闭（零漂移）：`autonomy.informationBottleneck`（β / 保留率下限）、`autonomy.chaosDiagnostics`（最少点数 / λ 阈值 / Hurst 半宽）、`autonomy.spectralRanking`（阻尼）、`autonomy.firstPassageCooldown`（恢复置信目标）；川流层 41.0-45.0 子项同样缺省关闭（零漂移）：`autonomy.queueingNetwork`（瓶颈 ρ 阈值）、`autonomy.spectralCalendar`（小时分桶数）、`autonomy.capacityFrontier`、`autonomy.fairBudget`、`autonomy.ocbaAllocator`（确认预算）；经纬层 49.0-50.0 子项同样缺省关闭（零漂移）：`autonomy.waveletView`（最少点数）、`autonomy.latentFactors`（潜维数）；经纬层 46.0-48.0 为引擎只读方法（Raft `quorumAudit` / Sync CRDT 通道 / CryptoEngine `shardKey`），无运行时开关；36.0 持续同调经 `query_memory` 的 `topology` 动作按需查询（零漂移）。
 
 ## 工具一览（18 个 + 缺省关闭的层论共识 Tool）
 
@@ -239,7 +307,7 @@ dsh web
 - `manage_autonomy`：`start` / `stop` / `tick` / `kill-switch` / `revive` / `reset-circuit`
 - `query_memory`：`world-model` / `curiosity` / `governance` / `patterns` / `lessons` / `keys` 等
 
-## 离线验证（35 个，零 API Key）
+## 离线验证（43 个，零 API Key）
 
 每个内核与子系统均有离线端到端验证脚本（`node scripts/verify-*.mjs`）：
 
@@ -254,6 +322,14 @@ node scripts/verify-frontier-kernels.mjs # 几何与拓扑层 17.0→20.0：解�
 node scripts/verify-frontier-wiring.mjs # 几何与拓扑层接线：真实引擎端到端（漂移洞察 / 自然变异 / 数学 defer）
 node scripts/verify-prophet-kernels.mjs # 先知层 26.0→30.0：GP 插值/EI-MC 对照 / Riccati 闭式 / POT 解析分位 / UCT 收敛 / CELF-穷举对照
 node scripts/verify-prophet-wiring.mjs  # 先知层接线：真实引擎端到端（GP 校准 / NIS 门控洞察 / 延迟样本→尾部外推 / UCT 互查 / 互补盲区入选）
+node scripts/verify-equilibrium-kernels.mjs # 均衡层 31.0→35.0：对抗遗憾界 / 匈牙利-穷举对照+对偶证书 / MP 边界贴边 / CVaR-RU 对账 / DARE 闭式 / Lyapunov 机器精度
+node scripts/verify-equilibrium-wiring.mjs  # 均衡层接线：真实引擎端到端（对抗降权翻盘 / 批内一对一 / 共同因子洞察 / 重尾超时定价 / 并发闭环）
+node scripts/verify-awakening-kernels.mjs  # 觉醒层 36.0→40.0：大陆孤岛+瓶颈稳定性 / IB-DPI+β 前沿 / logistic λ₁=ln2+Hurst 体质 / 环图精确均匀 / 反射原理 2 万路径对照
+node scripts/verify-awakening-wiring.mjs   # 觉醒层接线：真实引擎端到端（知识地形 / 蒸馏信息拦截 / 混沌体质翻转洞察 / 枢纽影响力 / 熔断冷却定价）
+node scripts/verify-flux-kernels.mjs     # 川流层 41.0→45.0：串联 M/M/1 模拟对照 + Jackson 独立性 / FFT 恒等 + Parseval + 周期恢复 / 最大流-穷举对照 + 割证书 / 教科书注水 + 公平审计 / OCBA-均匀 P(CS) 对照
+node scripts/verify-flux-wiring.mjs      # 川流层接线：真实引擎端到端（谱日历昼夜判定 / 容量前沿回写 / 家族公平反饿死 / OCBA 瓶颈聚焦）
+node scripts/verify-fabric-kernels.mjs   # 经纬层 46.0→50.0：quorum 闭式-穷举对照 + 3f+1 下界 / CRDT 置换收敛 + add-win / Shamir 阈值重建 + 零泄露 / 小波完美重构 + Parseval / 低秩恢复
+node scripts/verify-fabric-wiring.mjs    # 经纬层接线：真实引擎端到端（Raft 安全审计 / 双实例 CRDT 收敛 / 密钥分形重建 / 小波突发捕获 / 冷启动潜因子外推）
 ```
 
 | 分组 | 脚本 |
@@ -264,6 +340,10 @@ node scripts/verify-prophet-wiring.mjs  # 先知层接线：真实引擎端到�
 | 几何与拓扑层 17.0-20.0 | verify-frontier-kernels · verify-frontier-wiring |
 | 创世层 21.0-25.0 | verify-genesis-kernels · verify-genesis-wiring |
 | 先知层 26.0-30.0 | verify-prophet-kernels · verify-prophet-wiring |
+| 均衡层 31.0-35.0 | verify-equilibrium-kernels · verify-equilibrium-wiring |
+| 觉醒层 36.0-40.0 | verify-awakening-kernels · verify-awakening-wiring |
+| 川流层 41.0-45.0 | verify-flux-kernels · verify-flux-wiring |
+| 经纬层 46.0-50.0 | verify-fabric-kernels · verify-fabric-wiring |
 | 共生经济 | verify-symbiosis · verify-symbiosis-bridge · verify-belief-market · verify-futarchy · verify-energy-feedback · verify-full-agents · verify-observability |
 | 学习与进化 | verify-self-evolution · verify-self-evolution-v2 · verify-knowledge-distillation · verify-policy-evolution · verify-meta-cognition · verify-meta-cognition-v2 · verify-meta-edge · verify-consensus-sync |
 
@@ -296,7 +376,7 @@ node scripts/verify-prophet-wiring.mjs  # 先知层接线：真实引擎端到�
 ├── cordis.patch.yml              # bundle 配置层（dsh.bundle.patch 指向，全部国产模型零密钥）
 ├── symbiosis-sankey-demo.html    # 认知生态能量流 Sankey 全景（零依赖自包含）
 ├── patches/domestic-models/      # 按厂商拆分的可选 patch（9 厂商 + all-domestic.yml）
-├── scripts/                      # patch 生成器 + 35 个离线验证脚本
+├── scripts/                      # patch 生成器 + 43 个离线验证脚本
 └── src/
     ├── index.ts                  # 插件入口：10 步主链路编排 + Tool 注册
     ├── types.ts / errors.ts      # 共享类型层 / 统一错误体系（稳定机器可读 code）
@@ -319,7 +399,7 @@ node scripts/verify-prophet-wiring.mjs  # 先知层接线：真实引擎端到�
     ├── autonomy-loop.ts          # 自主循环：11 步心跳编排
     ├── host-fusion.ts            # 宿主融合层：全宿主可观测 + 安全治理
     ├── dsh-host.ts               # DSH 宿主集成：LLM 客户端 / 模型目录 / Key 注入
-    ├── core/                     # 质变内核：evidence 3.0 → submodular 30.0 二十八内核
+    ├── core/                     # 质变内核：evidence 3.0 → matrix-completion 50.0 四十八内核
     ├── meta/                     # 元认知层：自我建模 + 元认知控制器（双环外环）
     ├── policy/                   # 策略进化器 + 安全沙盒：种群进化 / 金丝雀部署
     ├── symbiosis/                # 认知能量共生经济：账本 / 市场 / 信念市场 / 智能体 / 运行时 / Sankey
