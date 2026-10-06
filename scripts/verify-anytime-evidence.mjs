@@ -212,7 +212,8 @@ section('E 策略进化集成：CS 下界适应度 + e-BH 淘汰台账');
   const eliminated = engine.pruneProvablyDominated(0.1);
   const eliminatedIds = new Set(eliminated.map((e) => e.id));
   ok(!eliminatedIds.has(seeds[0]), `持续优秀的基因组 ${seeds[0]} 未被淘汰（无冤案）`);
-  ok(eliminated.every((e) => e.eValue >= 1 / 0.05 - 1e-9 || e.eValue > 1), `淘汰台账的 e-值全部达确证阈值（${eliminated.map((e) => e.eValue.toFixed(1)).join(', ') || '本轮无淘汰'}）`);
+  // 淘汰候选只可能来自 eBelow ≥ 1/α（α=0.05 → ≥ 20）的流，断言按确证阈值全额收紧
+  ok(eliminated.every((e) => e.eValue >= 1 / 0.05 - 1e-9), `淘汰台账的 e-值全部达确证阈值 1/α=20（${eliminated.map((e) => e.eValue.toFixed(1)).join(', ') || '本轮无淘汰'}）`);
 }
 
 // ═══════════════════ F 元认知保证层 ═══════════════════

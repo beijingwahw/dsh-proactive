@@ -20,6 +20,28 @@
  * 数值稳定: Cholesky 分解带抖动升级（1e-10 → 1e-6），对数域计算 LML;
  *   y 标准化（均值 0 方差 1）、x 归一到 [0,1] 后再拟合，尺度不敏感。
  *
+ * ── R5-A3 世界性进化（第五轮）──
+ * 数学进化（FITC 稀疏 GP）: fitSparse(xs, ys, {numInducing})——诱导点
+ *   近似（FITC/QFFG）：K ≈ Q + diag(K − Q) + σn²I，Q = K_xu K_uu⁻¹ K_ux。
+ *   Woodbury 恒等式把 (Q+Λ)⁻¹ 的求解压到 m×m（m = 诱导点数）：
+ *     (Q+Λ)⁻¹ = Λ⁻¹ − Λ⁻¹K_xu·B⁻¹·K_uxΛ⁻¹，B = K_uu + K_uxΛ⁻¹K_xu
+ *   预测均值/方差均归结为预计算的 m 维量（β 向量与 G = C−CB⁻¹C 矩阵），
+ *   单点预测 O(m²)（全 GP O(n²) 求解 + O(n) 核求值）；LML 用
+ *     ln|Q+Λ| = Σlnλ + ln|B| − ln|K_uu|
+ *   全程对数域。**m = n 且诱导点 = 训练点时 Q = K、λ = σn² ⟹ FITC ≡
+ *   精确 GP**（验证脚本的收敛锚点：m→n 时后验与 LML 双双逼近全 GP）。
+ *
+ * 性能进化（核矩阵三角化 + 预测缓存 + 批量预测）:
+ *   - kernelMatrix 只算下三角再镜像（核函数对称且 IEEE 平方/绝对值位级
+ *     对称 ⟹ 结果逐位一致），fit 的 LML 网格搜索核求值次数减半；
+ *   - fit 缓存归一化训练输入（nxTrain），predict 不再每点重算 O(n) 次
+ *     归一化；predictBatch 一次批量多点（Cholesky 预分解复用的批量口径）。
+ *
+ * 数值稳健性（条件预警）: GpFitReport 新增 jitterApplied / conditionEstimate
+ *   / illConditioned——λ̂max ≥ max diag(K_y)、λ̂min ≤ min L_ii² 的保守
+ *   估计，κ 估计 > 1e12 或抖动非零时置警（重复观测点 + 小 σn 的经典
+ *   病态可被调用方感知，而非静默拿到不可信后验）。
+ *
  * 零漂移: 未挂载时一切路径与升级前逐位一致。
  */
 
@@ -123,6 +145,14 @@ export interface GpFitReport {
   sigmaF: number;
   logMarginalLikelihood: number;
   tuned: boolean;
+  /** R5-A3：诱导点数（稀疏拟合时有值；undefined = 全 GP） */
+  inducing?: number;
+  /** R5-A3：最终分解实际加入的对角抖动（0 = 精确分解） */
+  jitterApplied?: number;
+  /** R5-A3：条件数保守估计 λ̂max/λ̂min（λ̂max ≥ max diag，λ̂min ≤ min L_ii²） */
+  conditionEstimate?: number;
+  /** R5-A3：病态预警（抖动非零或条件数估计 > 1e12） */
+  illConditioned?: boolean;
 }
 
 /**
@@ -143,6 +173,22 @@ export class GaussianProcess {
   private L: number[][] | undefined;
   private alpha: number[] = [];
   private fitReport: GpFitReport | undefined;
+  /** R5-A3：归一化训练输入缓存（fit 时一次算好，predict 免去 O(n) 重算） */
+  private nxTrain: number[] = [];
+  /** R5-A3：FITC 稀疏因子（fitSparse 时填充；predict 自动走稀疏路径） */
+  private sparseState:
+    | {
+        inducingNx: number[];
+        ell: number;
+        sf: number;
+        /** mean_std(x*) = k_u*(x*)·β */
+        beta: number[];
+        /** K_uu 的 Cholesky（r = K_uu⁻¹k_u* 求解用） */
+        Luu: number[][];
+        /** G = C − C·B⁻¹·C（方差二次型：var = sf² − rᵀGr） */
+        G: number[][];
+      }
+    | undefined;
 
   constructor(config?: Partial<GaussianProcessConfig>) {
     this.config = { ...DEFAULT_GP_CONFIG, ...config };
@@ -169,6 +215,9 @@ export class GaussianProcess {
 
     const zy = this.ys.map((v) => (v - this.yMean) / this.yStd);
     const nx = this.xs.map((x) => this.normalize(x));
+    // R5-A3：缓存归一化训练输入；fit 是全 GP 拟合，清掉稀疏态
+    this.nxTrain = nx;
+    this.sparseState = undefined;
 
     const lmlOf = (ell: number, sf: number): number => {
       const K = this.kernelMatrix(nx, ell, sf);
@@ -203,32 +252,285 @@ export class GaussianProcess {
 
     const K = this.kernelMatrix(nx, bestEll, bestSf).map((row, i) => row.map((v, j) => v + (i === j ? this.config.sigmaN ** 2 : 0)));
     const decomp = choleskyLower(K);
-    if (!decomp) return undefined;
+    if (!decomp) {
+      // 分解失败须保持失败原子性：xs/nxTrain 已更新为最新数据，若残留旧拟合的
+      // L/α/fitReport，predict 会把新训练输入与旧分解做维度错配的混合运算
+      this.L = undefined;
+      this.alpha = [];
+      this.fitReport = undefined;
+      return undefined;
+    }
     this.L = decomp.L;
     this.alpha = solveCholesky(this.L, zy);
+    // R5-A3：条件数保守估计（λ̂max ≥ max diag(K_y)，λ̂min ≤ min L_ii²）
+    let maxDiag = 0;
+    let minLii2 = Infinity;
+    for (let i = 0; i < m; i += 1) {
+      maxDiag = Math.max(maxDiag, K[i][i]);
+      minLii2 = Math.min(minLii2, this.L[i][i] ** 2);
+    }
+    const conditionEstimate = maxDiag / Math.max(1e-300, minLii2);
     this.fitReport = {
       points: m,
       lengthScale: bestEll,
       sigmaF: bestSf,
       logMarginalLikelihood: bestLml,
       tuned,
+      jitterApplied: decomp.jitter,
+      conditionEstimate,
+      illConditioned: decomp.jitter > 0 || conditionEstimate > 1e12,
     };
     return this.fitReport;
   }
 
-  /** 后验预测（原始尺度；未拟合时 undefined） */
+  /**
+   * FITC 稀疏拟合（R5-A3 数学进化）：诱导点近似把后验求解压到 m×m。
+   * 诱导点取归一化训练输入的分位数网格（numInducing 缺省 ⌈√n⌉；
+   * numInducing ≥ 训练点数时退化为「诱导点 = 全部训练点」⟹ FITC ≡ 精确 GP）。
+   * 拟合后 predict()/predictBatch() 自动走 O(m²) 稀疏路径。
+   */
+  fitSparse(xs: number[], ys: number[], opts?: { numInducing?: number }): GpFitReport | undefined {
+    const n = Math.min(xs.length, ys.length);
+    if (n < 2) return undefined;
+    let sx = xs.slice(-n);
+    let sy = ys.slice(-n);
+    if (n > this.config.maxPoints) {
+      sx = sx.slice(sx.length - this.config.maxPoints);
+      sy = sy.slice(sy.length - this.config.maxPoints);
+    }
+    this.xs = sx;
+    this.ys = sy;
+    const m = this.xs.length;
+    this.yMean = this.ys.reduce((s, v) => s + v, 0) / m;
+    this.yStd = Math.max(1e-9, Math.sqrt(this.ys.reduce((s, v) => s + (v - this.yMean) ** 2, 0) / Math.max(1, m - 1)));
+    this.xMin = Math.min(...this.xs);
+    this.xMax = Math.max(...this.xs);
+    if (!(this.xMax - this.xMin > 1e-12)) this.xMax = this.xMin + 1;
+    const zy = this.ys.map((v) => (v - this.yMean) / this.yStd);
+    const nx = this.xs.map((x) => this.normalize(x));
+    this.nxTrain = nx;
+    const numInd = Math.min(m, Math.max(2, Math.round(opts?.numInducing ?? Math.ceil(Math.sqrt(m)))));
+
+    // 诱导点：归一化训练输入的等分位网格（覆盖全域，无重复）
+    const sortedNx = [...nx].sort((a, b) => a - b);
+    const u: number[] = [];
+    if (numInd === 1) {
+      u.push(sortedNx[0]);
+    } else {
+      for (let j = 0; j < numInd; j += 1) u.push(sortedNx[Math.round((j * (m - 1)) / (numInd - 1))]);
+    }
+
+    /** FITC 因子与 LML（给定超参） */
+    const buildSparse = (ell: number, sf: number) => {
+      const Kuu = u.map((a) => u.map((b) => this.kernelValue(a, b, ell, sf)));
+      const duu = choleskyLower(Kuu);
+      if (!duu) return undefined;
+      const Kux: number[][] = u.map((a) => nx.map((x) => this.kernelValue(a, x, ell, sf)));
+      // W = K_uu⁻¹K_ux（逐列解）；Q_ii = K_ux[:,i]ᵀW[:,i]；λ = σn² + K_ii − Q_ii
+      const W: number[][] = Array.from({ length: numInd }, () => new Array<number>(m).fill(0));
+      const lam = new Array<number>(m).fill(0);
+      for (let i = 0; i < m; i += 1) {
+        const col = Kux.map((row) => row[i]);
+        const w = solveCholesky(duu.L, col);
+        let q = 0;
+        for (let a = 0; a < numInd; a += 1) {
+          W[a][i] = w[a];
+          q += col[a] * w[a];
+        }
+        lam[i] = Math.max(1e-12, this.config.sigmaN ** 2 + sf * sf - q);
+      }
+      // S = K_uxΛ⁻¹；C = S·K_ux；B = K_uu + C
+      const C: number[][] = Array.from({ length: numInd }, () => new Array<number>(numInd).fill(0));
+      for (let a = 0; a < numInd; a += 1) {
+        for (let b = a; b < numInd; b += 1) {
+          let s = 0;
+          for (let i = 0; i < m; i += 1) s += (Kux[a][i] * Kux[b][i]) / lam[i];
+          C[a][b] = s;
+          C[b][a] = s;
+        }
+      }
+      const B = Kuu.map((row, a) => row.map((v, b) => v + C[a][b]));
+      const dB = choleskyLower(B);
+      if (!dB) return undefined;
+      // v = (Q+Λ)⁻¹zy = Λ⁻¹(zy − K_uxᵀ·B⁻¹·S·zy)
+      const p = new Array<number>(numInd).fill(0);
+      for (let a = 0; a < numInd; a += 1) {
+        let s = 0;
+        for (let i = 0; i < m; i += 1) s += (Kux[a][i] * zy[i]) / lam[i];
+        p[a] = s;
+      }
+      const w = solveCholesky(dB.L, p);
+      const v = new Array<number>(m).fill(0);
+      for (let i = 0; i < m; i += 1) {
+        let t = 0;
+        for (let a = 0; a < numInd; a += 1) t += Kux[a][i] * w[a];
+        v[i] = (zy[i] - t) / lam[i];
+      }
+      // β = K_uu⁻¹(K_ux·v)：mean_std(x*) = k_u*(x*)·β
+      const Kv = new Array<number>(numInd).fill(0);
+      for (let a = 0; a < numInd; a += 1) {
+        let s = 0;
+        for (let i = 0; i < m; i += 1) s += Kux[a][i] * v[i];
+        Kv[a] = s;
+      }
+      const beta = solveCholesky(duu.L, Kv);
+      // G = C − C·B⁻¹·C（方差二次型）
+      const Z: number[][] = Array.from({ length: numInd }, () => new Array<number>(numInd).fill(0));
+      for (let b = 0; b < numInd; b += 1) {
+        const colB = Array.from({ length: numInd }, (_, a) => C[a][b]);
+        const z = solveCholesky(dB.L, colB);
+        for (let a = 0; a < numInd; a += 1) Z[a][b] = z[a];
+      }
+      const G: number[][] = Array.from({ length: numInd }, () => new Array<number>(numInd).fill(0));
+      for (let a = 0; a < numInd; a += 1) {
+        for (let b = a; b < numInd; b += 1) {
+          let s = 0;
+          for (let c = 0; c < numInd; c += 1) s += C[a][c] * Z[c][b];
+          const g = C[a][b] - s;
+          G[a][b] = g;
+          G[b][a] = g;
+        }
+      }
+      // LML_FITC = −½zyᵀv − ½(Σlnλ + ln|B| − ln|K_uu|) − (m/2)ln2π
+      let quad = 0;
+      for (let i = 0; i < m; i += 1) quad += zy[i] * v[i];
+      let logDet = 0;
+      for (let i = 0; i < m; i += 1) logDet += Math.log(lam[i]);
+      for (let a = 0; a < numInd; a += 1) logDet += 2 * Math.log(Math.max(1e-300, dB.L[a][a]));
+      for (let a = 0; a < numInd; a += 1) logDet -= 2 * Math.log(Math.max(1e-300, duu.L[a][a]));
+      return {
+        lml: -0.5 * quad - 0.5 * logDet - (m / 2) * Math.log(2 * Math.PI),
+        Luu: duu.L,
+        beta,
+        G,
+        jitter: dB.jitter,
+      };
+    };
+
+    // 超参网格搜索（与 fit 同网格，LML 口径换 FITC）
+    let bestEll = this.config.lengthScale;
+    let bestSf = this.config.sigmaF;
+    let built = buildSparse(bestEll, bestSf);
+    let bestLml = built ? built.lml : Number.NEGATIVE_INFINITY;
+    let tuned = false;
+    if (this.config.tuneHyperparams) {
+      tuned = true;
+      for (let e = 0; e < 8; e += 1) {
+        const ell = 10 ** (-2 + (0.7 * e) / 7);
+        for (const sf of [0.5, 1, 2]) {
+          const trial = buildSparse(ell, sf);
+          if (trial && trial.lml > bestLml) {
+            bestLml = trial.lml;
+            bestEll = ell;
+            bestSf = sf;
+            built = trial;
+          }
+        }
+      }
+    }
+    if (!built) return undefined;
+    this.L = undefined;
+    this.alpha = [];
+    this.sparseState = { inducingNx: u, ell: bestEll, sf: bestSf, beta: built.beta, Luu: built.Luu, G: built.G };
+    this.fitReport = {
+      points: m,
+      lengthScale: bestEll,
+      sigmaF: bestSf,
+      logMarginalLikelihood: bestLml,
+      tuned,
+      inducing: numInd,
+      jitterApplied: built.jitter,
+    };
+    return this.fitReport;
+  }
+
+  /** 后验预测（原始尺度；未拟合时 undefined；稀疏拟合走 O(m²) FITC 路径） */
   predict(x: number): GpPredict | undefined {
+    if (this.sparseState) return this.predictSparse(x);
     if (!this.L || this.xs.length === 0) return undefined;
     const nx = this.normalize(x);
-    const kStar = this.xs.map((xi) => this.kernelValue(nx, this.normalize(xi), this.fitReport!.lengthScale, this.fitReport!.sigmaF));
+    const kStar = this.nxTrain.map((nxi) => this.kernelValue(nx, nxi, this.fitReport!.lengthScale, this.fitReport!.sigmaF));
     let meanStd = 0;
     for (let i = 0; i < kStar.length; i += 1) meanStd += kStar[i]! * this.alpha[i]!;
     const w = solveCholesky(this.L!, kStar);
     // var = k(x,x) − k*ᵀK⁻¹k*（点积口径；wᵀw 会错算成 k*ᵀK⁻²k*）
     let quad = 0;
     for (let i = 0; i < w.length; i += 1) quad += kStar[i]! * w[i]!;
-    const prior = this.kernelValue(0, 0, this.fitReport!.lengthScale, this.fitReport!.sigmaF);
+    const prior = this.fitReport!.sigmaF ** 2;
     const varStd = Math.max(0, prior - quad);
+    return {
+      mean: meanStd * this.yStd + this.yMean,
+      std: Math.sqrt(varStd + this.config.sigmaN ** 2) * this.yStd,
+    };
+  }
+
+  /**
+   * 批量后验预测（R5-A3 性能进化）：Cholesky 预分解的批量复用口径——
+   * 超参/归一化训练输入/α/L 循环外提升为局部量，核函数分支按 batch
+   * 选定一次（RBF 公式内联），逐点求解共享同一份预分解。单点结果与
+   * 逐次 predict(x) 逐位一致（算术次序与表达式完全相同）。
+   */
+  predictBatch(xs: number[]): (GpPredict | undefined)[] {
+    if (this.sparseState) return xs.map((x) => this.predictSparse(x));
+    if (!this.L || this.xs.length === 0) return xs.map(() => undefined);
+    const report = this.fitReport!;
+    const ell = report.lengthScale;
+    const sf = report.sigmaF;
+    const nTrain = this.nxTrain.length;
+    const alpha = this.alpha;
+    const L = this.L;
+    const yMean = this.yMean;
+    const yStd = this.yStd;
+    const n2 = this.config.sigmaN ** 2;
+    const useMatern = this.config.kernel === 'matern52';
+    const twoEll2 = 2 * ell * ell;
+    const sf2 = sf * sf;
+    return xs.map((x) => {
+      // 与 normalize 相同的除法口径（保持与 predict 逐位一致）
+      const nx = (x - this.xMin) / (this.xMax - this.xMin);
+      const kStar = new Array<number>(nTrain);
+      if (useMatern) {
+        for (let i = 0; i < nTrain; i += 1) kStar[i] = matern52(nx - this.nxTrain[i], ell, sf);
+      } else {
+        for (let i = 0; i < nTrain; i += 1) {
+          const d = nx - this.nxTrain[i];
+          kStar[i] = sf2 * Math.exp(-(d * d) / twoEll2);
+        }
+      }
+      let meanStd = 0;
+      for (let i = 0; i < nTrain; i += 1) meanStd += kStar[i] * alpha[i];
+      const w = solveCholesky(L, kStar);
+      let quad = 0;
+      for (let i = 0; i < nTrain; i += 1) quad += kStar[i] * w[i];
+      const varStd = Math.max(0, sf * sf - quad);
+      return {
+        mean: meanStd * yStd + yMean,
+        std: Math.sqrt(varStd + n2) * yStd,
+      };
+    });
+  }
+
+  /** 是否处于 FITC 稀疏拟合态 */
+  get isSparse(): boolean {
+    return this.sparseState !== undefined;
+  }
+
+  /** FITC 稀疏路径：mean = k_u*·β；var = sf² − rᵀGr（r = K_uu⁻¹k_u*） */
+  private predictSparse(x: number): GpPredict | undefined {
+    if (this.xs.length === 0) return undefined;
+    const sp = this.sparseState!;
+    const nx = this.normalize(x);
+    const ku = sp.inducingNx.map((uj) => this.kernelValue(nx, uj, sp.ell, sp.sf));
+    let meanStd = 0;
+    for (let a = 0; a < ku.length; a += 1) meanStd += ku[a]! * sp.beta[a]!;
+    const r = solveCholesky(sp.Luu, ku);
+    let quad = 0;
+    for (let a = 0; a < r.length; a += 1) {
+      let s = 0;
+      for (let b = 0; b < r.length; b += 1) s += sp.G[a][b] * r[b]!;
+      quad += r[a]! * s;
+    }
+    const varStd = Math.max(0, sp.sf * sp.sf - quad);
     return {
       mean: meanStd * this.yStd + this.yMean,
       std: Math.sqrt(varStd + this.config.sigmaN ** 2) * this.yStd,
@@ -254,8 +556,23 @@ export class GaussianProcess {
     return sf * sf * Math.exp(-((a - b) ** 2) / (2 * ell * ell));
   }
 
+  /**
+   * 核矩阵（R5-A3 三角化）：只算下三角再镜像——核函数关于 (a,b) 位级
+   * 对称（rbf 的 (a−b)² 与 (b−a)² 在 IEEE 下精确相等、matern52 用 |a−b|），
+   * 结果与全矩阵计算逐位一致，核求值次数减半。
+   */
   private kernelMatrix(xs: number[], ell: number, sf: number): number[][] {
-    return xs.map((a) => xs.map((b) => this.kernelValue(a, b, ell, sf)));
+    const n = xs.length;
+    const K: number[][] = Array.from({ length: n }, () => new Array<number>(n).fill(0));
+    for (let i = 0; i < n; i += 1) {
+      K[i][i] = this.kernelValue(xs[i], xs[i], ell, sf);
+      for (let j = 0; j < i; j += 1) {
+        const v = this.kernelValue(xs[i], xs[j], ell, sf);
+        K[i][j] = v;
+        K[j][i] = v;
+      }
+    }
+    return K;
   }
 }
 
@@ -388,6 +705,9 @@ export class GpSeriesCalibrator {
     if (this.ts.length > this.config.maxPoints) {
       this.ts.splice(0, this.ts.length - this.config.maxPoints);
       this.vs.splice(0, this.vs.length - this.config.maxPoints);
+      // 环形裁剪后长度不变但内容已换血：以长度为键的重拟合缓存会被误命中，
+      // 满容量后 GP 永久冻结在首次到达容量时的拟合——裁剪即失效，强制重拟合
+      this.fittedAt = -1;
     }
   }
 

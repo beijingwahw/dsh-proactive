@@ -48,6 +48,25 @@
  * 审计性：归纳是因果图当前状态的纯函数（确定性），可重放；
  * 每条定律携带成员明细、偏离代价、反常者与压缩账目——
  * 「为什么信这条定律」可逐边追溯。
+ *
+ * R5 · 12.0 进化（第五轮·世界性进化）：
+ * A. MDL 两部码显式分解（数学轴）—— 压缩账目从单一贝叶斯因子
+ *    拆为「模型码 × 残差码」两部：
+ *      compressionNat = modelCodeSavingNat − residualHeterogeneityNat
+ *    - 模型码部分 modelCodeSavingNat = Σ regret_i − regret_池：K 个
+ *      独立参数 → 1 个共享参数省下的描述长度（regret = 通用码 −
+ *      最优码 = Beta(1,1) 边际似然 − MLE 似然，≈ ½·ln n 量级）；
+ *    - 残差码部分 residualHeterogeneityNat = Σ nᵢ·KL(p̂ᵢ‖p̂)：共享
+ *      参数拟合损失（Gibbs 不等式保证 ≥ 0，恰为成员对池的 KL 散度）。
+ *    恒等式逐位可验——「定律值得多少」第一次分解为「省了几个参数」
+ *    对「数据有多不合群」的显式对账。
+ * B. 定律合并的信息论判据（数学轴）—— mergeGain：两条定律并集的
+ *    单参数码 vs 各自两参数分码，Δ = compression(A∪B) −
+ *    (compression(A)+compression(B)) > 0 ⇔ 两族共享一个参数更省码长
+ *    （族边界不携带信息——合并是数据驱动的范畴收敛）。
+ * C. 定律索引（性能轴）—— coveringTheory 从 O(定律数) 线性扫描
+ *    改为 (family→to) 哈希索引 O(1)；归纳时重建。语义与线性扫描
+ *    逐位一致（键唯一）。
  */
 
 import type { CausalKernel } from './causal-kernel.js';
@@ -102,11 +121,40 @@ export interface Theory {
    * 共享 θ 用一个参数解释全部数据 vs 每条边各自付一个参数的代价。
    */
   compressionNat: number;
+  /**
+   * R5·12.0 两部码·模型部分（nat，≥0）：Σ regretᵢ − regret_池，
+   * regret(s,f) = LL(θ̂) − ln B(1+s,1+f) = 通用码长减最优码长的
+   * 「编码后悔量」——K 参数 → 1 参数省下的描述长度。
+   */
+  modelCodeSavingNat: number;
+  /**
+   * R5·12.0 两部码·残差部分（nat，≥0，Gibbs 不等式）：
+   * Σ LLᵢ(θ̂ᵢ) − LL_池(θ̂) = Σ nᵢ·KL(p̂ᵢ‖p̂)——共享参数的拟合损失，
+   * 成员对池的 KL 散度总和（「数据有多不合群」）。
+   * 恒等式：compressionNat = modelCodeSavingNat − residualHeterogeneityNat。
+   */
+  residualHeterogeneityNat: number;
   /** 本次归纳是否发生范式转移（驱逐重建） */
   paradigmShift: boolean;
   /** law：全员一致；contested：存在反常者（定律存疑） */
   status: 'law' | 'contested';
   inducedAt: number;
+}
+
+/** R5·12.0：定律合并评估（信息论判据） */
+export interface MergeAssessment {
+  /** 参与合并的定律 A 的作用域标识 */
+  aId: string;
+  /** 定律 B 的作用域标识 */
+  bId: string;
+  /** 分离压缩账目 = compression(A) + compression(B)（nat） */
+  separateCompressionNat: number;
+  /** 并集单定律压缩账目（nat；成员为两定律幸存者之并） */
+  mergedCompressionNat: number;
+  /** Δ = merged − separate（>0 ⇒ 合并更省码长 ⇔ mergeable） */
+  deltaNat: number;
+  /** Δ > 0：两族共享一个参数在 MDL 口径下更优 */
+  mergeable: boolean;
 }
 
 /** 定律零样本预测（作用域内臂证据稀疏的边） */
@@ -163,6 +211,8 @@ export class TheoristEngine {
   private config: TheoristConfig;
   private kernel: CausalKernel;
   private cached: Theory[] = [];
+  /** R5·12.0：作用域索引 `${family}→${to}` → 定律（coveringTheory O(1)） */
+  private scopeIndex = new Map<string, Theory>();
   private induced = false;
   private zeroShotCount = 0;
   private paradigmShiftCount = 0;
@@ -238,14 +288,15 @@ export class TheoristEngine {
     }
 
     this.cached = theories;
+    this.scopeIndex = new Map(theories.map((t) => [`${t.family}→${t.to}`, t] as const));
     this.induced = true;
     return theories;
   }
 
-  /** 覆盖 (from → to) 的在世定律（无缓存时惰性归纳） */
+  /** 覆盖 (from → to) 的在世定律（无缓存时惰性归纳；R5·12.0 起经作用域索引 O(1)） */
   coveringTheory(from: string, to: string, now = Date.now()): Theory | undefined {
     if (!this.induced) this.induce(now);
-    return this.cached.find((t) => t.family === familyOf(from) && t.to === to);
+    return this.scopeIndex.get(`${familyOf(from)}→${to}`);
   }
 
   /**
@@ -265,6 +316,34 @@ export class TheoristEngine {
   /** 在世定律只读视图 */
   allTheories(): Theory[] {
     return this.cached.map((t) => ({ ...t, members: t.members.map((m) => ({ ...m })), outliers: [...t.outliers] }));
+  }
+
+  /**
+   * R5·12.0：定律合并的信息论判据——两条定律的数据并起来用一条定律
+   * 描述，还是各用各的更省码长？
+   *
+   * Δ = compression(A∪B) − [compression(A) + compression(B)]
+   *   = [模型码：2 参数 → 1 参数再省一个] − [残差码：跨族异质性新增的
+   *     KL 拟合损失]
+   * Δ > 0 ⇔ 两族共享一个参数在 MDL 口径下更优 ⇔ 族边界（from 前缀）
+   * 不携带信息——范畴由数据裁决而非人来划分。Δ ≤ 0 保持分立。
+   *
+   * 纯函数：只读两条定律的幸存成员计数，不改动图、不产生新定律。
+   */
+  mergeGain(a: Theory, b: Theory): MergeAssessment {
+    const members = [...a.members, ...b.members].map((m) => ({ ...m }));
+    const separate = a.compressionNat + b.compressionNat;
+    // 复用 evaluate 的纯函数账目（在本地副本上计算，不动内核）
+    const mergedEval = this.evaluate(members);
+    const merged = mergedEval.compressionNat;
+    return {
+      aId: a.id,
+      bId: b.id,
+      separateCompressionNat: round(separate),
+      mergedCompressionNat: merged,
+      deltaNat: round(merged - separate),
+      mergeable: merged - separate > 0,
+    };
   }
 
   /**
@@ -310,6 +389,14 @@ export class TheoristEngine {
     const separateLogMl = members.reduce((a, m) => a + m.standaloneLogMlNat, 0);
     const compressionNat = lawLogMl - separateLogMl;
 
+    // R5·12.0 两部码显式分解（恒等式：compression = 模型码 − 残差码）：
+    //   通用码 = ln B(1+s,1+f) = 最优码 LL(θ̂) + regret（编码后悔量）
+    //   compression = [Σ LL_i(θ̂_i) − LL_池(θ̂)] + [Σ regret_i − regret_池]
+    //               = 残差码（异质性，≥0）的负值 + 模型码（省参数，≥0）
+    const modelCodeSavingNat = members.reduce((a, m) => a + regretOf(m.successes, m.failures), 0) - regretOf(S, F);
+    const residualHeterogeneityNat =
+      members.reduce((a, m) => a + logLikAtMle(m.successes, m.failures), 0) - logLikAtMle(S, F);
+
     // 成员入伙收益：该边数据在「其余成员汇聚后验」下的预测对数似然
     // − 自立门户先验预测对数似然（去偏：剔除自身对汇聚的影响）
     for (const m of members) {
@@ -326,6 +413,8 @@ export class TheoristEngine {
       lawUpper: round(wilsonUpperBound(S, F)),
       members,
       compressionNat: round(compressionNat),
+      modelCodeSavingNat: round(modelCodeSavingNat),
+      residualHeterogeneityNat: round(residualHeterogeneityNat),
       status: members.some((m) => m.anomalous) ? 'contested' : 'law',
       inducedAt: 0,
     };
@@ -335,6 +424,30 @@ export class TheoristEngine {
 /** ln B(α, β) = lnΓ(α) + lnΓ(β) − lnΓ(α+β)（先验预测对数似然的核） */
 function lnBeta(alpha: number, beta: number): number {
   return lnGamma(alpha) + lnGamma(beta) - lnGamma(alpha + beta);
+}
+
+/**
+ * R5·12.0：MLE 对数似然 LL(θ̂) = s·ln θ̂ + f·ln(1−θ̂)，θ̂ = s/(s+f)。
+ * 数值口径（对数域稳健）：s=0 或 f=0 时对应项按 0·ln 0 = 0 约定取 0
+ * （不产生 −∞）；n=0（空数据）似然恒 0。
+ */
+function logLikAtMle(s: number, f: number): number {
+  const n = s + f;
+  if (n === 0) return 0;
+  const theta = s / n;
+  const termS = s > 0 ? s * Math.log(theta) : 0;
+  const termF = f > 0 ? f * Math.log(1 - theta) : 0;
+  return termS + termF;
+}
+
+/**
+ * R5·12.0：编码后悔量（码长口径）= 通用码长 − 最优码长
+ *   = [−ln B(1+s,1+f)] − [−LL(θ̂)] = LL(θ̂) − ln B(1+s,1+f) ≥ 0
+ * （通用码（Beta(1,1) 先验预测）永不短于已知 θ̂ 的最优码——每参数
+ * ≈ ½·ln n 的多余码长，正是「付一个参数的价」）。
+ */
+function regretOf(s: number, f: number): number {
+  return logLikAtMle(s, f) - lnBeta(1 + s, 1 + f);
 }
 
 // ─────────────────────────── 工具 ───────────────────────────

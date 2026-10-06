@@ -20,6 +20,21 @@
  *    交换批次文件），均支持 authToken 鉴权
  * 6. 状态持久化：时钟 / peer 进度 / 待推送变更 / 冲突记录 / 同步日志全部落盘，
  *    重启后无缝续传
+ *
+ * 第三轮·世界性升级（模块域 A12）：
+ * 7. CRDT 反熵协议：状态向量时钟比较（dominates/dominated/concurrent/equal）
+ *    + 增量反熵（antiEntropyBatch 只传对方缺的操作——接收端缺口检测保证
+ *    按因果序无空洞应用；保留窗滑出时自动降级为全量状态兜底）+ 冲突
+ *    CRDT 合并（计数器逐分量 max / add-win 集 / (stamp,writer) 全序寄存器）
+ *    ——反熵从「全量状态对撞」升级为「向量时钟裁剪的最小增量流」，
+ *    收敛从协议希望变成合并算子的代数性质
+ *
+ * 第四轮·世界性升级（模块域 A12）：
+ * 8. 跨集群联邦：FederationGateway 按命名空间/键前缀订阅做选择性状态
+ *    同步（未订阅前缀在出口即被裁剪——零传输，不是「传了再丢」），
+ *    每窗口限流（超发排队延迟、不静默丢弃）；buildFederationBatch 纯
+ *    函数与引擎批次同一哈希口径——联邦批次直接经 receiveBatch 校验
+ *    应用（幂等）。全部新增面独立于既有 DistributedSync 状态（零漂移）
  */
 
 import crypto from 'node:crypto';
@@ -134,6 +149,157 @@ export interface SyncState {
   lastSyncAt: Record<string, number>;
   /** 已应用变更 id（有界 FIFO；跨重启幂等去重的持久化载体） */
   appliedIds?: string[];
+  // ── 反熵协议持久化（第三轮；缺席时零介入） ──
+  /** 状态向量时钟：origin → 已连续应用的最大操作序号 */
+  aeClock?: Record<string, number>;
+  /** 反熵中继操作日志（有界；按 (origin, seq) 去重） */
+  aeLog?: Array<{ origin: string; seq: number; op: CrdtOperation }>;
+  /** 集合/寄存器通道状态（计数器通道复用 crdtCounters，不在此重复） */
+  aeChannels?: Record<string, CrdtChannelState>;
+}
+
+// ─────────────────────────── 反熵协议类型（第三轮） ───────────────────────────
+
+/** CRDT 通道种类 */
+export type CrdtChannelKind = 'counter' | 'set' | 'register';
+
+/**
+ * CRDT 操作（op-based；由 (origin, seq) 因果坐标唯一标识）。
+ * remove 在 emit 时固化「发起端已见标签集」——add-win 语义的并发安全根源
+ */
+export type CrdtOperation =
+  | { kind: 'increment'; channel: string; by: number }
+  | { kind: 'add'; channel: string; element: string; tag?: string }
+  | { kind: 'remove'; channel: string; element: string; tags?: string[] }
+  | { kind: 'set'; channel: string; value: string; stamp: number };
+
+/** 带因果坐标的操作 */
+export interface StampedOperation {
+  origin: string;
+  seq: number;
+  op: CrdtOperation;
+}
+
+/** 通道状态快照（全量兜底 / 持久化 / 收敛比对的载体） */
+export interface CrdtChannelState {
+  kind: CrdtChannelKind;
+  /** counter：节点分量 */
+  counts?: Record<string, number>;
+  /** set：加标签集 / 墓碑集 */
+  set?: { added: Record<string, string[]>; removed: Record<string, string[]> };
+  /** register：最后写胜全序三元组 */
+  register?: { value: string | null; stamp: number; writer: string };
+}
+
+/** 反熵批次：向量时钟裁剪出的最小增量流（或全量状态兜底） */
+export interface AntiEntropyBatch {
+  from: string;
+  /** 发送方完整向量时钟（接收端据此裁剪 + 合并） */
+  clock: Record<string, number>;
+  /** 对方缺的操作（按 origin 分组、seq 升序——接收端逐序应用） */
+  ops: StampedOperation[];
+  /** 全量状态兜底（发送端保留窗无法覆盖对方缺口时） */
+  fullState: boolean;
+  state?: Record<string, CrdtChannelState>;
+}
+
+/** 向量时钟偏序关系 */
+export type VectorClockRelation = 'equal' | 'dominates' | 'dominated' | 'concurrent';
+
+/**
+ * 比较两个状态向量时钟（纯函数）：
+ * dominates = a 包含 b 的全部因果历史；concurrent = 双方各有对方未见过的操作
+ */
+export function compareVectorClocks(a: Record<string, number>, b: Record<string, number>): VectorClockRelation {
+  let aGreater = false;
+  let bGreater = false;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) {
+    const av = a[k] ?? 0;
+    const bv = b[k] ?? 0;
+    if (av > bv) aGreater = true;
+    else if (av < bv) bGreater = true;
+  }
+  if (aGreater && bGreater) return 'concurrent';
+  if (aGreater) return 'dominates';
+  if (bGreater) return 'dominated';
+  return 'equal';
+}
+
+/** add-win 集（自包含实现：removeTags 精确墓碑——并发 add 的标签不被陪葬） */
+class AddWinSet {
+  private added = new Map<string, Set<string>>();
+  private removed = new Map<string, Set<string>>();
+
+  add(element: string, tag: string): void {
+    const bucket = this.added.get(element) ?? new Set<string>();
+    bucket.add(tag);
+    this.added.set(element, bucket);
+  }
+
+  removeTags(element: string, tags: string[]): void {
+    if (tags.length === 0) return;
+    const bucket = this.removed.get(element) ?? new Set<string>();
+    for (const t of tags) bucket.add(t);
+    this.removed.set(element, bucket);
+  }
+
+  /** 元素当前活跃标签（remove 发起时的已见标签快照口径） */
+  liveTags(element: string): string[] {
+    const added = this.added.get(element);
+    if (!added) return [];
+    const removed = this.removed.get(element);
+    return [...added].filter((t) => !removed?.has(t));
+  }
+
+  has(element: string): boolean {
+    return this.liveTags(element).length > 0;
+  }
+
+  elements(): string[] {
+    return [...this.added.keys()].filter((e) => this.has(e)).sort();
+  }
+
+  state(): NonNullable<CrdtChannelState['set']> {
+    const added: Record<string, string[]> = {};
+    const removed: Record<string, string[]> = {};
+    for (const [e, tags] of this.added) added[e] = [...tags].sort();
+    for (const [e, tags] of this.removed) removed[e] = [...tags].sort();
+    return { added, removed };
+  }
+
+  mergeState(state: NonNullable<CrdtChannelState['set']>): void {
+    for (const [e, tags] of Object.entries(state.added ?? {})) {
+      for (const t of tags) this.add(e, t);
+    }
+    for (const [e, tags] of Object.entries(state.removed ?? {})) {
+      this.removeTags(e, tags);
+    }
+  }
+}
+
+/** 最后写胜寄存器（(stamp, writer) 字典序全序——平局确定仲裁） */
+class LastWriterRegister {
+  private value: string | null = null;
+  private stamp = -1;
+  private writer = '';
+
+  set(value: string, stamp: number, writer: string): void {
+    if (stamp < this.stamp) return;
+    if (stamp === this.stamp && writer <= this.writer) return;
+    this.value = value;
+    this.stamp = stamp;
+    this.writer = writer;
+  }
+
+  state(): NonNullable<CrdtChannelState['register']> {
+    return { value: this.value, stamp: this.stamp, writer: this.writer };
+  }
+
+  mergeState(state: NonNullable<CrdtChannelState['register']>): void {
+    if (state.value === null || state.value === undefined) return;
+    this.set(state.value, state.stamp, state.writer);
+  }
 }
 
 /** 同步引擎配置 */
@@ -156,6 +322,8 @@ const DEFAULT_LOG_LIMIT = 200;
 const MAX_PENDING_CHANGES = 5_000;
 /** 待推送变更默认字节上限（条数之外的第二道闸：单条大 payload 场景） */
 const DEFAULT_MAX_PENDING_BYTES = 16 * 1024 * 1024;
+/** 反熵中继日志上限（FIFO；滑出后反熵自动降级全量状态兜底） */
+const DEFAULT_AE_LOG_LIMIT = 4096;
 
 /**
  * 分布式记忆同步引擎
@@ -179,6 +347,16 @@ export class DistributedSync {
   /** 待推送队列总字节数（含每条变更近似大小缓存） */
   private pendingBytes = new Map<string, number>();
   private totalPendingBytes = 0;
+
+  // ── 反熵协议状态（第三轮；未使用时零介入） ──
+  /** 通道定义（计数器通道状态存 crdtCounters，集合/寄存器存此处的实例） */
+  private aeChannels = new Map<string, { kind: CrdtChannelKind; set?: AddWinSet; register?: LastWriterRegister }>();
+  /** 反熵中继操作日志（全部 origin 的已见操作，按 (origin,seq) 唯一） */
+  private aeLog: StampedOperation[] = [];
+  /** 状态向量时钟：origin → 已连续应用的最大序号 */
+  private aeClock: Record<string, number> = {};
+  /** 本节点已发出的操作数（自身向量时钟分量） */
+  private aeOwnSeq = 0;
 
   /**
    * @param localNodeId 本节点 id
@@ -209,6 +387,28 @@ export class DistributedSync {
       const size = this.approxSizeOf(c);
       this.pendingBytes.set(c.id, size);
       this.totalPendingBytes += size;
+    }
+    // 反熵状态跨重启恢复（向量时钟 + 中继日志 + 通道状态）
+    if (this.state.aeClock && typeof this.state.aeClock === 'object') {
+      this.aeClock = { ...this.state.aeClock };
+      this.aeOwnSeq = this.aeClock[localNodeId] ?? 0;
+    }
+    if (Array.isArray(this.state.aeLog)) {
+      const seen = new Set<string>();
+      for (const so of this.state.aeLog) {
+        if (!so || !so.op || !so.origin || typeof so.seq !== 'number') continue;
+        const key = `${so.origin}:${so.seq}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        this.aeLog.push({ origin: so.origin, seq: so.seq, op: so.op });
+      }
+      this.aeLog = this.aeLog.slice(-DEFAULT_AE_LOG_LIMIT);
+    }
+    if (this.state.aeChannels && typeof this.state.aeChannels === 'object') {
+      for (const [channel, st] of Object.entries(this.state.aeChannels)) {
+        if (!st || !st.kind) continue;
+        this.aeChannels.set(channel, this.channelFromState(channel, st));
+      }
     }
   }
 
@@ -811,6 +1011,16 @@ export class DistributedSync {
     try {
       // 幂等集合随状态落盘（有界，FIFO 截断与内存淘汰口径一致）
       this.state.appliedIds = [...this.appliedIds].slice(-this.options.appliedSetLimit);
+      // 反熵状态落盘（向量时钟 + 中继日志 + 集合/寄存器通道；计数器复用 crdtCounters 状态）
+      this.state.aeClock = { ...this.aeClock };
+      this.state.aeLog = this.aeLog.slice(-DEFAULT_AE_LOG_LIMIT);
+      const channels: Record<string, CrdtChannelState> = {};
+      for (const [channel, def] of this.aeChannels) {
+        if (def.kind === 'counter') channels[channel] = { kind: 'counter', counts: this.crdtCounters.get(channel)?.state() ?? {} };
+        else if (def.kind === 'set') channels[channel] = { kind: 'set', set: def.set ? def.set.state() : { added: {}, removed: {} } };
+        else channels[channel] = { kind: 'register', register: def.register ? def.register.state() : { value: null, stamp: -1, writer: '' } };
+      }
+      this.state.aeChannels = channels;
       if (this.cryptoEngine) {
         this.cryptoEngine.writeEncrypted(this.statePath, this.state);
         return;
@@ -839,20 +1049,28 @@ export class DistributedSync {
    * crdtState 读取——任何消息顺序都收敛到同一读数。
    */
   attachCrdtChannel(channels: ReadonlyArray<string>): void {
-    for (const c of channels) if (!this.crdtCounters.has(c)) this.crdtCounters.set(c, new GCounter());
-  }
-
-  /** 47.0：本地递增（通道不存在时惰性创建） */
-  incrementCrdtCounter(channel: string, by = 1): void {
-    let counter = this.crdtCounters.get(channel);
-    if (!counter) {
-      counter = new GCounter();
-      this.crdtCounters.set(channel, counter);
+    for (const c of channels) {
+      if (!this.crdtCounters.has(c)) this.crdtCounters.set(c, new GCounter());
+      if (!this.aeChannels.has(c)) this.aeChannels.set(c, { kind: 'counter' });
     }
-    counter.increment(this.localNodeId, by);
   }
 
-  /** 47.0：合入远端 CRDT 状态（交换/幂等——重复合入无害） */
+  /**
+   * 47.0：本地递增（通道不存在时惰性创建）。
+   * 第三轮升级：同时以 op-based 形式进反熵日志——增量经由 antiEntropyBatch
+   * 传播（mergeCrdtState 的全量对撞通道保留，两者共用同一 G-Counter 状态）
+   */
+  incrementCrdtCounter(channel: string, by = 1): void {
+    this.emitCrdtOperation({ kind: 'increment', channel, by });
+  }
+
+  /**
+   * 47.0：合入远端 CRDT 状态（交换/幂等——重复合入无害；全量状态通道）。
+   *
+   * 通道口径约束：同一通道不要同时使用本方法（状态对撞）与反熵增量流
+   * （antiEntropyBatch/applyAntiEntropy）——增量 op 非幂等，效果已经由
+   * 状态合并到位的 op 会在增量通道被再次相加。两种通道按通道隔离使用
+   */
   mergeCrdtState(remote: Record<string, Record<string, number>>): void {
     for (const [channel, counts] of Object.entries(remote)) {
       let counter = this.crdtCounters.get(channel);
@@ -866,10 +1084,519 @@ export class DistributedSync {
     }
   }
 
-  /** 47.0：CRDT 状态快照（可序列化 gossip 载荷） */
+  /** 47.0：CRDT 状态快照（计数器通道；可序列化 gossip 载荷） */
   crdtState(): Record<string, Record<string, number>> {
     const out: Record<string, Record<string, number>> = {};
     for (const [channel, counter] of this.crdtCounters) out[channel] = counter.state();
     return out;
+  }
+
+  // ─────────────── 47.x CRDT 反熵协议（向量时钟 + 增量传播 + 冲突合并） ───────────────
+
+  /**
+   * 声明 CRDT 通道种类（计数器通道亦可经 attachCrdtChannel 挂载）。
+   * 未声明的通道在首个操作时按操作种类自动创建
+   */
+  registerCrdtChannels(spec: Record<string, CrdtChannelKind>): void {
+    for (const [channel, kind] of Object.entries(spec)) {
+      this.channelFor(channel, kind, true);
+    }
+  }
+
+  /** 本节点状态向量时钟（只读副本） */
+  antiEntropyClock(): Record<string, number> {
+    return { ...this.aeClock };
+  }
+
+  /**
+   * 发出一个 CRDT 操作：分配自身因果坐标 (localNodeId, ++seq)、本地应用、
+   * 进中继日志。remove 未显式给 tags 时固化「本端当前活跃标签集」——
+   * add-win 语义要求墓碑在发起时刻封闭。
+   *
+   * 通道口径约束：经 emit 的通道应走反熵增量流同步；与 mergeCrdtState
+   * 状态对撞混用于同一通道会双计非幂等增量（见 mergeCrdtState 注释）
+   */
+  emitCrdtOperation(op: CrdtOperation): StampedOperation {
+    let operation = op;
+    if (op.kind === 'remove' && (!op.tags || op.tags.length === 0)) {
+      const channel = this.channelFor(op.channel, 'set');
+      operation = { ...op, tags: channel.set ? channel.set.liveTags(op.element) : [] };
+    } else {
+      // 确保通道存在（计数器/寄存器/集按首个操作定型）
+      this.channelFor(op.channel, op.kind === 'increment' ? 'counter' : op.kind === 'set' ? 'register' : 'set');
+    }
+    this.aeOwnSeq += 1;
+    const stamped: StampedOperation = { origin: this.localNodeId, seq: this.aeOwnSeq, op: operation };
+    this.aeClock[this.localNodeId] = this.aeOwnSeq;
+    this.applyStamped(stamped, true);
+    this.rememberOp(stamped);
+    this.schedulePersist();
+    return stamped;
+  }
+
+  /**
+   * 增量反熵批次：只含对方向量时钟缺失的操作。
+   *
+   * - 保留窗缺口检测：对方缺的序号已滑出中继日志时，降级为全量状态兜底
+   *   （半格合并与操作流殊途同归——收敛不被保留窗破坏）
+   * - ops 按 origin 分组、seq 升序：接收端沿因果序无空洞应用
+   */
+  antiEntropyBatch(peerClock: Record<string, number>): AntiEntropyBatch {
+    const peer = peerClock ?? {};
+    // 各 origin 在中继日志中的最早序号（保留窗下界；无保留视为无穷早）
+    const oldestByOrigin = new Map<string, number>();
+    for (const so of this.aeLog) {
+      const cur = oldestByOrigin.get(so.origin);
+      if (cur === undefined || so.seq < cur) oldestByOrigin.set(so.origin, so.seq);
+    }
+    let truncated = false;
+    for (const [origin, mine] of Object.entries(this.aeClock)) {
+      const theirs = peer[origin] ?? 0;
+      const oldest = oldestByOrigin.get(origin) ?? Number.MAX_SAFE_INTEGER;
+      if (theirs < mine && theirs < oldest - 1) {
+        truncated = true;
+        break;
+      }
+    }
+    if (truncated) {
+      return { from: this.localNodeId, clock: { ...this.aeClock }, ops: [], fullState: true, state: this.crdtFullState() };
+    }
+    const ops = this.aeLog.filter((so) => so.seq > (peer[so.origin] ?? 0));
+    return { from: this.localNodeId, clock: { ...this.aeClock }, ops, fullState: false };
+  }
+
+  /**
+   * 应用反熵批次：
+   * - 全量兜底：通道状态半格合并（幂等/交换/结合）+ 时钟合并；操作只入
+   *   中继日志不再应用（状态已含其效果——重复应用会双计非幂等操作）
+   * - 增量流：缺口检测（seq > 水位+1 的操作跳过留待重传，水位不虚进）
+   */
+  applyAntiEntropy(batch: AntiEntropyBatch): { applied: number; skipped: number; stateMerged: boolean } {
+    if (!batch || batch.from === this.localNodeId) return { applied: 0, skipped: 0, stateMerged: false };
+    if (batch.fullState) {
+      for (const [channel, state] of Object.entries(batch.state ?? {})) {
+        if (!state || !state.kind) continue;
+        this.mergeChannelState(channel, state);
+      }
+      for (const so of sortOps(batch.ops)) this.rememberOp(so);
+      this.mergeClock(batch.clock);
+      this.schedulePersist();
+      return { applied: 0, skipped: batch.ops.length, stateMerged: true };
+    }
+    let applied = 0;
+    let skipped = 0;
+    for (const so of sortOps(batch.ops)) {
+      const watermark = this.aeClock[so.origin] ?? 0;
+      if (so.seq <= watermark) {
+        skipped += 1; // 重复投递
+        continue;
+      }
+      if (so.seq > watermark + 1) {
+        skipped += 1; // 因果缺口：跳过留待重传（水位不虚进——不会假性覆盖）
+        continue;
+      }
+      this.applyStamped(so, false);
+      this.aeClock[so.origin] = so.seq;
+      this.rememberOp(so);
+      applied += 1;
+    }
+    this.mergeClock(batch.clock);
+    this.schedulePersist();
+    return { applied, skipped, stateMerged: false };
+  }
+
+  /** 通道收敛读数（counter 总和 / set 排序元素 / register 值） */
+  crdtRead(channel: string): number | string[] | string | null | undefined {
+    const def = this.aeChannels.get(channel);
+    if (!def) return undefined;
+    if (def.kind === 'counter') return this.crdtCounters.get(channel)?.value() ?? 0;
+    if (def.kind === 'set') return def.set ? def.set.elements() : [];
+    return def.register ? def.register.state().value : null;
+  }
+
+  /** 全部通道状态快照（收敛比对 / 全量兜底载荷；canonical 口径可逐位比对） */
+  crdtFullState(): Record<string, CrdtChannelState> {
+    const out: Record<string, CrdtChannelState> = {};
+    for (const [channel, def] of this.aeChannels) {
+      if (def.kind === 'counter') out[channel] = { kind: 'counter', counts: this.crdtCounters.get(channel)?.state() ?? {} };
+      else if (def.kind === 'set') out[channel] = { kind: 'set', set: def.set ? def.set.state() : { added: {}, removed: {} } };
+      else out[channel] = { kind: 'register', register: def.register ? def.register.state() : { value: null, stamp: -1, writer: '' } };
+    }
+    return out;
+  }
+
+  // ── 反熵内部 ──
+
+  /** 取通道定义；不存在时按 kind 创建（kind 冲突返回既有定义——通道定型不改） */
+  private channelFor(
+    channel: string,
+    kind: CrdtChannelKind,
+    force = false,
+  ): { kind: CrdtChannelKind; set?: AddWinSet; register?: LastWriterRegister } {
+    let def = this.aeChannels.get(channel);
+    if (!def) {
+      def = kind === 'set' ? { kind, set: new AddWinSet() } : kind === 'register' ? { kind, register: new LastWriterRegister() } : { kind };
+      if (kind === 'counter' && !this.crdtCounters.has(channel)) this.crdtCounters.set(channel, new GCounter());
+      this.aeChannels.set(channel, def);
+      return def;
+    }
+    if (force && def.kind !== kind) return def; // 通道已定型：拒绝改种
+    return def;
+  }
+
+  /** 从持久化状态重建通道实例 */
+  private channelFromState(channel: string, st: CrdtChannelState): { kind: CrdtChannelKind; set?: AddWinSet; register?: LastWriterRegister } {
+    if (st.kind === 'counter') {
+      // 计数器分量必须真正回灌 G-Counter（挂空壳会让重启后读数归零）
+      const counter = new GCounter();
+      for (const [node, v] of Object.entries(st.counts ?? {})) counter.increment(node, v);
+      this.crdtCounters.set(channel, counter);
+      return { kind: 'counter' };
+    }
+    if (st.kind === 'set') {
+      const set = new AddWinSet();
+      set.mergeState(st.set ?? { added: {}, removed: {} });
+      return { kind: 'set', set };
+    }
+    const register = new LastWriterRegister();
+    register.mergeState(st.register ?? { value: null, stamp: -1, writer: '' });
+    return { kind: 'register', register };
+  }
+
+  /** 应用一个已定坐标的操作（本地 emit 与远端批次共用；效果确定性依赖于 op 全量） */
+  private applyStamped(stamped: StampedOperation, isLocal: boolean): void {
+    const { op } = stamped;
+    if (op.kind === 'increment') {
+      const def = this.channelFor(op.channel, 'counter');
+      if (def.kind !== 'counter') return;
+      let counter = this.crdtCounters.get(op.channel);
+      if (!counter) {
+        counter = new GCounter();
+        this.crdtCounters.set(op.channel, counter);
+      }
+      counter.increment(stamped.origin, Math.max(0, Math.floor(op.by))); // 分量记在 origin 名下
+      return;
+    }
+    if (op.kind === 'add') {
+      const def = this.channelFor(op.channel, 'set');
+      if (def.kind !== 'set') return;
+      if (!def.set) def.set = new AddWinSet();
+      def.set.add(op.element, op.tag ?? `${stamped.origin}:${stamped.seq}`);
+      return;
+    }
+    if (op.kind === 'remove') {
+      const def = this.channelFor(op.channel, 'set');
+      if (def.kind !== 'set') return;
+      if (!def.set) def.set = new AddWinSet();
+      def.set.removeTags(op.element, op.tags ?? []);
+      return;
+    }
+    // set（寄存器）
+    const def = this.channelFor(op.channel, 'register');
+    if (def.kind !== 'register') return;
+    if (!def.register) def.register = new LastWriterRegister();
+    def.register.set(op.value, op.stamp, stamped.origin);
+    void isLocal;
+  }
+
+  /** 操作入中继日志（调用路径保证 (origin, seq) 不重复；FIFO 限长） */
+  private rememberOp(stamped: StampedOperation): void {
+    this.aeLog.push(stamped);
+    if (this.aeLog.length > DEFAULT_AE_LOG_LIMIT) this.aeLog = this.aeLog.slice(-DEFAULT_AE_LOG_LIMIT);
+  }
+
+  /** 合并向量时钟（逐分量 max） */
+  private mergeClock(remote: Record<string, number>): void {
+    for (const [origin, seq] of Object.entries(remote ?? {})) {
+      if (typeof seq !== 'number' || !Number.isFinite(seq)) continue;
+      this.aeClock[origin] = Math.max(this.aeClock[origin] ?? 0, seq);
+    }
+  }
+
+  /** 通道状态半格合并（全量兜底路径） */
+  private mergeChannelState(channel: string, state: CrdtChannelState): void {
+    const def = this.channelFor(
+      channel,
+      state.kind,
+    );
+    if (state.kind === 'counter' && def.kind === 'counter') {
+      let counter = this.crdtCounters.get(channel);
+      if (!counter) {
+        counter = new GCounter();
+        this.crdtCounters.set(channel, counter);
+      }
+      const other = new GCounter();
+      for (const [node, v] of Object.entries(state.counts ?? {})) other.increment(node, v);
+      counter.merge(other);
+      return;
+    }
+    if (state.kind === 'set' && def.kind === 'set') {
+      if (!def.set) def.set = new AddWinSet();
+      def.set.mergeState(state.set ?? { added: {}, removed: {} });
+      return;
+    }
+    if (state.kind === 'register' && def.kind === 'register') {
+      if (!def.register) def.register = new LastWriterRegister();
+      def.register.mergeState(state.register ?? { value: null, stamp: -1, writer: '' });
+    }
+  }
+}
+
+/** 操作流按 (origin, seq) 全序排序（确定性应用序） */
+function sortOps(ops: ReadonlyArray<StampedOperation>): StampedOperation[] {
+  return [...ops].sort((a, b) => (a.origin === b.origin ? a.seq - b.seq : a.origin < b.origin ? -1 : 1));
+}
+
+// ─────────────────────────── 跨集群联邦网关（第四轮，独立新增面） ───────────────────────────
+
+/** 联邦订阅：命名空间 + 键前缀（只订阅指纹匹配前缀的变更） */
+export interface FederationSubscription {
+  namespace: string;
+  keyPrefix: string;
+}
+
+/** 联邦网关选项 */
+export interface FederationGatewayOptions {
+  /** 网关 id（审计标识） */
+  gatewayId: string;
+  /** 订阅清单（缺省空 = 不转发任何内容） */
+  subscriptions?: FederationSubscription[];
+  /** 每窗口最多转发的变更条数（限流） */
+  ratePerWindow: number;
+  /** 窗口长度（毫秒） */
+  windowMs: number;
+  /** 注入时钟（缺省 Date.now——确定性仿真注入虚拟时钟） */
+  now?: () => number;
+  /** 待发队列上限（默认 1024；超限丢弃并计数——防洪泛） */
+  maxQueue?: number;
+}
+
+/** 联邦网关统计（零传输与限流的可验证口径） */
+export interface FederationStats {
+  /** offer 进网的变更总数 */
+  offered: number;
+  /** 命中订阅（进入待发队列）的变更数 */
+  matched: number;
+  /** 未订阅前缀被出口裁剪数（零传输） */
+  filtered: number;
+  /** 队列超限丢弃数 */
+  dropped: number;
+  /** 已转发变更数 */
+  forwarded: number;
+  /** 当前滞留队列长度（限流延迟中） */
+  deferred: number;
+  /** 已转发批次字节总量（近似序列化长度） */
+  bytesForwarded: number;
+  /** 按「命名空间:前缀」的转发计数（未订阅前缀不出现——零传输证据） */
+  forwardedByPrefix: Record<string, number>;
+  /** 已流转的限流窗口数 */
+  windowsElapsed: number;
+  /** 限流实际生效的次数（有变更因窗口令牌耗尽而滞留的 pump 次数） */
+  throttledPumps: number;
+}
+
+/**
+ * 构建联邦批次（纯函数）：与 DistributedSync.computeBatchHash 同一
+ * 哈希口径——产出的批次可直接经 receiveBatch 校验应用（幂等去重生效）。
+ * logicalClock 缺省取变更流中的最大逻辑时钟
+ */
+export function buildFederationBatch(
+  sourceNodeId: string,
+  changes: ReadonlyArray<ChangeEntry>,
+  options: { logicalClock?: number; timestamp?: number; batchId?: string } = {},
+): SyncBatch {
+  const list = [...changes];
+  const logicalClock =
+    options.logicalClock ?? list.reduce((m, c) => Math.max(m, typeof c.logicalClock === 'number' ? c.logicalClock : 0), 0);
+  const batch: SyncBatch = {
+    batchId: options.batchId ?? `fed-${sourceNodeId}-${logicalClock}-${crypto.randomBytes(3).toString('hex')}`,
+    sourceNodeId,
+    changes: list,
+    timestamp: options.timestamp ?? Date.now(),
+    logicalClock,
+    batchHash: '',
+  };
+  const chain = list.map((c) => `${c.id}:${c.dataHash}`).join('|');
+  batch.batchHash = crypto.createHash('sha256').update(`${batch.sourceNodeId}:${batch.logicalClock}:${chain}`).digest('hex');
+  return batch;
+}
+
+/**
+ * 联邦网关：跨集群间的选择性状态同步出口。
+ *
+ * - 选择性：offer 的变更按订阅前缀在出口裁剪——未订阅前缀零传输
+ *   （filtered 计数 + B 端永不接触），而非「全量转发再由对端丢弃」
+ * - 限流：每窗口 ratePerWindow 个令牌；超发排队（deferred）下窗口
+ *   续传，不静默丢弃；队列上限防未消费洪泛
+ * - 确定性：时钟可注入（虚拟时钟下逐窗口推进，同输入同输出）
+ * - 批次口径：buildFederationBatch（与引擎哈希一致）→ 对端
+ *   DistributedSync.receiveBatch 直接校验应用（幂等）
+ */
+export class FederationGateway {
+  readonly gatewayId: string;
+  private subs: FederationSubscription[];
+  private readonly rate: number;
+  private readonly windowMs: number;
+  private readonly nowFn: () => number;
+  private readonly maxQueue: number;
+  private queue: ChangeEntry[] = [];
+  private queuedIds = new Set<string>();
+  private sink: ((batch: SyncBatch) => Promise<unknown> | void) | null = null;
+  private lastWindow = -1;
+  private tokensUsed = 0;
+  private readonly stats: FederationStats;
+
+  constructor(options: FederationGatewayOptions) {
+    if (!options || !options.gatewayId) throw new Error('联邦网关需要 gatewayId');
+    if (!Number.isFinite(options.ratePerWindow) || options.ratePerWindow < 1) {
+      throw new Error('ratePerWindow 必须 ≥ 1');
+    }
+    if (!Number.isFinite(options.windowMs) || options.windowMs < 1) {
+      throw new Error('windowMs 必须 ≥ 1');
+    }
+    this.gatewayId = options.gatewayId;
+    this.subs = (options.subscriptions ?? []).filter((s) => s && typeof s.keyPrefix === 'string' && s.keyPrefix.length > 0);
+    this.rate = Math.floor(options.ratePerWindow);
+    this.windowMs = Math.floor(options.windowMs);
+    this.nowFn = options.now ?? Date.now;
+    this.maxQueue = Math.max(1, options.maxQueue ?? 1024);
+    this.stats = {
+      offered: 0,
+      matched: 0,
+      filtered: 0,
+      dropped: 0,
+      forwarded: 0,
+      deferred: 0,
+      bytesForwarded: 0,
+      forwardedByPrefix: {},
+      windowsElapsed: 0,
+      throttledPumps: 0,
+    };
+  }
+
+  /** 订阅清单（只读副本） */
+  subscriptions(): FederationSubscription[] {
+    return this.subs.map((s) => ({ ...s }));
+  }
+
+  /** 重设订阅（已在队列中的变更按新订阅重新裁剪） */
+  setSubscriptions(subs: FederationSubscription[]): void {
+    this.subs = (subs ?? []).filter((s) => s && typeof s.keyPrefix === 'string' && s.keyPrefix.length > 0);
+    const kept: ChangeEntry[] = [];
+    const keptIds = new Set<string>();
+    for (const c of this.queue) {
+      if (this.matchSubscription(c.fingerprint)) {
+        kept.push(c);
+        keptIds.add(c.id);
+      }
+    }
+    this.queue = kept;
+    this.queuedIds = keptIds;
+  }
+
+  /** 接线对端（联邦批次的交付目标——通常是远端集群的 receiveBatch 桥） */
+  link(sink: (batch: SyncBatch) => Promise<unknown> | void): void {
+    this.sink = sink;
+  }
+
+  /** 待发队列长度 */
+  queueSize(): number {
+    return this.queue.length;
+  }
+
+  /** 网关统计（只读快照） */
+  statsView(): FederationStats {
+    return { ...this.stats, deferred: this.queue.length, forwardedByPrefix: { ...this.stats.forwardedByPrefix } };
+  }
+
+  /**
+   * 变更入网：命中订阅进待发队列（重复 id 幂等跳过），未订阅前缀
+   * 出口裁剪（零传输），队列超限丢弃并计数
+   */
+  offer(changes: ReadonlyArray<ChangeEntry>): { matched: number; filtered: number; dropped: number } {
+    let matched = 0;
+    let filtered = 0;
+    let dropped = 0;
+    for (const c of changes ?? []) {
+      if (!c || typeof c.fingerprint !== 'string') continue;
+      this.stats.offered += 1;
+      if (!this.matchSubscription(c.fingerprint)) {
+        filtered += 1;
+        this.stats.filtered += 1;
+        continue;
+      }
+      matched += 1;
+      this.stats.matched += 1;
+      if (this.queuedIds.has(c.id)) continue; // 重复 offer 幂等
+      if (this.queue.length >= this.maxQueue) {
+        dropped += 1;
+        this.stats.dropped += 1;
+        continue;
+      }
+      this.queue.push(c);
+      this.queuedIds.add(c.id);
+    }
+    return { matched, filtered, dropped };
+  }
+
+  /**
+   * 推进限流窗口并转发：当前窗口剩余令牌内的队首变更打包为一个联邦
+   * 批次交付对端；令牌耗尽时余量滞留（deferred——限流延迟而非丢弃）。
+   * 未接线时不消费队列（转发零静默丢失）
+   */
+  async pump(): Promise<{ forwarded: number; deferred: number }> {
+    const window = Math.floor(this.nowFn() / this.windowMs);
+    if (window > this.lastWindow) {
+      this.stats.windowsElapsed += window - this.lastWindow;
+      this.lastWindow = window;
+      this.tokensUsed = 0;
+    }
+    const out: ChangeEntry[] = [];
+    while (this.queue.length > 0 && this.tokensUsed < this.rate) {
+      const c = this.queue.shift()!;
+      this.queuedIds.delete(c.id);
+      out.push(c);
+      this.tokensUsed += 1;
+    }
+    if (out.length === 0) {
+      return { forwarded: 0, deferred: this.queue.length };
+    }
+    if (!this.sink) {
+      // 未接线：变更退回队列（顺序保持），令牌回滚——不静默丢失
+      this.queue = out.concat(this.queue);
+      for (const c of out) this.queuedIds.add(c.id);
+      this.tokensUsed -= out.length;
+      return { forwarded: 0, deferred: this.queue.length };
+    }
+    if (this.queue.length > 0) this.stats.throttledPumps += 1;
+    const batch = buildFederationBatch(out[0]!.sourceNodeId, out, { timestamp: this.nowFn() });
+    const batchBytes = JSON.stringify(batch).length;
+    try {
+      await this.sink(batch);
+    } catch {
+      // 交付失败：变更退回队列（顺序保持），令牌回滚——不静默丢失；
+      // 对端若已部分收达，重投由 receiveBatch 的 appliedIds 幂等去重吸收
+      this.queue = out.concat(this.queue);
+      for (const c of out) this.queuedIds.add(c.id);
+      this.tokensUsed -= out.length;
+      return { forwarded: 0, deferred: this.queue.length };
+    }
+    // 统计在交付成功后才累计——失败路径无需回滚任何计数
+    this.stats.bytesForwarded += batchBytes;
+    for (const c of out) {
+      const sub = this.matchSubscription(c.fingerprint)!;
+      const key = `${sub.namespace}:${sub.keyPrefix}`;
+      this.stats.forwardedByPrefix[key] = (this.stats.forwardedByPrefix[key] ?? 0) + 1;
+    }
+    this.stats.forwarded += out.length;
+    return { forwarded: out.length, deferred: this.queue.length };
+  }
+
+  /** 命中订阅（首个前缀匹配的订阅；空订阅表 = 永不命中） */
+  private matchSubscription(fingerprint: string): FederationSubscription | null {
+    for (const sub of this.subs) {
+      if (fingerprint.startsWith(sub.keyPrefix)) return sub;
+    }
+    return null;
   }
 }

@@ -84,6 +84,19 @@
           code-generation: 0.8
           general: 0.8
           analysis: 0.8
+    # τ2 结构学习的对照臂：与 glm-4.5 同端点同 key——桶内 A/B 对照是
+    # 规则固化的数据前提（soak 实测：单臂世界结构学习必然饿死）
+    - id: glm-5.3
+      endpoint: https://open.bigmodel.cn/api/paas/v4
+      timeout: 90000
+      maxConcurrency: 3
+      costPerKToken: 0.004
+      contextWindow: 128000
+      initialCapabilities:
+        taskScores:
+          code-generation: 0.85
+          general: 0.85
+          analysis: 0.85
     - id: glm-4-flash
       endpoint: https://open.bigmodel.cn/api/paas/v4
       timeout: 30000
@@ -186,7 +199,10 @@
       watchErrors: true
       watchPerformance: true
       aggregationWindow: 5
-      signalSources: []
+      # 真实工作负载入站通道：HTTP POST :9878（scripts/dsh-work.mjs 驱动）
+      signalSources:
+        - type: webhook
+          port: 9878
     qualityThreshold: 0.7
     maxRetries: 2
     globalTimeout: 300000
@@ -226,6 +242,30 @@
     autonomy:
       enabled: true
       heartbeatMs: 30000
+      # 新臂入场探索：glm-5.3 引入期保持对照流量（τ2 结构学习数据前提）
+      exploration:
+        enabled: true
+        sampleFloor: 30
+        budget: 1000000
+        bonus: 0.25
+        overrideRate: 0.3
+      # 创世纪 G4：快路径解钉历史模型（复用"怎么做"，不固化"用谁做"）
+      fastPath:
+        reuseModels: false
+      symbiosis:
+        enabled: true
+        plasticity:
+          enabled: true
+          persistPath: .scheduler/plasticity.json
+          rulesPath: .scheduler/plasticity-rules.json
+          gateWindow: 50
+          probeSize: 50
+          # 引入期参数：更频繁的固化尝试（证据不足时无害空转）
+          consolidateEvery: 60
+          # 创世纪 G3：流动性操作（引入期预算加倍，常态后回调 6）
+          probes:
+            enabled: true
+            maxPerHour: 12
     hostFusion:
       enabled: true
       observeToolResults: true

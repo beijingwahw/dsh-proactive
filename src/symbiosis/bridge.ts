@@ -33,6 +33,12 @@
  *
  * 权限与安全：桥接器是 SymbiosisRuntime 的唯一持有者；智能体仍只能经
  * 感知视图只读、经提案由运行时代为成交。缺省关闭（影子系统，零行为漂移）。
+ *
+ * 四轮升级（接点 4：条件结算合约）：attachConditionalSettlement() 挂载后，
+ * openDelivery/settleDeliveries 提供「交付托管制」的知识交易通路——
+ * 买方货款 + 卖方违约保证金双托管，交付确认按质量三路结算（全额 /
+ * 按比例 / 违约罚没入账）；deliveryAudit() 从账本独立重算托管守恒
+ * （入 = 出 + 在途）。未挂载全部 undefined（影子口径零漂移）。
  */
 
 import type { Insight } from '../goal-engine.js';
@@ -42,8 +48,18 @@ import { AgentBase, type AgentProposal } from './agent.js';
 import type { GovernanceGate, SymbiosisTickReport } from './runtime.js';
 import { SymbiosisRuntime, type DistributionReport, type SymbiosisConfig } from './runtime.js';
 import { TREASURY } from './ledger.js';
+import type { ContractAuditReport, ContractSettlementReport, DeliveryContractView } from './market.js';
 import { EvolverAgent, MemoryAgent, OptimizerAgent, type EvolutionCycleOutcome, type MemoryAgentConfig, type OptimizerAgentConfig } from './wrappers.js';
 import { buildEnergySankey, renderSankeyHtml, type EnergySankeyReport } from './observability.js';
+import type { PlasticityLoop, FailureMode } from '../plasticity/loop.js';
+import { classifyFailure, INFRA_MODES } from '../plasticity/loop.js';
+// 创世纪 61.0/62.0/63.0/64.0/65.0：共生市场的稳定撮合 / 机制设计 / 核仁 /
+// 相关均衡 / 动态定价（全部影子口径——不改变主链路铸币与结算数值）
+import { deferredAcceptance, isStable, type StableMatchingProblem, type StabilityCheck } from '../core/stable-matching.js';
+import { empiricalGrid, myersonReserve, vcgAllocate, type VcgOutcome } from '../core/mechanism-design.js';
+import { makeGameFromPairs, nucleolus, shapleyExact, core as gameCore, type CoreStatus, type NucleolusResult } from '../core/nucleolus.js';
+import { normalGame, learnCE, isCorrelatedEquilibrium, type LearnCEResult, type CECheck, type NormalGame } from '../core/correlated-equilibrium.js';
+import { EnergyPricingMount } from '../engines-frontier/genesis25.js';
 
 /** 全局成功率信号键（同时是滚动信念的 subject 与 externalEstimates 的键） */
 export const SIGNAL_GLOBAL_SUCCESS = 'task.successRate';
@@ -58,6 +74,23 @@ export function modelSignalKey(modelId: string): string {
 /** 模型智能体账户 id */
 export function modelAgentId(modelId: string): string {
   return `model:${modelId}`;
+}
+
+/** 四轮升级：条件结算批量结算汇总（宿主一拍多合约的聚合读数） */
+export interface DeliverySettlementSummary {
+  /** 本批结算合约数 */
+  settled: number;
+  full: number;
+  partial: number;
+  breach: number;
+  /** 付给卖方货款合计 */
+  totalToSeller: number;
+  /** 退还买方货款合计 */
+  totalRefunded: number;
+  /** 违约罚没合计（入买方） */
+  totalPenalties: number;
+  /** 逐合约明细 */
+  reports: ContractSettlementReport[];
 }
 
 /**
@@ -216,6 +249,23 @@ export class SymbiosisBridge {
   private memoryAgentInstance?: MemoryAgent;
   private optimizerAgentInstance?: OptimizerAgent;
   private futarchyLog: SymbiosisTickReport['futarchyDecisions'] = [];
+  /** 61.0/62.0/63.0/64.0：市场理论核挂载标志（未挂载零介入——影子口径） */
+  private marketTheoryMounted: { stableMatching: boolean; mechanismDesign: boolean; nucleolus: boolean; correlatedEquilibrium: boolean } = {
+    stableMatching: false,
+    mechanismDesign: false,
+    nucleolus: false,
+    correlatedEquilibrium: false,
+  };
+  /** 65.0：费率学习挂载（未挂载零介入——影子口径） */
+  private pricingMount?: EnergyPricingMount;
+  /** 四轮升级：条件结算合约挂载（未挂载零介入——影子口径） */
+  private conditionalSettlementMounted = false;
+  /** E 路线：τ1 可塑性学习闭环（未挂载零介入——影子口径） */
+  private plasticity?: PlasticityLoop;
+  /** 可塑性事件序号（taskId 唯一性） */
+  private plasticitySeq = 0;
+  /** τ2 固化器（未挂载零介入；onEvent 驱动固化节奏） */
+  private consolidation?: { onEvent(): boolean };
   private readonly cfg: Required<Pick<SymbiosisBridgeConfig, 'beliefHorizonTicks' | 'globalSuccessThreshold' | 'modelSuccessThreshold' | 'modelBetBudget' | 'modelReserveBalance' | 'divergenceMargin' | 'maxDriftInsightsPerTick'>> & {
     futarchy: Required<NonNullable<SymbiosisBridgeConfig['futarchy']>>;
     economic: Required<NonNullable<SymbiosisBridgeConfig['economic']>>;
@@ -264,6 +314,36 @@ export class SymbiosisBridge {
     const agent = new ModelAgent(modelId, { betBudget: this.cfg.modelBetBudget, reserveBalance: this.cfg.modelReserveBalance });
     this.runtime.register(agent);
     this.modelAgents.set(modelId, agent);
+    // τ1 名册同步：可塑性路由的发现性依赖名册（不依赖偶然的首次使用）
+    this.plasticity?.register([modelAgentId(modelId)], Date.now());
+  }
+
+  /**
+   * E 路线：τ1 可塑性学习闭环挂载（未挂载零介入——影子口径同其他 attach*）。
+   *
+   * 挂载后 settleTask 把「结算前预报 → 任务结局（含逐节点真值）」喂给
+   * 学习回路：Beta 后验 / 门控校准 / 预算赌徒路由从真实结局流在线更新，
+   * 遗忘门控与持久化由 loop 自理（autoGate / persistPath 配置）。
+   * 铸币、分红、信誉等既有结算数值**逐位不变**（学习只读结局，不改经济）。
+   */
+  attachPlasticity(loop: PlasticityLoop): void {
+    this.plasticity = loop;
+    // attach 晚于 registerModel 的时序兜底：既有模型补录名册
+    for (const modelId of this.modelAgents.keys()) loop.register([modelAgentId(modelId)], Date.now());
+  }
+
+  /**
+   * τ2：挂载固化器（未挂载零介入）。挂载后每次结算事件驱动
+   * consolidator.onEvent()（内部按 interval 节奏自动固化）。
+   * 经验流绑定（bindSource → loop.eventLog）由调用方完成。
+   */
+  attachConsolidation(consolidator: { onEvent(): boolean }): void {
+    this.consolidation = consolidator;
+  }
+
+  /** 可塑性学习回路（未挂载 undefined；观测/审计用） */
+  get plasticityLoop(): PlasticityLoop | undefined {
+    return this.plasticity;
   }
 
   /**
@@ -384,16 +464,222 @@ export class SymbiosisBridge {
   }
 
   /**
+   * 61.0：挂载稳定匹配撮合（影子口径——不改变主链路任何撮合/结算）。
+   *
+   * matchContributors() 把 agent↔任务双边偏好交给延迟接受算法：产出
+   * 无阻挡对指派——「没有 agent+任务 对愿意私奔脱离系统」成为可检查
+   * 性质（isStable 带阻挡对证人，可只对越界对告警）；格极值
+   * （latticeExtremes）供挂载方显式选择「租户最优/模型最优」位置。
+   */
+  attachStableMatching(): void {
+    this.marketTheoryMounted.stableMatching = true;
+  }
+
+  /** 61.0：双边偏好撮合（未挂载返回 undefined） */
+  matchContributors(problem: StableMatchingProblem): { matching: Record<string, string>; stability: StabilityCheck } | undefined {
+    if (!this.marketTheoryMounted.stableMatching) return undefined;
+    try {
+      const result = deferredAcceptance(problem);
+      return { matching: result.matching, stability: isStable(result.matching, problem) };
+    } catch {
+      return undefined; // 偏好结构非法 → 诚实降级
+    }
+  }
+
+  /**
+   * 62.0：挂载机制设计（影子口径）。
+   *
+   * reservePriceFloor() 把卖方挂单 ask 的底价从拍脑袋费率表升级为
+   * Myerson 最优保留价（历史成交价经验分布的铁化虚拟价值——「喊价
+   * = 真话」成为占优策略）；clearCompetition() 把多买方竞争同一资产
+   * 的出清从「先到先得」升级为 VCG 外部性定价（支付 = 第二高边际估值，
+   * 收入入央行国库——预算不平衡是 DSIC 的数学代价，由国库吸收）。
+   */
+  attachMechanismDesign(): void {
+    this.marketTheoryMounted.mechanismDesign = true;
+  }
+
+  /** 62.0：Myerson 保留价（未挂载 / 样本不足 / 退化时 undefined） */
+  reservePriceFloor(samples: number[]): number | undefined {
+    if (!this.marketTheoryMounted.mechanismDesign) return undefined;
+    try {
+      const reserve = myersonReserve(empiricalGrid(samples));
+      return Number.isFinite(reserve) ? reserve : undefined; // 全负虚拟价值 → Infinity（不出售）诚实降级
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 62.0：VCG 多买方竞争出清（未挂载返回 undefined；bids[i][g] = 买方 i 对物品 g 的估值） */
+  clearCompetition(bids: number[][]): VcgOutcome | undefined {
+    if (!this.marketTheoryMounted.mechanismDesign) return undefined;
+    try {
+      return vcgAllocate({ bids });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 63.0：挂载核仁分配审计（影子口径）。
+   *
+   * royaltyAudit() 对多贡献者分账做双口径并陈：Shapley（16.0 平均公平
+   * 基准）× 核仁（最坏联盟无异议基准）——两者接近 → 分配稳健可执行；
+   * 两者分裂 → 暴露结构性异议联盟，应先谈再分（不是静默选一边）。
+   * 核空（ε₁ > 0）时 core() 诚实上报，不假装稳定存在。
+   */
+  attachNucleolusAudit(): void {
+    this.marketTheoryMounted.nucleolus = true;
+  }
+
+  /** 63.0：版税/盈余分配双口径审计（未挂载返回 undefined；玩家 ≤ 8——精确核仁务实上限） */
+  royaltyAudit(entries: Array<{ mask: number; value: number }>, players: number): {
+    core: CoreStatus;
+    shapley: ReadonlyArray<{ toString(): string }>;
+    nucleolus?: NucleolusResult;
+  } | undefined {
+    if (!this.marketTheoryMounted.nucleolus) return undefined;
+    if (players < 1 || players > 8) return undefined;
+    try {
+      const game = makeGameFromPairs(players, entries);
+      return {
+        core: gameCore(game),
+        shapley: shapleyExact(game),
+        nucleolus: nucleolus(game),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 64.0：挂载相关均衡协调（影子口径）。
+   *
+   * coordinationProfile() 把竞争性协调议题（GPU 时间片 / 热门模型配额
+   * 的「你用我停」）建模为正则型博弈，无悔动态（regret matching）学出
+   * 相关均衡分布——比 Nash 更宽的解概念 = 更强的可达成性（独立心智经
+   * 由「信号设备」达成无通讯协调）；isCorrelatedEquilibrium 给出方案
+   * 上线前的自执行审计（worstViolation > 0 = 存在单方偏离动机）。
+   */
+  attachCorrelatedEquilibrium(): void {
+    this.marketTheoryMounted.correlatedEquilibrium = true;
+  }
+
+  /** 64.0：协调议题的相关均衡画像（未挂载返回 undefined） */
+  coordinationProfile(
+    actions: number[],
+    utilities: number[][],
+    options?: { steps?: number; seed?: number },
+  ): { game: NormalGame; ce: LearnCEResult; check: CECheck } | undefined {
+    if (!this.marketTheoryMounted.correlatedEquilibrium) return undefined;
+    try {
+      const game = normalGame(actions, utilities);
+      const ce = learnCE(game, options?.steps ?? 4000, options?.seed ?? 20261001);
+      return { game, ce, check: isCorrelatedEquilibrium(ce.jointFreq, game) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 65.0：挂载动态定价（影子口径）。
+   *
+   * 费率档从静态查表升级为「从成交反馈学价格」：每次任务结算回填
+   * （有铸币 = 成交），UCB/Thompson 报价自动在闲置档降价、抢手档提价
+   * ——遗憾 √T 收敛可审计。仅学习读数，不改变任何真实铸币/结算数值。
+   */
+  attachDynamicPricing(options?: { policy?: 'ucb' | 'thompson'; unit?: number; exploration?: number; seed?: number }): void {
+    this.pricingMount = new EnergyPricingMount(options);
+  }
+
+  /** 65.0：费率学习读数（未挂载 undefined） */
+  dynamicPricingView(): { lastPrice: number | undefined; estimate: { price: number; expectedDemand: number; expectedRevenue: number } | undefined } | undefined {
+    return this.pricingMount?.view();
+  }
+
+  // ═══════════════ 四轮升级：条件结算合约（交付托管制宿主 API） ═══════════════
+
+  /**
+   * 挂载条件结算（影子口径：挂载前 openDelivery/settleDeliveries 返回
+   * undefined，不改变任何既有行为）。
+   *
+   * 挂载后知识交易多一条「托管制」通路：买方货款 + 卖方违约保证金双
+   * 托管，交付确认按质量三路结算（全额 / 按比例 / 违约罚没）——
+   * 「先付钱怕跑路、先交付怕白嫖」的信任死结由托管解开，违约以
+   * 'contract-breach' 凭证入账（可审计的经济信用记录）。
+   */
+  attachConditionalSettlement(): void {
+    this.conditionalSettlementMounted = true;
+  }
+
+  /** 开立交付合约（未挂载 / 资产不在市 → undefined；错误明细走 error 字段） */
+  openDelivery(
+    buyerId: string,
+    assetId: string,
+    opts: { price?: number; depositRate?: number; fullQualityAt?: number } = {},
+  ): { ok: boolean; error?: string; contractId?: string } | undefined {
+    if (!this.conditionalSettlementMounted) return undefined;
+    const result = this.runtime.market.openDeliveryContract(buyerId, assetId, opts);
+    return result.ok ? { ok: true, contractId: result.contractId } : { ok: false, error: result.error };
+  }
+
+  /**
+   * 批量三路结算（宿主一拍多合约）：quality ≥ fullQualityAt 全额 /
+   * (0, fullQualityAt) 按质量比例 / 缺失或 ≤0 违约（退款 + 罚没入账）。
+   */
+  settleDeliveries(results: Array<{ contractId: string; quality?: number }>): DeliverySettlementSummary | undefined {
+    if (!this.conditionalSettlementMounted) return undefined;
+    const summary: DeliverySettlementSummary = { settled: 0, full: 0, partial: 0, breach: 0, totalToSeller: 0, totalRefunded: 0, totalPenalties: 0, reports: [] };
+    for (const r of results) {
+      const report = this.runtime.market.settleDelivery(r.contractId, r.quality);
+      if (!report) continue;
+      summary.settled += 1;
+      summary[report.mode] += 1;
+      summary.totalToSeller += report.toSeller;
+      summary.totalRefunded += report.refundBuyer;
+      summary.totalPenalties += report.penaltyToBuyer;
+      summary.reports.push(report);
+    }
+    return summary;
+  }
+
+  /** 合约台账视图（未挂载 undefined） */
+  deliveryContracts(): DeliveryContractView[] | undefined {
+    return this.conditionalSettlementMounted ? this.runtime.market.deliveryContracts() : undefined;
+  }
+
+  /** 违约清单（未挂载 undefined） */
+  deliveryBreaches(): DeliveryContractView[] | undefined {
+    return this.conditionalSettlementMounted ? this.runtime.market.contractBreaches() : undefined;
+  }
+
+  /** 托管守恒审计（入 = 出 + 在途；违约凭证与台账一一对应；未挂载 undefined） */
+  deliveryAudit(): ContractAuditReport | undefined {
+    return this.conditionalSettlementMounted ? this.runtime.market.auditContracts() : undefined;
+  }
+
+  /**
    * 任务结算（宿主计划执行完成后调用）：
    * 逐节点贡献聚合（各模型 = 其成功节点质量之和）→ 央行铸币分红。
    * futarchy 启用时，部署中的策略基因视为任务成功的隐性贡献者
    * （dividendWeight 钩子评估）——进化经济的自持收入来源。
    * 未注册模型的节点不计入；失败任务不铸币但记录贡献证据（信誉惩罚）。
    */
-  settleTask(result: {
-    success: boolean;
-    nodeResults: ReadonlyArray<{ modelId: string; success: boolean; quality: number }>;
-  }): DistributionReport {
+  settleTask(
+    result: {
+      success: boolean;
+      nodeResults: ReadonlyArray<{ modelId: string; success: boolean; quality: number; tokensUsed?: number; error?: string }>;
+    },
+    opts?: { taskContext?: string },
+  ): DistributionReport {
+    // τ1 结算前预报：当前后验的混合信念（在本结局进入学习流之前采样——
+    // 校准器学「当时的预报 vs 之后的现实」，事后预报是作弊）
+    const plasticForecast = this.plasticity
+      ? (() => {
+          const arms = [...new Set(result.nodeResults.filter((n) => this.modelAgents.has(n.modelId)).map((n) => modelAgentId(n.modelId)))];
+          return arms.length > 0 ? this.plasticity!.forecast(arms, Date.now()) : undefined;
+        })()
+      : undefined;
     const weights = new Map<string, number>();
     for (const node of result.nodeResults) {
       if (!this.modelAgents.has(node.modelId)) continue;
@@ -412,12 +698,57 @@ export class SymbiosisBridge {
       result.success,
       [...weights].map(([agentId, weight]) => ({ agentId, weight })),
     );
+    // 65.0：费率学习回填（影子口径——只学价格，不改任何铸币/结算数值；
+    // 未挂载零介入）
+    this.pricingMount?.settlement(report.totalDistributed > 0);
     // D 路线：已购知识使用反馈——optimizer 购入的知识以真实任务成败参与
     // 定价校准，央行国库按使用向卖方（memory）支付版税：知识按使用付费，
     // 「沉淀知识 → 成交 → 被使用 → 持续变现」的完整认知经济闭环。
     if (this.optimizerAgentInstance) {
       for (const purchase of this.optimizerAgentInstance.purchases()) {
         this.runtime.reportAssetUsage(purchase.assetId, result.success);
+      }
+    }
+    // τ1 学习信号：结算后的结局回填（逐节点真值 + 逐臂 token 消耗——
+    // 赌徒路由的消耗画像用真值而非缺省估计；遗忘门控在 loop 内自理）。
+    // 创世纪 G1 分账：失败节点按 error 分型（auth/network/timeout/
+    // integrity 只入可用性科目，能力后验零污染——key 死了 ≠ 模型差了）
+    if (this.plasticity && plasticForecast !== undefined) {
+      const byArm = new Map<string, boolean>();
+      const armTokens = new Map<string, number>();
+      const armMode = new Map<string, FailureMode>();
+      for (const node of result.nodeResults) {
+        if (!this.modelAgents.has(node.modelId)) continue;
+        const armId = modelAgentId(node.modelId);
+        const nodeOk = (byArm.get(armId) ?? false) || node.success;
+        byArm.set(armId, nodeOk);
+        // tokensUsed 缺席 = 未上报（跳过），非零消耗——零观测会稀释均值
+        if (node.tokensUsed !== undefined) armTokens.set(armId, (armTokens.get(armId) ?? 0) + Math.max(0, node.tokensUsed));
+        if (!node.success) {
+          const mode = classifyFailure(node.error);
+          // 严重度取高：infra（auth/network/timeout/integrity）优先记名
+          const prev = armMode.get(armId);
+          if (prev === undefined || INFRA_MODES.has(mode)) armMode.set(armId, mode);
+        }
+      }
+      if (byArm.size > 0) {
+        this.plasticitySeq += 1;
+        this.plasticity.observeTask({
+          taskId: `settle-${Date.now()}-${this.plasticitySeq}`,
+          success: result.success,
+          contributors: [...byArm].map(([agentId, nodeSuccess]) => ({
+            agentId,
+            success: nodeSuccess,
+            tokens: armTokens.get(agentId),
+            failureMode: nodeSuccess ? undefined : armMode.get(agentId),
+          })),
+          forecastP: plasticForecast,
+          at: Date.now(),
+          taskContext: opts?.taskContext,
+          source: 'direct',
+        });
+        // τ2 固化节奏：结算事件驱动（未挂载零介入）
+        this.consolidation?.onEvent();
       }
     }
     return report;

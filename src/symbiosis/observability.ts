@@ -20,6 +20,15 @@
  *   行动经济：action-escrow 预扣 / action-cost 燃烧 / action-refund 退还
  *
  * 边界：只读账本（audit 拷贝），不执行任何流转；渲染纯函数无副作用。
+ *
+ * 三轮升级（能源桑基结构化导出）：buildFlowMatrix() 把链接聚合升维为
+ * 源×汇矩阵（行和 = 源流出、列和 = 汇流入，两者恒等即流量守恒的
+ * 机器可查形式）；exportSankeyData() 提供 CSV / JSONL / 矩阵三种
+ * 结构化导出（落盘即得可被电子表格/数据管道直接消费的能量流向表）。
+ *
+ * 四轮升级（渠道扩容）：条件结算合约六渠道（contract 组：托管/保证金/
+ * 结算/退回/退款/违约罚没）+ 通胀收缩销毁（monetary-contraction，归入
+ * 铸币组）——托管制交易与央行货币政策的能量流向在 Sankey 全景中可见。
  */
 
 import type { EnergyLedger } from './ledger.js';
@@ -51,10 +60,18 @@ const CHANNEL_META: Record<string, { label: string; group: ChannelGroup }> = {
   'action-escrow': { label: '行动预扣', group: 'action' },
   'action-cost': { label: '成本燃烧', group: 'action' },
   'action-refund': { label: '失败退还', group: 'action' },
+  // ── 四轮升级：条件结算合约 / 通胀治理渠道 ──
+  'contract-escrow': { label: '合约货款托管', group: 'contract' },
+  'contract-stake': { label: '合约保证金', group: 'contract' },
+  'contract-settle': { label: '合约结算付款', group: 'contract' },
+  'contract-unstake': { label: '保证金退回', group: 'contract' },
+  'contract-refund': { label: '合约退款', group: 'contract' },
+  'contract-breach': { label: '违约罚没', group: 'contract' },
+  'monetary-contraction': { label: '通胀收缩销毁', group: 'mint' },
 };
 
 /** 渠道分组（着色 + 图例） */
-export type ChannelGroup = 'distribution' | 'mint' | 'market' | 'belief' | 'action' | 'other';
+export type ChannelGroup = 'distribution' | 'mint' | 'market' | 'belief' | 'action' | 'contract' | 'other';
 
 export const CHANNEL_GROUPS: Array<{ group: ChannelGroup; label: string; color: string }> = [
   { group: 'distribution', label: '能量分发', color: '#8b5cf6' },
@@ -62,6 +79,7 @@ export const CHANNEL_GROUPS: Array<{ group: ChannelGroup; label: string; color: 
   { group: 'market', label: '知识市场', color: '#3b82f6' },
   { group: 'belief', label: '信念市场', color: '#f59e0b' },
   { group: 'action', label: '行动经济', color: '#ef4444' },
+  { group: 'contract', label: '条件结算合约', color: '#06b6d4' },
   { group: 'other', label: '其他', color: '#94a3b8' },
 ];
 
@@ -233,6 +251,107 @@ export function buildEnergySankey(
       chainIntact: ledger.verifyChain(),
     },
   };
+}
+
+// ═══════════════════════ 三轮升级：源→汇结构化导出 ═══════════════════════
+
+/** 源×汇流量矩阵（行 = 源账户，列 = 汇账户；cells[i][j] = i→j 聚合金额） */
+export interface FlowMatrix {
+  /** 行头（源账户 id，按层排序） */
+  sources: string[];
+  /** 列头（汇账户 id，按层排序） */
+  sinks: string[];
+  /** cells[i][j] = sources[i] → sinks[j] 的聚合能量（无流转为 0） */
+  cells: number[][];
+  /** 行和 = 每个源账户的窗口内总流出 */
+  rowSums: number[];
+  /** 列和 = 每个汇账户的窗口内总流入 */
+  colSums: number[];
+  /**
+   * 双口径对账：Σ行和 ≈ 节点表总流出 且 Σ列和 ≈ 节点表总流入
+   * （链接聚合与节点聚合从同一 journal 派生 → 恒成立；任何单边篡改
+   * ——改了链接不改节点、或反之——即刻破坏该恒等式）
+   */
+  conserved: boolean;
+  /** 矩阵覆盖的链接数 / 链接总数（聚合后无丢失应为 1） */
+  coverage: number;
+}
+
+/**
+ * 构建源→汇流量矩阵：Sankey 链接的升维视图。
+ *
+ * 行和 = 流出、列和 = 流入；守恒语义是**双口径对账**——链接聚合
+ * （矩阵行列和）与节点聚合（nodes.inflow/outflow）必须给出相同的
+ * 总量。两口径在 buildEnergySankey 内从同一 journal 派生时恒等；
+ * 报告被单边篡改（改链接不改节点，或反之）时即刻失配。
+ */
+export function buildFlowMatrix(report: EnergySankeyReport): FlowMatrix {
+  const layerOfId = new Map(report.nodes.map((n) => [n.id, n.layer]));
+  const layer = (id: string): number => layerOfId.get(id) ?? 2;
+  const sources = [...new Set(report.links.map((l) => l.source))].sort((a, b) => layer(a) - layer(b) || a.localeCompare(b));
+  const sinks = [...new Set(report.links.map((l) => l.target))].sort((a, b) => layer(a) - layer(b) || a.localeCompare(b));
+  const rowOf = new Map(sources.map((s, i) => [s, i]));
+  const colOf = new Map(sinks.map((s, i) => [s, i]));
+  const cells = sources.map(() => sinks.map(() => 0));
+  let covered = 0;
+  for (const link of report.links) {
+    const i = rowOf.get(link.source);
+    const j = colOf.get(link.target);
+    if (i === undefined || j === undefined) continue;
+    cells[i]![j]! += link.amount;
+    covered += 1;
+  }
+  const rowSums = cells.map((row) => row.reduce((a, b) => a + b, 0));
+  const colSums = sinks.map((_, j) => cells.reduce((a, row) => a + row[j]!, 0));
+  const totalRows = rowSums.reduce((a, b) => a + b, 0);
+  const totalCols = colSums.reduce((a, b) => a + b, 0);
+  const nodeOutflow = report.nodes.reduce((a, n) => a + n.outflow, 0);
+  const nodeInflow = report.nodes.reduce((a, n) => a + n.inflow, 0);
+  return {
+    sources,
+    sinks,
+    cells,
+    rowSums,
+    colSums,
+    conserved: Math.abs(totalRows - nodeOutflow) < 1e-6 && Math.abs(totalCols - nodeInflow) < 1e-6,
+    coverage: covered / Math.max(1, report.links.length),
+  };
+}
+
+/** 结构化导出格式 */
+export type SankeyExportFormat = 'csv' | 'jsonl' | 'matrix';
+
+const csvEscape = (s: string): string => (/[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+
+/**
+ * 能量流向结构化导出（源→汇 + 流量；落盘即可被表格/管道消费）：
+ * - csv：链接级表（source,target,channel,group,amount,count）；
+ * - jsonl：每链接一行 JSON（字段同上，类型保真）；
+ * - matrix：源×汇矩阵文本（行和/列和随行，末行流量守恒校验）。
+ */
+export function exportSankeyData(report: EnergySankeyReport, format: SankeyExportFormat): string {
+  if (format === 'csv') {
+    const head = 'source,target,channel,group,amount,count';
+    const rows = report.links.map((l) =>
+      [l.source, l.target, l.channel, l.group, l.amount.toFixed(6), String(l.count)].map(csvEscape).join(','),
+    );
+    return [head, ...rows].join('\n');
+  }
+  if (format === 'jsonl') {
+    return report.links.map((l) => JSON.stringify({ source: l.source, target: l.target, channel: l.channel, group: l.group, amount: l.amount, count: l.count })).join('\n');
+  }
+  const m = buildFlowMatrix(report);
+  const width = Math.max(...[...m.sources, ...m.sinks, 'Σ'].map((s) => s.length), 'source\\sink'.length) + 2;
+  const cellW = 12;
+  const pad = (s: string, w: number): string => s.padStart(w);
+  const lines: string[] = [];
+  lines.push(`${'source\\sink'.padEnd(width)}${m.sinks.map((s) => pad(s, cellW)).join('')}${pad('Σout', cellW)}`);
+  m.sources.forEach((src, i) => {
+    lines.push(`${src.padEnd(width)}${m.cells[i]!.map((v) => pad(v > 0 ? v.toFixed(2) : '.', cellW)).join('')}${pad(m.rowSums[i]!.toFixed(2), cellW)}`);
+  });
+  lines.push(`${'Σin'.padEnd(width)}${m.colSums.map((v) => pad(v.toFixed(2), cellW)).join('')}${pad(m.colSums.reduce((a, b) => a + b, 0).toFixed(2), cellW)}`);
+  lines.push(`# conservation: ${m.conserved ? 'OK' : 'BROKEN'} | coverage: ${(m.coverage * 100).toFixed(1)}% | links: ${report.links.length}`);
+  return lines.join('\n');
 }
 
 // ═══════════════════════ HTML 渲染（自包含离线 SVG） ═══════════════════════

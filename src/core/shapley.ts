@@ -44,6 +44,25 @@
  * 与 3-15.0 的关系：证据内核（3.0）记录「谁参与了什么」，因果内核
  * （5.0）回答「干预效应几何」，本内核回答「合作剩余如何公平分割」——
  * 参与 → 效应 → 分配，三层递进构成完整的多智能体问责链。
+ *
+ * ── R5-A13 世界性进化（第五轮）──
+ *
+ * 6. **加权 Shapley（Kalai–Samet 1977 非对称权）**：经典 Shapley 对全部
+ *    n! 个排列一视同仁——但真实协作里「优先级/股权/采样权重」本就非对称。
+ *    加权 Shapley 给排列赋予概率 p(π) = Π_t λ_{π_t}/Λ_t（Λ_t = 剩余玩家
+ *    权重和），φ^w_i = Σ_π p(π)·边际_i(π)。实现为**部分排列 DFS**：每个
+ *    DFS 节点恰结算一个玩家的边际（概率 × 边际贡献），无需走到叶子重算
+ *    前缀——节点数 ≈ e·n!，比「全排列逐个走前缀」的 n!·n 次估值省一个
+ *    因子。公理保持：效率（Σφ^w = V(N)）、虚拟（零边际者恰得 0）、
+ *    可加；等权时 p(π) = 1/n! 精确退化为经典 Shapley。
+ *
+ * 7. **分层排列采样（按首玩家分层 + 层内方差估计）**：均匀随机排列的
+ *    首玩家均匀分布——按「排列首玩家」把排列空间切成 n 个等权层，层内
+ *    均匀采样，估计量 φ̂_i = (1/n)Σ_s μ̂_{s,i} 仍无偏；方差分解定理
+ *    σ² = Σ_s w_s σ_s² + Σ_s w_s(μ_s−μ)² 保证分层方差 ≤ 单层池化方差
+ *    （层间差被整段消除）。逐（层×玩家）喂 EmpiricalBernstein 置信序列
+ *    （水平 α/n，Bonferroni 并集界），求和区间仍是任意时刻有效——
+ *    偷看安全口径不降级；报告逐玩家方差缩减比（对照口径）。
  */
 
 import { EmpiricalBernsteinSequence, round } from './anytime-evidence.js';
@@ -130,6 +149,41 @@ export interface ShapleyReport {
   efficiencyResidual: number;
   /** 提前停止原因 */
   stopReason: 'exact' | 'budget' | 'ranking-decided';
+  interpretation: string;
+}
+
+/** 加权 Shapley 报告（R5-A13：Kalai–Samet 非对称权） */
+export interface WeightedShapleyReport {
+  players: number;
+  totalValue: number;
+  /** 非对称权重（与入参对齐；全部等权时精确退化为经典 Shapley） */
+  weights: number[];
+  attributions: ShapleyAttribution[];
+  /** 效率公理残差 Σφ^w − V(N) */
+  efficiencyResidual: number;
+  /** 部分排列 DFS 结算的节点数（≈ e·n!；每节点恰结算一个玩家的边际） */
+  enumeratedNodes: number;
+  interpretation: string;
+}
+
+/** 分层排列采样报告（R5-A13：按首玩家分层 + 层内方差估计） */
+export interface StratifiedShapleyReport {
+  players: number;
+  totalValue: number;
+  /** 估计量中心与任意时刻有效置信区间（Bonferroni 并集界求和区间） */
+  attributions: ShapleyAttribution[];
+  /** 总排列数（均分到 n 层） */
+  permutations: number;
+  /** 层数 = 玩家数（按排列首玩家分层） */
+  strata: number;
+  /** 每层排列数（均分） */
+  perStratum: number;
+  /** 逐玩家（与 players 同序）分层估计量方差 Σ_s w²σ²_s/m_s */
+  stratifiedVariances: number[];
+  /** 逐玩家单流池化方差 σ̂²_pool/M（对照口径） */
+  pooledVariances: number[];
+  /** 逐玩家方差缩减比 分层/池化（< 1 = 分层更优；方差分解定理担保方向） */
+  varianceRatios: number[];
   interpretation: string;
 }
 
@@ -369,6 +423,252 @@ export class ShapleyAttributionEngine {
     return true;
   }
 
+  // ─────────────────────────── R5-A13：加权 Shapley ───────────────────────────
+
+  /** 加权 Shapley 精确枚举的玩家数上限（部分排列节点数 ≈ e·n!；9 → ~98.6 万节点） */
+  static readonly MAX_WEIGHTED_PLAYERS = 9;
+
+  /**
+   * 加权 Shapley（Kalai–Samet 1977）：排列概率 p(π) = Π_t λ_{π_t}/Λ_t
+   * （Λ_t = 剩余玩家权重和），φ^w_i = Σ_π p(π)·边际_i(π)。
+   *
+   * 实现为部分排列 DFS：扩展到「前缀 P + 玩家 i」节点时立即以节点概率
+   * 结算 i 的边际贡献 V(P∪{i}) − V(P)——所有含该前缀的排列被一次性
+   * 团结算（概率 telescoping），无需走到叶子。等权 ⟹ p(π) = 1/n!
+   * 精确退化为经典 Shapley；零边际玩家（dummy）在任意权下仍恰得 0。
+   *
+   * weights 与 players 等长、每个权重必须为有限正数（零/负权会毁灭
+   * 排列概率的良定义——显式拒绝而非静默钳制）。
+   */
+  weightedShapley(players: readonly string[], weights: ReadonlyArray<number>): WeightedShapleyReport {
+    const unique = [...new Set(players)];
+    if (unique.length === 0) {
+      throw new Error('weightedShapley: 玩家列表不能为空');
+    }
+    if (weights.length !== unique.length) {
+      throw new Error(`weightedShapley: weights 长度 ${weights.length} 必须等于玩家数 ${unique.length}`);
+    }
+    for (let i = 0; i < weights.length; i += 1) {
+      const w = weights[i];
+      if (!Number.isFinite(w) || w <= 0) {
+        throw new Error(`weightedShapley: 权重必须是有限正数（第 ${i} 个 = ${w}）`);
+      }
+    }
+    const n = unique.length;
+    if (n > ShapleyAttributionEngine.MAX_WEIGHTED_PLAYERS) {
+      throw new Error(
+        `weightedShapley: 精确加权枚举上限 ${ShapleyAttributionEngine.MAX_WEIGHTED_PLAYERS} 玩家（收到 ${n}——节点数 ≈ e·n! 指数增长；更大场景请用排列采样口径）`,
+      );
+    }
+
+    const totalValue = this.coalition(unique);
+    const tolerance = this.config.tolerance;
+    const phi = new Float64Array(n);
+    let enumeratedNodes = 0;
+
+    // 部分排列 DFS：state = 已选前缀（下标序），nodeProb = 该前缀的概率质量
+    const chosen = new Array<boolean>(n).fill(false);
+    const prefix: string[] = [];
+    const dfs = (nodeProb: number, remainingWeight: number, depth: number): void => {
+      enumeratedNodes += 1;
+      if (depth === n) return;
+      for (let i = 0; i < n; i += 1) {
+        if (chosen[i]) continue;
+        const childProb = (nodeProb * weights[i]) / remainingWeight;
+        chosen[i] = true;
+        prefix.push(unique[i]);
+        const withI = this.coalition(prefix);
+        const withoutI = depth === 0 ? this.coalition([]) : this.coalition(prefix.slice(0, -1));
+        phi[i] += childProb * (withI - withoutI);
+        dfs(childProb, remainingWeight - weights[i], depth + 1);
+        prefix.pop();
+        chosen[i] = false;
+      }
+    };
+    dfs(1, weights.reduce((a, b) => a + b, 0), 0);
+
+    // Banzhaf 关键性与 dummy 判定复用 2ⁿ 位掩码枚举（与精确口径一致）
+    const size = 1 << n;
+    const swings = new Int32Array(n);
+    const values = new Float64Array(size);
+    for (let mask = 0; mask < size; mask += 1) {
+      const coalition: string[] = [];
+      for (let i = 0; i < n; i += 1) if (mask & (1 << i)) coalition.push(unique[i]);
+      values[mask] = this.coalition(coalition);
+    }
+    for (let i = 0; i < n; i += 1) {
+      const bit = 1 << i;
+      for (let s = 0; s < size; s += 1) {
+        if (s & bit) continue;
+        if (values[s | bit] - values[s] > tolerance) swings[i] += 1;
+      }
+    }
+
+    let sumPhi = 0;
+    for (let i = 0; i < n; i += 1) sumPhi += phi[i];
+    const order = [...unique.keys()].sort((a, b) => phi[b] - phi[a]);
+    const attributions: ShapleyAttribution[] = order.map((index, rank) => ({
+      playerId: unique[index],
+      shapley: round(phi[index]),
+      lower: round(phi[index]),
+      upper: round(phi[index]),
+      share: totalValue > tolerance ? round(Math.max(0, phi[index] / totalValue)) : 0,
+      rank: rank + 1,
+      exact: true,
+      samples: factorialsOf(n), // 排列覆盖数 n!（每个排列对每个玩家各出一份边际）
+      criticality: round(swings[index] / (size / 2)),
+      isDummy: Math.abs(phi[index]) <= tolerance,
+      provablyPositive: phi[index] > tolerance,
+    }));
+    normalizeShares(attributions, totalValue, tolerance);
+
+    const maxWeight = Math.max(...weights);
+    const maxIndex = weights.indexOf(maxWeight);
+    return {
+      players: n,
+      totalValue: round(totalValue),
+      weights: [...weights],
+      attributions,
+      efficiencyResidual: round(sumPhi - totalValue),
+      enumeratedNodes,
+      interpretation: `加权 Shapley（Kalai–Samet，权向 λ=${weights.map((w) => w.toFixed(2)).join(':')}，${enumeratedNodes} 个部分排列节点）：第 1 名 ${attributions[0].playerId}（φ^w=${attributions[0].shapley.toFixed(3)}）；最高权玩家 ${unique[maxIndex]}（λ=${maxWeight.toFixed(2)}，份额 ${((attributions.find((a) => a.playerId === unique[maxIndex])?.share ?? 0) * 100).toFixed(1)}%）`,
+    };
+  }
+
+  // ─────────────────────────── R5-A13：分层排列采样 ───────────────────────────
+
+  /**
+   * 分层排列采样：按「排列首玩家」把排列空间切成 n 个等权层（均匀随机
+   * 排列的首玩家均匀分布），层内均匀采样，φ̂_i = (1/n)Σ_s μ̂_{s,i} 无偏。
+   *
+   * 方差分解定理：σ² = Σ_s w_sσ_s² + Σ_s w_s(μ_s−μ)² —— 分层估计量只吃
+   * 「层内」项，层间差被整段消除（报告 varianceRatios 对照）。
+   * 置信区间：逐（层×玩家）EmpiricalBernstein 序列（水平 α/n），求和区间
+   * 由 Bonferroni 并集界背书——任意时刻有效（偷看安全）不降级。
+   */
+  attributeStratified(players: readonly string[]): StratifiedShapleyReport {
+    const unique = [...new Set(players)];
+    if (unique.length === 0) {
+      throw new Error('attributeStratified: 玩家列表不能为空');
+    }
+    const n = unique.length;
+    if (n < 2 || n <= this.config.exactThreshold) {
+      // 小博弈不值得采样口径：诚实拒绝（精确口径已覆盖）
+      throw new Error(
+        `attributeStratified: 分层采样面向 n > exactThreshold 的大博弈（收到 n=${n}，阈值 ${this.config.exactThreshold}——请走 attribute 精确路径）`,
+      );
+    }
+    const totalValue = this.coalition(unique);
+    const tolerance = this.config.tolerance;
+    const perStratum = Math.max(1, Math.floor(this.config.maxPermutations / n));
+    const permutations = perStratum * n;
+    const stratumAlpha = this.config.alpha / n; // Bonferroni：n 层并集界
+
+    // streams.get(stratum)!.get(player)!：层 × 玩家 置信序列；pooled：玩家单流对照
+    const streams = new Map<number, Map<string, EmpiricalBernsteinSequence>>();
+    const pooled = new Map<string, EmpiricalBernsteinSequence>();
+    const criticalCount = new Map<string, number>();
+    for (const s of unique) {
+      streams.set(
+        unique.indexOf(s),
+        new Map(unique.map((p) => [p, new EmpiricalBernsteinSequence(stratumAlpha)])),
+      );
+      pooled.set(s, new EmpiricalBernsteinSequence(this.config.alpha));
+      criticalCount.set(s, 0);
+    }
+
+    const working: string[] = [];
+    for (let stratum = 0; stratum < n; stratum += 1) {
+      // 层 stratum：首玩家固定 unique[stratum]，其余 Fisher–Yates 均匀洗牌
+      for (let rep = 0; rep < perStratum; rep += 1) {
+        working.length = 0;
+        for (let i = 0; i < n; i += 1) if (i !== stratum) working.push(unique[i]);
+        for (let i = working.length - 1; i > 0; i -= 1) {
+          const j = Math.floor(this.rng() * (i + 1));
+          [working[i], working[j]] = [working[j], working[i]];
+        }
+        const prefix: string[] = [unique[stratum]];
+        let prefixValue = this.coalition(prefix);
+        const observe = (player: string, marginal: number): void => {
+          const scaled = (marginal + 1) / 2; // [−1,1] → [0,1]
+          streams.get(stratum)!.get(player)!.observe(scaled);
+          pooled.get(player)!.observe(scaled);
+          if (marginal > tolerance) criticalCount.set(player, criticalCount.get(player)! + 1);
+        };
+        observe(unique[stratum], prefixValue - this.coalition([]));
+        for (const player of working) {
+          prefix.push(player);
+          const newPrefixValue = this.coalition(prefix);
+          observe(player, newPrefixValue - prefixValue);
+          prefixValue = newPrefixValue;
+        }
+      }
+    }
+
+    // 分层合成：中心 = (1/n)Σ_s μ_s；区间 = (1/n)Σ_s [lower_s, upper_s]（并集界）
+    const stratifiedVariances: number[] = [];
+    const pooledVariances: number[] = [];
+    const varianceRatios: number[] = [];
+    const estimates = unique.map((p, i) => {
+      let meanScaled = 0;
+      let lowerScaled = 0;
+      let upperScaled = 0;
+      let stratVar = 0;
+      for (let s = 0; s < n; s += 1) {
+        const b = streams.get(s)!.get(p)!.bounds();
+        meanScaled += b.mean / n;
+        lowerScaled += b.lower / n;
+        upperScaled += b.upper / n;
+        stratVar += streams.get(s)!.get(p)!.sampleVariance / (n * n * perStratum);
+      }
+      const pb = pooled.get(p)!.bounds();
+      const pooledVar = pooled.get(p)!.sampleVariance / permutations;
+      stratifiedVariances.push(stratVar);
+      pooledVariances.push(pooledVar);
+      varianceRatios.push(pooledVar > 0 ? stratVar / pooledVar : stratVar === 0 ? 0 : Number.POSITIVE_INFINITY);
+      return {
+        playerId: p,
+        index: i,
+        shapley: round(2 * meanScaled - 1),
+        lower: round(Math.max(-1, 2 * lowerScaled - 1)),
+        upper: round(Math.min(1, 2 * upperScaled - 1)),
+        samples: permutations,
+      };
+    });
+    estimates.sort((a, b) => b.shapley - a.shapley);
+
+    const sumPhi = estimates.reduce((a, e) => a + e.shapley, 0);
+    const attributions: ShapleyAttribution[] = estimates.map((e, rank) => ({
+      playerId: e.playerId,
+      shapley: e.shapley,
+      lower: e.lower,
+      upper: e.upper,
+      share: totalValue > tolerance && sumPhi > tolerance ? round(Math.max(0, e.shapley / sumPhi)) : 0,
+      rank: rank + 1,
+      exact: false,
+      samples: e.samples,
+      criticality: round(criticalCount.get(e.playerId)! / permutations),
+      isDummy: e.upper <= tolerance,
+      provablyPositive: e.lower > tolerance,
+    }));
+    normalizeShares(attributions, totalValue, tolerance);
+
+    const avgRatio = varianceRatios.reduce((a, r) => a + (Number.isFinite(r) ? r : 1), 0) / n;
+    const top = attributions[0];
+    return {
+      players: n,
+      totalValue: round(totalValue),
+      attributions,
+      permutations,
+      strata: n,
+      perStratum,
+      stratifiedVariances,
+      pooledVariances,
+      varianceRatios,
+      interpretation: `分层排列采样（${n} 层 × ${perStratum} 排列 = ${permutations}）：平均方差缩减比 ${avgRatio.toFixed(3)}（< 1 = 层间差被消除）；第 1 名 ${top.playerId}（φ̂=${top.shapley.toFixed(3)}，任意时刻有效 CI [${top.lower.toFixed(3)}, ${top.upper.toFixed(3)}]）`,
+    };
+  }
+
   // ─────────────────────────── 协同检测 ───────────────────────────
 
   /**
@@ -421,6 +721,12 @@ function precomputedFactorials(n: number): number[] {
   const f = [1];
   for (let i = 1; i <= n; i += 1) f.push(f[i - 1] * i);
   return f;
+}
+
+/** n!（整数口径；加权 Shapley 的排列覆盖数） */
+function factorialsOf(n: number): number {
+  const f = precomputedFactorials(n);
+  return f[n];
 }
 
 /** 位计数（popcount） */

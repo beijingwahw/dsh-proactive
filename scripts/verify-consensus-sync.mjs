@@ -27,6 +27,17 @@ const ok = (cond, msg) => {
   if (cond) { passed += 1; console.log(`  ✓ ${msg}`); }
   else { failed += 1; console.error(`  ✗ ${msg}`); }
 };
+// R5-A19 稳健性加固：固定 setTimeout 等待在负载下偶发不足（选主/追平
+// 是真实 RPC 时序），改为「条件满足即返回 + 宽松截止」的自适应等待——
+// 断言不变，只消除时间敏感性（快机更快、慢机不闪失）。
+const waitFor = async (pred, deadlineMs, stepMs = 100) => {
+  const t0 = Date.now();
+  while (Date.now() - t0 < deadlineMs) {
+    if (pred()) return true;
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+  return pred();
+};
 
 // ═══ A raft：三节点真实 RPC 集群 ═══
 console.log('A raft 三节点集群（二分查找 + 冲突提示 + 重启恢复）');
@@ -44,7 +55,7 @@ console.log('A raft 三节点集群（二分查找 + 冲突提示 + 重启恢复
   });
   const engines = [mk(0), mk(1), mk(2)];
   for (const e of engines) e.start();
-  await new Promise((r) => setTimeout(r, 1500));
+  await waitFor(() => engines.some((e) => e.getRole() === 'leader'), 8000);
 
   const leader = engines.find((e) => e.getRole() === 'leader');
   ok(!!leader, `选举出 leader（priority 加权 → ${leader?.getClusterStatus().localNodeId}）`);
@@ -59,7 +70,11 @@ console.log('A raft 三节点集群（二分查找 + 冲突提示 + 重启恢复
     if (r.committed) committed += 1;
   }
   ok(committed === 3, `3 笔提案全部多数派提交（${committed}/3）`);
-  await new Promise((r) => setTimeout(r, 400));
+  await waitFor(() => {
+    const lens = engines.map((e) => e.getClusterStatus().logLength);
+    const cis = engines.map((e) => e.getClusterStatus().commitIndex);
+    return new Set(lens).size === 1 && lens[0] >= 3 && cis.every((c) => c >= 3);
+  }, 5000);
 
   const lens = engines.map((e) => e.getClusterStatus().logLength);
   ok(new Set(lens).size === 1 && lens[0] >= 3, `三节点日志一致（logLength = ${lens.join('/')}）`);
@@ -71,7 +86,7 @@ console.log('A raft 三节点集群（二分查找 + 冲突提示 + 重启恢复
   for (let i = 4; i <= 6; i += 1) await leader.propose(cmd(`sig-${i}`), 5000);
   const n2b = mk(2); // 同 logPath 重建：验证 loadPersistentState + 复制追平
   n2b.start();
-  await new Promise((r) => setTimeout(r, 1500));
+  await waitFor(() => n2b.getClusterStatus().logLength >= 6, 8000);
   const n2Len = n2b.getClusterStatus().logLength;
   ok(n2Len >= 6, `滞后 follower 重启后追平（logLength ${n2Len} ≥ 6，持久化 + 复制链路完好）`);
 

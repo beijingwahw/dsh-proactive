@@ -42,6 +42,30 @@
  * 与 6.0 的关系：free-energy 提供单动作 EFE 定理，本内核把它沿
  * 时间维展开——从「选最好的一步」到「选最好的余生」。
  * 深思心智 = 自由能心智 × 时间。
+ *
+ * ── R5 第五轮世界性进化（四轴）──
+ *
+ * A1【数学进化】辩论的贝叶斯说服模型（simulateDebate）：正方/反方各持
+ *    Beta 证据池，轮替发言；论据强度 = 一次 Bernoulli 观测的期望信息
+ *    增益 EIG(α,β) = H(α,β) − [p·H(α+1,β) + (1−p)·H(α,β+1)]（与想象
+ *    推演的认知价值同一公式——「证据的边际说服力」与「想象的信息价
+ *    值」在本内核首次同构）。听众信念按对数优势闭式更新：
+ *        L_R = L₀ + w·(Σ_pro s_k − Σ_con s_k)，B_R = σ(L_R)
+ *    任意前缀的听众信念都是前缀和的一次 σ——闭式可复算；发言后证据
+ *    池按自身均值吸收伪计数 → 强度 ~ O(1/n) 调和衰减 → 辩论自然收敛
+ *    （重复发言的边际说服力递减的数学化）。
+ *
+ * A2【性能进化】辩论轮次的提前收敛（clinch）检测：当 |L_r| 已超过
+ *    「剩余全部轮次按当前强度上界累计也无法翻转」的保守包络
+ *        UB(r) = w·(R−r)·max(s_pro(r), s_con(r))
+ *    （强度包络单调不增——epistemicMonotone 标记可审计）时提前停机。
+ *    停机时返回的 verdict 与全程跑满 R 轮**严格相同**（胜负已定才停），
+ *    且投影闭式区间 [L_r−UB, L_r+UB] 双侧同号——等价性由构造保证，
+ *    verify-r5 脚本以 ≥200 种子对照 exact 全程重放逐位验证。
+ *
+ * A3【数值稳健】imagine 新增 logPAllSuccess = Σ ln p_t（对数域累加）：
+ *    长计划下 pAllSuccess 连乘下溢为 0 时，对数域读数仍保持满精度
+ *    （轨迹排序/审计可继续使用）；既有字段与数值逐位不变（纯增量）。
  */
 
 import { betaEntropy, FreeEnergyEngine } from './free-energy.js';
@@ -107,6 +131,12 @@ export interface ImaginationReport {
   undiscountedEfe: number;
   /** 全程成功概率 = Π p_t */
   pAllSuccess: number;
+  /**
+   * R5：全程成功概率的对数域读数 = Σ ln p_t（数值稳健轴）。
+   * 长计划下 pAllSuccess 连乘下溢为 0 时，本字段仍保持满精度；
+   * 与 pAllSuccess 满足 exp(logPAllSuccess) ≈ pAllSuccess（非下溢区）。
+   */
+  logPAllSuccess: number;
   steps: StepEvaluation[];
   /** 首败风险分布：恰好在第 step 步首次失败的概率 */
   riskProfile: Array<{ step: number; pFailAt: number }>;
@@ -375,6 +405,7 @@ export class DeliberationEngine {
     let totalEfe = 0;
     let undiscounted = 0;
     let pAll = 1;
+    let logPAll = 0;
 
     for (let t = 0; t < actions.length; t += 1) {
       const action = actions[t]!;
@@ -411,6 +442,7 @@ export class DeliberationEngine {
       totalEfe += discounted;
       undiscounted += efe;
       pAll *= p;
+      logPAll += Math.log(p); // R5：对数域累加（A3 数值稳健轴）
       states.push(post.successor);
       imaginedUses.set(key, k + 1);
       state = post.successor;
@@ -429,6 +461,7 @@ export class DeliberationEngine {
       totalEfe: round(totalEfe),
       undiscountedEfe: round(undiscounted),
       pAllSuccess: round(pAll),
+      logPAllSuccess: round(logPAll),
       steps,
       riskProfile,
       epistemicMonotone: checkEpistemicMonotone(steps),
@@ -943,6 +976,8 @@ export class DeliberationEngine {
       totalEfe: node.totalEfe,
       undiscountedEfe: round(node.steps.reduce((s, x) => s + x.efe, 0)),
       pAllSuccess: node.pSuccess,
+      // R5：对数域读数由步分解重加和（与 imagine 的累加路径在舍入内一致）
+      logPAllSuccess: round(node.steps.reduce((s, x) => s + Math.log(x.pStep), 0)),
       steps: node.steps,
       riskProfile: node.steps.map((s) => ({ step: s.step, pFailAt: round(before(s.step) * (1 - s.pStep)) })),
       epistemicMonotone: checkEpistemicMonotone(node.steps),
@@ -966,6 +1001,232 @@ function checkEpistemicMonotone(steps: StepEvaluation[]): boolean {
     lastEpistemic.set(key, s.epistemic);
   }
   return true;
+}
+
+// ─────────────────────────── R5：辩论的贝叶斯说服模型 ───────────────────────────
+
+/** 一方证据池（Beta 口径的成败计数） */
+export interface DebateEvidencePool {
+  successes: number;
+  failures: number;
+}
+
+/** 辩论配置 */
+export interface DebateConfig {
+  /** 最大轮次 R（一场辩论的回合上限，缺省 20） */
+  rounds: number;
+  /** 听众初始信念 ∈ (0,1)（缺省 0.5 无偏向） */
+  initialBelief: number;
+  /** 听众可说服度 w > 0（每 nat 论据强度折算的对数优势位移，缺省 1） */
+  persuasibility: number;
+  /** 提前收敛（clinch）检测开关（缺省 true；false = 全程跑满对照口径） */
+  earlyStop: boolean;
+}
+
+export const DEFAULT_DEBATE_CONFIG: DebateConfig = {
+  rounds: 20,
+  initialBelief: 0.5,
+  persuasibility: 1,
+  earlyStop: true,
+};
+
+/** 单轮发言审计 */
+export interface DebateRoundTrace {
+  /** 轮次（1 起） */
+  round: number;
+  side: 'pro' | 'con';
+  /** 论据强度（nat：一次 Bernoulli 观测的期望信息增益） */
+  strength: number;
+  /** 发言后听众对数优势 L_r */
+  logOdds: number;
+  /** 发言后听众信念 B_r = σ(L_r) */
+  belief: number;
+  /** 本轮信念位移 |B_r − B_{r−1}|（收敛审计） */
+  marginalChange: number;
+}
+
+/** 辩论推演结果 */
+export interface DebateResult {
+  /** 实际推演轮次（提前停机 < rounds） */
+  roundsUsed: number;
+  /** 是否提前停机（clinch 触发） */
+  stoppedEarly: boolean;
+  /** clinch 触发轮（未触发 undefined） */
+  clinchRound: number | undefined;
+  /** 停机时剩余轮次的保守强度包络 UB = w·(R−r)·max(当前双方强度) */
+  clinchBound: number;
+  /** 最终听众信念（提前停机时 = 停机轮信念；胜负已定） */
+  finalBelief: number;
+  /** 最终听众对数优势 */
+  finalLogOdds: number;
+  /** 判决：'pro' ⟺ L > 0（clinch 停机与全程跑满严格一致） */
+  verdict: 'pro' | 'con';
+  /** 正方累计论据强度（nat） */
+  totalProStrength: number;
+  /** 反方累计论据强度（nat） */
+  totalConStrength: number;
+  /** 强度包络是否单调不增（clinch 界的数学前提，可审计） */
+  strengthEnvelopeMonotone: boolean;
+  /** 全程轮迹 */
+  trace: DebateRoundTrace[];
+}
+
+/**
+ * 一次 Bernoulli 观测的期望信息增益（论据强度的数学定义）：
+ *   EIG(α,β) = H(α,β) − [p·H(α+1,β) + (1−p)·H(α,β+1)]，p = α/(α+β)
+ * 与 imagine() 的认知价值同一公式——证据的边际说服力即其信息价值。
+ */
+function argumentStrength(alpha: number, beta: number): number {
+  const n = alpha + beta;
+  if (n <= 0) return 0;
+  const p = alpha / n;
+  const h0 = betaEntropy(alpha, beta);
+  const hYes = betaEntropy(alpha + 1, beta);
+  const hNo = betaEntropy(alpha, beta + 1);
+  return Math.max(0, h0 - (p * hYes + (1 - p) * hNo));
+}
+
+function logistic(x: number): number {
+  return 1 / (1 + Math.exp(-x));
+}
+
+/**
+ * R5·A1 贝叶斯说服辩论（听众信念更新的闭式模型）。
+ *
+ * 动力学（全部确定性、纯数学）：
+ * - 正方先发言，双方轮替；第 k 次发言的论据强度 = 该方证据池的
+ *   EIG(α,β)（证据越多边际说服力越低——O(1/n) 调和衰减）。
+ * - 发言后证据池按自身均值吸收一个伪计数（α += p, β += 1−p，与想象
+ *   证据折算同一口径）→ 强度包络单调不增。
+ * - 听众对数优势闭式更新：L_r = L₀ + w·(Σ_pro s − Σ_con s)；
+ *   任意前缀信念 B_r = σ(L_r) —— 一次前缀和 + 一次 σ，可独立复算。
+ *
+ * R5·A2 提前收敛（clinch）：|L_r| > w·(R−r)·max(s_pro, s_con) 时胜负
+ * 已定（剩余轮次即使全部由落后方按当前强度上界发言也无法翻转对数优势
+ * 的符号），提前停机；verdict 与跑满全程严格相同（等价性由单调包络
+ * 构造保证，verify 脚本以 exact 对照逐种子验证）。
+ */
+export function simulateDebate(
+  proEvidence: DebateEvidencePool,
+  conEvidence: DebateEvidencePool,
+  config?: Partial<DebateConfig>,
+): DebateResult {
+  const cfg = { ...DEFAULT_DEBATE_CONFIG, ...config };
+  if (!Number.isFinite(cfg.rounds) || cfg.rounds < 1 || !Number.isInteger(cfg.rounds)) {
+    throw new Error(`simulateDebate: rounds 须为 ≥1 的整数（收到 ${cfg.rounds}）`);
+  }
+  if (!Number.isFinite(cfg.initialBelief) || cfg.initialBelief <= 0 || cfg.initialBelief >= 1) {
+    throw new Error(`simulateDebate: initialBelief 须落在开区间 (0,1)（收到 ${cfg.initialBelief}）`);
+  }
+  if (!Number.isFinite(cfg.persuasibility) || cfg.persuasibility <= 0) {
+    throw new Error(`simulateDebate: persuasibility 须为 > 0 的有限数（收到 ${cfg.persuasibility}）`);
+  }
+  for (const [name, pool] of [
+    ['proEvidence', proEvidence],
+    ['conEvidence', conEvidence],
+  ] as const) {
+    if (!pool || typeof pool !== 'object') throw new Error(`simulateDebate: ${name} 需为 { successes, failures } 对象`);
+    if (!Number.isFinite(pool.successes) || pool.successes < 0) {
+      throw new Error(`simulateDebate: ${name}.successes 须为 ≥0 有限数（收到 ${pool.successes}）`);
+    }
+    if (!Number.isFinite(pool.failures) || pool.failures < 0) {
+      throw new Error(`simulateDebate: ${name}.failures 须为 ≥0 有限数（收到 ${pool.failures}）`);
+    }
+  }
+
+  const w = cfg.persuasibility;
+  // 证据池 = Beta(1+s, 1+f)（与转移模型同口径的均匀先验）
+  let proAlpha = 1 + proEvidence.successes;
+  let proBeta = 1 + proEvidence.failures;
+  let conAlpha = 1 + conEvidence.successes;
+  let conBeta = 1 + conEvidence.failures;
+
+  const L0 = Math.log(cfg.initialBelief / (1 - cfg.initialBelief));
+  let L = L0;
+  let prevBelief = cfg.initialBelief;
+  let totalPro = 0;
+  let totalCon = 0;
+  let lastProStrength = argumentStrength(proAlpha, proBeta);
+  let lastConStrength = argumentStrength(conAlpha, conBeta);
+  const trace: DebateRoundTrace[] = [];
+  const proStrengths: number[] = [lastProStrength];
+  const conStrengths: number[] = [lastConStrength];
+  let stoppedEarly = false;
+  let clinchRound: number | undefined;
+  let clinchBound = 0;
+  let roundsUsed = 0;
+
+  for (let r = 1; r <= cfg.rounds; r += 1) {
+    const side: 'pro' | 'con' = r % 2 === 1 ? 'pro' : 'con';
+    let strength: number;
+    if (side === 'pro') {
+      strength = lastProStrength;
+    } else {
+      strength = lastConStrength;
+    }
+    L += side === 'pro' ? w * strength : -w * strength;
+    if (side === 'pro') totalPro += strength;
+    else totalCon += strength;
+    // 证据池按自身均值吸收伪计数（强度包络单调衰减的来源）
+    if (side === 'pro') {
+      const p = proAlpha / (proAlpha + proBeta);
+      proAlpha += p;
+      proBeta += 1 - p;
+      lastProStrength = argumentStrength(proAlpha, proBeta);
+      proStrengths.push(lastProStrength);
+    } else {
+      const p = conAlpha / (conAlpha + conBeta);
+      conAlpha += p;
+      conBeta += 1 - p;
+      lastConStrength = argumentStrength(conAlpha, conBeta);
+      conStrengths.push(lastConStrength);
+    }
+    const belief = logistic(L);
+    trace.push({
+      round: r,
+      side,
+      strength: round(strength),
+      logOdds: round(L),
+      belief: round(belief),
+      marginalChange: round(Math.abs(belief - prevBelief)),
+    });
+    prevBelief = belief;
+    roundsUsed = r;
+
+    // clinch：|L| 超过剩余轮次按当前强度上界的累计 → 胜负已定
+    const remaining = cfg.rounds - r;
+    if (cfg.earlyStop && remaining > 0) {
+      const bound = w * remaining * Math.max(lastProStrength, lastConStrength);
+      if (Math.abs(L) > bound) {
+        stoppedEarly = true;
+        clinchRound = r;
+        clinchBound = round(bound);
+        break;
+      }
+    }
+  }
+
+  // 强度包络单调性（clinch 界的数学前提；两方独立校验）
+  const monotone = (arr: number[]): boolean => {
+    for (let i = 1; i < arr.length; i += 1) {
+      if (arr[i]! > arr[i - 1]! + 1e-12) return false;
+    }
+    return true;
+  };
+
+  return {
+    roundsUsed,
+    stoppedEarly,
+    clinchRound,
+    clinchBound,
+    finalBelief: round(prevBelief),
+    finalLogOdds: round(L),
+    verdict: L > 0 ? 'pro' : 'con',
+    totalProStrength: round(totalPro),
+    totalConStrength: round(totalCon),
+    strengthEnvelopeMonotone: monotone(proStrengths) && monotone(conStrengths),
+    trace,
+  };
 }
 
 function round(x: number): number {

@@ -21,20 +21,43 @@
  * 5. 监管桥接：宿主 SafetyGovernor.checkGate()（kill-switch/熔断）
  *    对行动类提案有一票否决权——能量经济与安全治理在批准层统一。
  *
+ * 四轮升级（通胀治理执行面）：配置 monetaryPolicy 后，任务结算的央行
+ * 铸币受流通量目标带约束——超发 → 铸币税率随带外偏离自动上调（分红
+ * 缩水）+ 央行从国库收缩销毁；通缩 → 税率归零、分红加成；带内不动。
+ * 心跳报告附带 monetary 读数，monetaryTrend() 给出流通量趋势
+ * （contracting / expanding / 带内回归 / 穿带计数）。缺省零漂移。
+ *
  * Phase 1 影子定位：本运行时独立心跳、不接管既有 autonomy-loop
  * 主链路，可并行观察能量流向后再决定融合深度（不破坏现有功能）。
  */
 
-import { isTradeListener, type AgentProposal, type ExecutionGrant, type ManagedAgent, type MarketSnapshot, type ProposalKind } from './agent.js';
+import { hasTrustView, isTradeListener, type AgentProposal, type ExecutionGrant, type ManagedAgent, type MarketSnapshot, type ProposalKind } from './agent.js';
 import { BeliefMarket } from './belief.js';
 import { CognitiveMarket } from './market.js';
-import { EnergyLedger, ESCROW, TREASURY } from './ledger.js';
+import { EnergyLedger, ESCROW, TREASURY, MonetaryGovernor, type MonetaryAssessment, type MonetaryPolicyConfig, type MonetaryZone } from './ledger.js';
 import { shapleyValues, type CausalKernel, type ContributorProb } from '../core/causal-kernel.js';
 import { FreeEnergyEngine, type EFEAction, type EFEEvaluation } from '../core/free-energy.js';
 
+/**
+ * 否决理由结构（三轮升级：否决流论证化）。
+ *
+ * 一票否决不再是「reason 字符串了事」——监管否决必须携带可审计的
+ * 论证结构：否决的损失估计（能量量纲，供事后对账「否决避免/误伤
+ * 了多少价值」）+ 替代方案（被否决者的可行出路；只堵不疏的否决
+ * 不被接受）。空理由否决在 justifiedVetoes 模式下被拒（提案放行）。
+ */
+export interface VetoJustification {
+  /** 否决的损失估计（能量量纲；执行该提案的预期损失上界） */
+  lossEstimate: number;
+  /** 替代方案（非空；被否决提案的可行出路） */
+  alternative: string;
+  /** 补充说明（可选） */
+  detail?: string;
+}
+
 /** 只读监管门控（与 SafetyGovernor.checkGate 结构兼容） */
 export interface GovernanceGate {
-  checkGate(): { allowed: boolean; reason?: string; blockedBy?: string };
+  checkGate(): { allowed: boolean; reason?: string; blockedBy?: string; justification?: VetoJustification };
 }
 
 export interface SymbiosisConfig {
@@ -83,6 +106,34 @@ export interface SymbiosisConfig {
   /** ── 7.0：深思内核（多步行动提案按轨迹自由能排序）── */
   /** 深思内核实例（挂载后多步计划提案可按想象推演的轨迹 G 排序） */
   deliberation?: import('../core/deliberation.js').DeliberationEngine;
+  /** ── 三轮升级：否决流论证化（缺省 false——reason 字符串口径，零漂移）── */
+  /**
+   * true 时监管否决必须携带 justification（损失估计 + 替代方案）：
+   * 空理由否决被拒（提案放行并记入 rejectedVetoes 审计）——
+   * 「只堵不疏 / 拍脑袋否决」在机制上不成立。
+   */
+  justifiedVetoes?: boolean;
+  /**
+   * ── 三轮升级：女巫抵抗执行面（缺省 false——零漂移）──
+   * true 时智能体单笔出价/行动预算超过其冷启动额度（trustView().spendAllowance）
+   * 即被一票拦截（veto 'sybil-allowance'）——新账号刷分后也无法大额行动。
+   */
+  sybilGuard?: boolean;
+  /**
+   * ── 四轮升级：通胀治理（缺省 undefined —— 零漂移）──
+   * 配置后任务结算的央行铸币受流通量目标带约束：超发 → 铸币税率随带外
+   * 偏离自动上调（分红缩水）+ 央行从国库收缩销毁（treasury → burn）；
+   * 通缩 → 税率归零、分红加成；带内 → 基础税率。流通量采样史可观测
+   * （monetaryView()：趋势 / 带内回归 / 穿带计数）。
+   */
+  monetaryPolicy?: MonetaryPolicyConfig;
+  /**
+   * ── 四轮（集成收口）：任务结算注入时钟（缺省 Date.now，零漂移）──
+   * settleTaskOutcome 以「单次结算冻结同一时刻」驱动贡献观测与信誉
+   * 读取（observe/read 同拍 → 衰减因子恰为 1，分红金额不随结算耗时
+   * 抖动），并把该时刻透传给货币政策采样（MonetaryGovernor.record）。
+   */
+  clock?: () => number;
 }
 
 export interface GrantOutcome {
@@ -96,6 +147,18 @@ export interface GrantOutcome {
   summary: string;
 }
 
+/** 四轮升级：心跳的通胀治理读数（配置 monetaryPolicy 时出现） */
+export interface MonetaryTickView {
+  circulating: number;
+  target: number;
+  ratio: number;
+  zone: MonetaryZone;
+  mintTaxRate: number;
+  dividendScale: number;
+  /** 本轮建议收缩量（仅 above 时 > 0；实际销毁发生在任务结算） */
+  contraction: number;
+}
+
 export interface SymbiosisTickReport {
   tick: number;
   timestamp: number;
@@ -103,7 +166,13 @@ export interface SymbiosisTickReport {
   dormantAgents: string[];
   reliefs: Array<{ agentId: string; amount: number }>;
   proposals: Array<{ agentId: string; kind: ProposalKind; bid: number }>;
-  vetoes: Array<{ agentId: string; kind: ProposalKind; reason: string }>;
+  vetoes: Array<{ agentId: string; kind: ProposalKind; reason: string; justification?: VetoJustification }>;
+  /**
+   * 三轮升级（否决流论证化）：被拒的监管否决——justifiedVetoes 模式下
+   * 空理由（缺 justification / 损失估计非法 / 替代方案为空）的否决不生效，
+   * 对应提案照常处理并在此留痕（why = 拒因）。
+   */
+  rejectedVetoes: Array<{ agentId: string; kind: ProposalKind; why: string }>;
   trades: number;
   grants: GrantOutcome[];
   mintedThisTick: number;
@@ -137,6 +206,8 @@ export interface SymbiosisTickReport {
   divergence: Array<{ assetId: string; subject: string; marketProb: number; statEstimate: number; gap: number }>;
   /** 6.0：变分自由能（信念市场价 vs 因果后验的 KL 总和；漂移的信息论度量） */
   variationalFreeEnergy?: { total: number; driftDetected: boolean; worst?: { id: string; kl: number } };
+  /** ── 四轮升级：通胀治理读数（配置 monetaryPolicy 时出现；缺省 undefined） ── */
+  monetary?: MonetaryTickView;
 }
 
 export interface DistributionReport {
@@ -146,6 +217,16 @@ export interface DistributionReport {
   method?: 'linear-wilson' | 'shapley-counterfactual';
   /** 各贡献者的 Shapley 边际贡献值（拔掉该智能体任务成功率掉多少） */
   shapley?: Array<{ agentId: string; shapleyValue: number; counterfactualProb: number }>;
+  /** ── 四轮升级：本次结算的货币政策明细（配置 monetaryPolicy 时出现） ── */
+  monetary?: {
+    zone: MonetaryZone;
+    mintTaxRate: number;
+    dividendScale: number;
+    /** 铸币税扣留（incomePerSuccess − 实际分红池；未铸部分即收税） */
+    taxWithheld: number;
+    /** 央行收缩销毁量（treasury → burn，reason 'monetary-contraction'） */
+    contraction: number;
+  };
 }
 
 /** 行动类提案（需预扣能量并执行）；市场类由运行时直接撮合 */
@@ -161,7 +242,7 @@ export class SymbiosisRuntime {
   private tickCount = 0;
   /** futarchy 待决议行动（提案轮创建决策资产 → 下一轮市场表决 → 执行/否决） */
   private pendingDecisions: Array<{ agentId: string; proposal: AgentProposal; assetId: string }> = [];
-  private readonly config: Required<Omit<SymbiosisConfig, 'tickSignals' | 'governor' | 'causalKernel' | 'causalOutcomeNode' | 'freeEnergy' | 'scientist' | 'deliberation'>>;
+  private readonly config: Required<Omit<SymbiosisConfig, 'tickSignals' | 'governor' | 'causalKernel' | 'causalOutcomeNode' | 'freeEnergy' | 'scientist' | 'deliberation' | 'monetaryPolicy' | 'clock'>>;
   private readonly tickSignals?: () => Record<string, number>;
   private readonly governor?: GovernanceGate;
   /** 5.0：因果内核（可选挂载；缺省保持既有线性分红，零行为漂移） */
@@ -173,6 +254,10 @@ export class SymbiosisRuntime {
   private readonly scientist?: import('../core/scientist.js').ScientistMind;
   /** 7.0：深思内核（可选挂载；缺省多步提案排序不可用，零漂移） */
   private readonly deliberation?: import('../core/deliberation.js').DeliberationEngine;
+  /** ── 四轮升级：通胀治理器（可选挂载；缺省铸币/分红行为零漂移） ── */
+  private readonly monetary?: MonetaryGovernor;
+  /** ── 四轮（集成收口）：任务结算时钟（缺省 Date.now，零漂移） ── */
+  private readonly clockFn: () => number;
 
   constructor(config: SymbiosisConfig = {}, governor?: GovernanceGate) {
     this.config = {
@@ -188,6 +273,8 @@ export class SymbiosisRuntime {
       futarchyEnabled: config.futarchyEnabled ?? false,
       futarchyMinImpliedProb: config.futarchyMinImpliedProb ?? 0.55,
       futarchyDecisionB: config.futarchyDecisionB ?? 6,
+      justifiedVetoes: config.justifiedVetoes ?? false,
+      sybilGuard: config.sybilGuard ?? false,
     };
     this.tickSignals = config.tickSignals;
     this.governor = governor;
@@ -196,6 +283,8 @@ export class SymbiosisRuntime {
     this.freeEnergy = config.freeEnergy;
     this.scientist = config.scientist;
     this.deliberation = config.deliberation;
+    this.monetary = config.monetaryPolicy ? new MonetaryGovernor(config.monetaryPolicy) : undefined;
+    this.clockFn = config.clock ?? Date.now;
     this.ledger = new EnergyLedger({ initialSupply: this.config.initialSupply });
     this.market = new CognitiveMarket(this.ledger);
     this.beliefMarket = new BeliefMarket(this.ledger, { defaultB: this.config.beliefLiquidityB });
@@ -273,11 +362,21 @@ export class SymbiosisRuntime {
     // 3. 收集提案 + 4. 监管否决 + 5. 市场类直接撮合 + 6. 行动类授权执行
     const proposalsSeen: SymbiosisTickReport['proposals'] = [];
     const vetoes: SymbiosisTickReport['vetoes'] = [];
+    const rejectedVetoes: SymbiosisTickReport['rejectedVetoes'] = [];
     const grants: GrantOutcome[] = [];
     const pendingBids: Array<{ bidder: string; assetId: string; price: number }> = [];
     const beliefBets: SymbiosisTickReport['beliefBets'] = [];
 
-    const gate = this.governor?.checkGate() ?? { allowed: true };
+    // 三轮升级（否决流论证化）：gate 一票否决须过论证关——
+    // justifiedVetoes 模式下空理由（缺 justification / 损失估计非法 /
+    // 替代方案为空）的否决被拒，blocked = false 且留痕拒因
+    const gateRaw = this.governor?.checkGate() ?? { allowed: true };
+    const gate = this.gateVerdict(gateRaw);
+    const recordRejectedVeto = (agentId: string, kind: ProposalKind): void => {
+      if (gateRaw.allowed === false && !gate.blocked) {
+        rejectedVetoes.push({ agentId, kind, why: gate.vetoRejectedWhy ?? 'empty-justification' });
+      }
+    };
 
     for (const agent of active) {
       let proposals: AgentProposal[];
@@ -292,10 +391,11 @@ export class SymbiosisRuntime {
 
         // 市场类提案：监管仅拦暂停态；否则直接进市场
         if (proposal.kind === 'list-knowledge') {
-          if (!gate.allowed) {
-            vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: gate.reason ?? 'governance' });
+          if (gate.blocked) {
+            vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: gate.reason ?? 'governance', justification: gate.justification });
             continue;
           }
+          recordRejectedVeto(agent.id, proposal.kind);
           const listed = this.market.list({
             seller: agent.id,
             kind: (proposal.assetKind as 'pattern') ?? 'pattern',
@@ -309,6 +409,16 @@ export class SymbiosisRuntime {
         }
         if (proposal.kind === 'buy-knowledge') {
           if (!proposal.assetRef) continue;
+          // 三轮升级：女巫抵抗执行面——超额出价一票拦截
+          if (this.sybilBlocked(agent, proposal.bid)) {
+            vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: this.sybilReason(agent, proposal.bid) });
+            continue;
+          }
+          if (gate.blocked) {
+            vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: gate.reason ?? 'governance', justification: gate.justification });
+            continue;
+          }
+          recordRejectedVeto(agent.id, proposal.kind);
           pendingBids.push({ bidder: agent.id, assetId: proposal.assetRef, price: proposal.bid });
           continue;
         }
@@ -319,6 +429,10 @@ export class SymbiosisRuntime {
         if (proposal.kind === 'bet-belief') {
           if (!proposal.assetRef) {
             vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: 'missing-asset-ref' });
+            continue;
+          }
+          if (this.sybilBlocked(agent, proposal.bid)) {
+            vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: this.sybilReason(agent, proposal.bid) });
             continue;
           }
           const bet = this.beliefMarket.buyToPrice(
@@ -356,8 +470,13 @@ export class SymbiosisRuntime {
         }
 
         // 行动类提案：监管一票否决（kill-switch / 熔断）
-        if (!gate.allowed) {
-          vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: gate.reason ?? 'governance' });
+        if (gate.blocked) {
+          vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: gate.reason ?? 'governance', justification: gate.justification });
+          continue;
+        }
+        recordRejectedVeto(agent.id, proposal.kind);
+        if (this.sybilBlocked(agent, proposal.bid)) {
+          vetoes.push({ agentId: agent.id, kind: proposal.kind, reason: this.sybilReason(agent, proposal.bid) });
           continue;
         }
         const outcome = await this.executeAction(agent, proposal);
@@ -395,12 +514,19 @@ export class SymbiosisRuntime {
       }
       const agent = this.agents.find((a) => a.id === decision.agentId);
       const implied = view.impliedProbYes;
-      if (!gate.allowed) {
+      if (gate.blocked) {
         futarchyDecisions.push({ agentId: decision.agentId, proposalId: decision.proposal.id, impliedProb: implied, decision: 'governor-vetoed' });
         this.cancelBelief(decision.assetId, beliefSettlements);
         continue;
       }
+      recordRejectedVeto(decision.agentId, decision.proposal.kind);
       if (implied >= this.config.futarchyMinImpliedProb && agent) {
+        // 女巫抵抗执行面：futarchy 决议通过的资助同样受冷启动额度约束
+        if (this.sybilBlocked(agent, decision.proposal.bid)) {
+          futarchyDecisions.push({ agentId: decision.agentId, proposalId: decision.proposal.id, impliedProb: implied, decision: 'governor-vetoed' });
+          this.cancelBelief(decision.assetId, beliefSettlements);
+          continue;
+        }
         const grant = await this.executeAction(agent, decision.proposal);
         if (grant) grants.push(grant);
         futarchyDecisions.push({ agentId: decision.agentId, proposalId: decision.proposal.id, impliedProb: implied, decision: 'funded', actionSuccess: grant?.success ?? false });
@@ -465,6 +591,7 @@ export class SymbiosisRuntime {
       reliefs: relieves,
       proposals: proposalsSeen,
       vetoes,
+      rejectedVetoes,
       trades: trades.length,
       grants,
       mintedThisTick: this.ledger.totalSupply() - supplyBefore,
@@ -477,7 +604,31 @@ export class SymbiosisRuntime {
       futarchyDecisions,
       divergence,
       variationalFreeEnergy: variational,
+      monetary: this.monetary ? this.monetaryView() : undefined,
     };
+  }
+
+  /**
+   * 四轮升级：通胀治理读数（当前流通量的政策评估 + 采样趋势）。
+   * 心跳附带走记录（采样不销毁）；未配置 monetaryPolicy → undefined。
+   */
+  monetaryView(): MonetaryTickView | undefined {
+    if (!this.monetary) return undefined;
+    const a = this.monetary.record(this.ledger.circulatingSupply(), this.clockFn());
+    return {
+      circulating: a.circulating,
+      target: a.target,
+      ratio: a.ratio,
+      zone: a.zone,
+      mintTaxRate: a.mintTaxRate,
+      dividendScale: a.dividendScale,
+      contraction: a.contraction,
+    };
+  }
+
+  /** 通胀治理采样趋势（流通量 contracting/expanding/带内回归/穿带计数） */
+  monetaryTrend(): ReturnType<MonetaryGovernor['trend']> | undefined {
+    return this.monetary?.trend();
   }
 
   /**
@@ -591,9 +742,12 @@ export class SymbiosisRuntime {
     const shares: DistributionReport['shares'] = [];
     if (valid.length === 0) return { totalDistributed: 0, shares, method: this.causalKernel ? 'shapley-counterfactual' : 'linear-wilson' };
 
+    // 四轮（集成收口）：单次结算冻结同一时刻——贡献观测与信誉读取同拍
+    // （衰减因子恰为 1），分红金额不随结算耗时跨毫秒而抖动；可注入 clock。
+    const now = this.clockFn();
     // 贡献观测（无论成败都写入证据——失败的统计代价）
     for (const c of valid) {
-      this.agents.find((a) => a.id === c.agentId)?.recordContribution(success);
+      this.agents.find((a) => a.id === c.agentId)?.recordContribution(success, now);
     }
 
     // 5.0：调度器的刻意选型 = do-干预（黄金因果证据，成败都登记）
@@ -611,7 +765,19 @@ export class SymbiosisRuntime {
       }
     }
 
-    if (!success) return { totalDistributed: 0, shares, method: this.causalKernel ? 'shapley-counterfactual' : 'linear-wilson' };
+    if (!success) {
+      const failedAssessment = this.applyMonetaryPolicy(now);
+      return failedAssessment
+        ? { totalDistributed: 0, shares, method: this.causalKernel ? 'shapley-counterfactual' : 'linear-wilson', monetary: failedAssessment }
+        : { totalDistributed: 0, shares, method: this.causalKernel ? 'shapley-counterfactual' : 'linear-wilson' };
+    }
+
+    // ── 四轮升级：通胀治理执行面 ──
+    // 分红池 = incomePerSuccess × dividendScale（超发被税/通缩加成），
+    // 税 = 未铸部分（incomePerSuccess − 池）；超带时央行从国库收缩销毁。
+    // 未配置 monetaryPolicy → pool 即 incomePerSuccess（数值零漂移）。
+    const monetary = this.applyMonetaryPolicy(now);
+    const dividendPool = this.config.incomePerSuccess * (monetary ? monetary.dividendScale : 1);
 
     // ── 分红权重计算 ──
     let weights: number[];
@@ -623,7 +789,7 @@ export class SymbiosisRuntime {
       // 后验估计（因果图处理臂 P(Y=1|do(参与))，无证据回退 Wilson 下界）
       const probs: ContributorProb[] = valid.map((c) => {
         const agent = this.agents.find((a) => a.id === c.agentId);
-        const fallback = agent ? Math.max(agent.reputation().wilsonLower, 0.05) : 0.05;
+        const fallback = agent ? Math.max(agent.reputation(now).wilsonLower, 0.05) : 0.05;
         const eff = this.causalKernel!.effect(c.agentId, this.causalOutcomeNode);
         return { agentId: c.agentId, prob: eff.interventionalSamples >= 3 ? Math.max(eff.pDo, 0.02) : fallback };
       });
@@ -644,7 +810,7 @@ export class SymbiosisRuntime {
       // 既有口径：显式 weight ?? Wilson 下界（+ε 保底）
       weights = valid.map((c) => {
         const agent = this.agents.find((a) => a.id === c.agentId);
-        const fallback = agent ? Math.max(agent.reputation().wilsonLower, 0.05) : 0.05;
+        const fallback = agent ? Math.max(agent.reputation(now).wilsonLower, 0.05) : 0.05;
         return Math.max(0.0001, c.weight ?? fallback);
       });
     }
@@ -652,7 +818,7 @@ export class SymbiosisRuntime {
     const weightSum = weights.reduce((a, b) => a + b, 0);
     let distributed = 0;
     weights.forEach((w, i) => {
-      const amount = Math.floor((this.config.incomePerSuccess * w) / weightSum);
+      const amount = Math.floor((dividendPool * w) / weightSum);
       if (amount <= 0) return;
       const receipt = this.ledger.mint(valid[i]!.agentId, amount, 'task-dividend');
       if (!receipt.ok) return;
@@ -660,7 +826,48 @@ export class SymbiosisRuntime {
       shares.push({ agentId: valid[i]!.agentId, weight: Number(w.toFixed(4)), amount });
       distributed += amount;
     });
-    return { totalDistributed: distributed, shares, method, shapley: shapleyDetail };
+    return monetary
+      ? {
+          totalDistributed: distributed,
+          shares,
+          method,
+          shapley: shapleyDetail,
+          monetary: {
+            zone: monetary.zone,
+            mintTaxRate: monetary.mintTaxRate,
+            dividendScale: monetary.dividendScale,
+            taxWithheld: Math.max(0, this.config.incomePerSuccess - dividendPool),
+            contraction: monetary.contraction,
+          },
+        }
+      : { totalDistributed: distributed, shares, method, shapley: shapleyDetail };
+  }
+
+  /**
+   * 通胀治理执行（四轮升级，settleTaskOutcome 内部调用）：
+   * 评估并采样当前流通量；超带时从国库收缩销毁（treasury → burn，
+   * reason 'monetary-contraction'——流通量的实际回归力量）。
+   * 返回政策明细（未配置 monetaryPolicy → undefined，零介入）。
+   */
+  private applyMonetaryPolicy(now: number = this.clockFn()): DistributionReport['monetary'] | undefined {
+    if (!this.monetary) return undefined;
+    const a = this.monetary.assess(this.ledger.circulatingSupply());
+    let contractionBurned = 0;
+    if (a.contraction > 0) {
+      const clamped = Math.min(a.contraction, this.ledger.balance(TREASURY));
+      if (clamped > 0) {
+        const receipt = this.ledger.burn(TREASURY, clamped, 'monetary-contraction', 'policy');
+        contractionBurned = receipt.ok ? clamped : 0;
+      }
+    }
+    this.monetary.record(this.ledger.circulatingSupply(), now);
+    return {
+      zone: a.zone,
+      mintTaxRate: a.mintTaxRate,
+      dividendScale: a.dividendScale,
+      taxWithheld: Math.max(0, this.config.incomePerSuccess * (1 - a.dividendScale)),
+      contraction: contractionBurned,
+    };
   }
 
   /** 知识使用回报（任务结算时由运行时自动回填，买卖双方不可操纵） */
@@ -669,6 +876,46 @@ export class SymbiosisRuntime {
     if (payout) {
       this.agents.find((a) => a.id === payout.seller)?.noteEarnings(payout.amount);
     }
+  }
+
+  // ─────────────── 三轮升级：否决论证化 + 女巫抵抗执行面 ───────────────
+
+  /**
+   * 监管否决的论证裁决：justifiedVetoes 模式下，一票否决必须携带
+   * justification 且损失估计为有限非负数、替代方案非空——否则否决
+   * 被拒（blocked = false，拒因留给留痕）。缺省模式（false）保持
+   * 旧行为：reason 字符串口径，gate 说不许就不许（零漂移）。
+   */
+  private gateVerdict(gate: ReturnType<GovernanceGate['checkGate']>): {
+    blocked: boolean;
+    reason?: string;
+    justification?: VetoJustification;
+    vetoRejectedWhy?: string;
+  } {
+    if (gate.allowed) return { blocked: false };
+    if (!this.config.justifiedVetoes) return { blocked: true, reason: gate.reason };
+    const j = gate.justification;
+    if (!j) return { blocked: false, vetoRejectedWhy: 'missing-justification' };
+    if (!Number.isFinite(j.lossEstimate) || j.lossEstimate < 0) return { blocked: false, vetoRejectedWhy: 'invalid-loss-estimate' };
+    if (typeof j.alternative !== 'string' || j.alternative.trim().length === 0) return { blocked: false, vetoRejectedWhy: 'empty-alternative' };
+    return { blocked: true, reason: gate.reason, justification: j };
+  }
+
+  /**
+   * 女巫抵抗准入：sybilGuard 挂载且智能体暴露 trustView 时，
+   * 单笔出价/行动预算超过其冷启动额度 → 拦截。
+   * 未挂载（缺省）或智能体无 trustView（自定义智能体）→ 恒放行（零漂移）。
+   */
+  private sybilBlocked(agent: ManagedAgent, bid: number): boolean {
+    if (!this.config.sybilGuard || !(bid > 0)) return false;
+    if (!hasTrustView(agent)) return false;
+    return bid > agent.trustView().spendAllowance + 1e-9;
+  }
+
+  /** 女巫拦截的 veto 理由（含额度读数，可审计） */
+  private sybilReason(agent: ManagedAgent, bid: number): string {
+    const allowance = hasTrustView(agent) ? agent.trustView().spendAllowance : Number.POSITIVE_INFINITY;
+    return `sybil-allowance:bid ${Number(bid.toFixed(2))} > allowance ${Number(allowance.toFixed(2))}（冷启动额度未解锁）`;
   }
 
   /** 行动类提案执行：预扣 → 执行 → 成功燃烧 / 失败半退 */

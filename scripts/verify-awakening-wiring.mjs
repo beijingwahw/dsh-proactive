@@ -248,7 +248,6 @@ section('40.0 首达冷却定价（SafetyGovernor.attachFirstPassageAdvisor）')
 
   governor.attachFirstPassageAdvisor({ targetProb: 0.9 });
   // Date.now 桩：每次失败推进 500ms（失败间隔序列 → 恢复方向）
-  const realNow = Date.now.bind(Date);
   let clock = 1_000_000;
   const origNow = Date.now;
   Date.now = () => clock;
@@ -259,7 +258,6 @@ section('40.0 首达冷却定价（SafetyGovernor.attachFirstPassageAdvisor）')
     }
   } finally {
     Date.now = origNow;
-    void realNow;
   }
   const view = governor.firstPassageView();
   ok(view !== undefined && view.recommendedCooldownMs > 0 && view.mu > 0,

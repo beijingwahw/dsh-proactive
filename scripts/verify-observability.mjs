@@ -288,7 +288,8 @@ section('H 分层合法：铸币源 0 / 国库 1 / 智能体 2 / 池 3 / 燃烧�
   let layersOk = true;
   for (const [id, layer] of Object.entries(expect)) {
     const n = report.nodes.find((x) => x.id === id);
-    if (n && n.layer !== layer) layersOk = false;
+    // 节点缺席同样判失败——五大内部账户是本场景必然出现的分层锚点
+    if (!n || n.layer !== layer) layersOk = false;
   }
   const agentsOnLayer2 = report.nodes.filter((n) => n.kind === 'agent').every((n) => n.layer === 2);
   ok(layersOk, '内部账户分层正确');

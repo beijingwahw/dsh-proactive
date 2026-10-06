@@ -266,9 +266,6 @@ section('E 自然选择：失败周期持续失血 → 余额跌破门槛 → �
     return { deployed: false, bestGain: -0.5, summary: '沙盒进化失败（无候选过门禁）' };
   });
   for (let i = 0; i < 6; i += 1) await bridge.heartbeat(healthyKpi);
-  const funded = bridge
-    .status()
-    .futarchy.lastDecisions.filter(() => true); // 仅触发展开
   ok(runs === 2, `失败进化恰被执行 2 次后自动暂停（实际 ${runs}）`);
   const bal = bridge.runtime.ledger.balance('evolver');
   ok(bal < 60, `持续失败 → 余额 ${bal.toFixed(1)} < 60 → 不再提案（经济自然选择）`);
@@ -276,7 +273,6 @@ section('E 自然选择：失败周期持续失血 → 余额跌破门槛 → �
   const st = bridge.status().futarchy.evolver;
   ok(st.cyclesRun === 2 && st.deployCount === 0, `状态可观测：周期 ${st.cyclesRun} / 部署 ${st.deployCount}`);
   ok(bridge.runtime.ledger.verifyConservation() && bridge.runtime.ledger.verifyChain(), '失败经济全程守恒 + 链完整');
-  void funded;
 }
 
 // ═══════════════════ G 主链路集成 ═══════════════════

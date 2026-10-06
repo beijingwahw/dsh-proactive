@@ -64,15 +64,6 @@ const cleanup = (p) => {
 };
 
 const openGate = () => ({ allowed: true });
-const kpi = (successRate) => ({
-  timestamp: Date.now(),
-  successRate,
-  avgQuality: 0.8,
-  avgLatency: 900,
-  cacheHitRate: 0.3,
-  modelSuccessRates: {},
-  activeExecutions: 0,
-});
 
 /** 同质双模型 LLM stub（评分差异只来自注入的经济乘数） */
 const makeHomogeneousLLM = () => {

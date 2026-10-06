@@ -120,6 +120,9 @@ export interface PolicyFitness {
  * 可追溯性：id 唯一、version 随部署谱系单调递增、generation 记录进化代际、
  * parentId 指向父代策略（交叉时另有 secondaryParentId 双亲）、origin 标记
  * 来源、fitness 携带最近评估表现数据。
+ *
+ * 第四轮升级：origin 增加 'transfer'——跨任务迁移派生策略（父代是源
+ * 任务的供体策略，标量基因部分复制自供体，谱系可跨任务回溯）。
  */
 export interface Policy {
   id: string;
@@ -128,8 +131,8 @@ export interface Policy {
   /** 策略类型（当前仅调度策略；预留扩展） */
   type: 'scheduler';
   params: SchedulerPolicyParams;
-  /** 来源：baseline 基准 / mutation 变异 / crossover 交叉 / explorer 边界内随机探索 / manual 人工注入 */
-  origin: 'baseline' | 'mutation' | 'crossover' | 'explorer' | 'manual';
+  /** 来源：baseline 基准 / mutation 变异 / crossover 交叉 / explorer 边界内随机探索 / manual 人工注入 / transfer 跨任务迁移（第四轮） */
+  origin: 'baseline' | 'mutation' | 'crossover' | 'explorer' | 'manual' | 'transfer';
   /** 进化代际（每轮进化周期 +1） */
   generation: number;
   /** 父代策略 id（可追溯进化链） */
@@ -158,6 +161,19 @@ export interface SandboxTask {
   source: 'replay' | 'adversarial';
   /** 可读标签（评估报告与调试用） */
   label?: string;
+  /**
+   * 第三轮升级：对抗课程生成元数据（AdversarialCurriculum 产物携带；
+   * 固定难度口径 generateAdversarialTasks 与历史回放任务不带此字段——
+   * 消费方可据此区分「难度自适应/边界挖掘」任务与普通任务）
+   */
+  curriculum?: {
+    /** 生成时难度档（0~1） */
+    difficulty: number;
+    /** 是否边界案例挖掘产物（历史失败模式附近采样） */
+    boundaryMined: boolean;
+    /** 压力模式（extreme / cold-start / feature-dense / minimal / boundary） */
+    mode: string;
+  };
 }
 
 /** 沙盒内模拟模型状态（从 LLMClient 运行时状态映射，离线快照） */

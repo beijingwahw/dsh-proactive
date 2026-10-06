@@ -11,6 +11,14 @@
  * - MentalReport 严格实现第四阶段验收接口定义，并补充可追溯字段
  * - JudgeMetric 把「参数调整」与「效果判定指标」显式关联，
  *   使保守调整闭环（应用 → 观察 → 判定 → 保留/回滚）可机器执行
+ * - 3.0 升级新增（全部可选字段/联合扩展，旧持久化历史向后兼容）：
+ *   死区稳定环（StabilityLoopConfig）/ 调整证书门（CertificateGateConfig，
+ *   89.0 视图 LCB>0 才放行）/ 自我模型变更日志（SelfModelChange）/
+ *   自我评估校准（SelfCalibrationSummary）/ 内外环冲突仲裁审计
+ * - 4.0 升级新增（全部可选字段/联合扩展，缺省零漂移）：
+ *   自我效能预测（SelfEfficacySummary，按任务类型 Beta 后验 + 校准追踪）/
+ *   认知负荷计量（CognitiveLoadConfig，超阈值暂停新调整防归因混淆）/
+ *   调整幅度元学习（AmplitudeMetaLearnConfig，大调整连续翻车→幅度先验收紧）
  */
 
 // ─────────────────────────── 系统指标快照 ───────────────────────────
@@ -228,6 +236,24 @@ export interface MentalReport {
   knobEffectiveness?: KnobEffectiveness[];
   /** 元认知层自察：熔断器 / 安全包络 / 学习器 / 稳态带（系统对自身调整机制的认知） */
   metaStability?: MetaStabilitySummary;
+  /**
+   * 3.0：自我评估校准（自评 vs 实际表现的滚动偏差追踪）。
+   *
+   * 有 recordSelfAssessment 样本后输出：自评过高（overconfident）的
+   * 系统会把「感觉良好」当成「表现良好」，自评过低（underconfident）
+   * 的系统会过度求助/过度保守——校准视图给出偏差 EMA、校正口径与
+   * 告警态。无样本时字段缺省（旧持久化历史向后兼容）。
+   */
+  selfCalibration?: SelfCalibrationSummary;
+  /**
+   * 4.0：自我效能预测（按任务类型的成功率预测 + 预测-实际校准追踪）。
+   *
+   * 有 recordSelfEfficacy 样本后输出：各任务类型的 Beta 后验预测
+   * （历史 α/β + 事后实测）、预测 vs 实际的偏差 EMA（预测过高 = 把
+   * 「预计能成」当「真能成」）与 Brier 分数 EMA（预测质量的概率校准
+   * 口径）。无样本时字段缺省（旧持久化历史向后兼容）。
+   */
+  selfEfficacy?: SelfEfficacySummary;
 }
 
 // ─────────────────────────── 元认知控制 ───────────────────────────
@@ -244,7 +270,17 @@ export type JudgeMetric =
 export interface AuditEntry {
   id: string;
   timestamp: number;
-  type: 'adjust' | 'commit' | 'rollback' | 'manual-override' | 'freeze' | 'skip' | 'circuit-breaker';
+  type:
+    | 'adjust'
+    | 'commit'
+    | 'rollback'
+    | 'manual-override'
+    | 'freeze'
+    | 'skip'
+    | 'circuit-breaker'
+    | 'certificate-reject'
+    | 'conflict-arbitration'
+    | 'load-gate';
   /** 调节旋钮 id */
   knob?: string;
   from?: number;
@@ -268,10 +304,40 @@ export interface AuditEntry {
     delta: number;
     violated: boolean;
   };
-  /** 2.0：调整来源（reactive 规则反应式 / proactive 预测前瞻式） */
-  source?: 'reactive' | 'proactive';
+  /** 调整来源（reactive 规则反应式 / proactive 预测前瞻式 / homeostatic 稳定环） */
+  source?: 'reactive' | 'proactive' | 'homeostatic';
   /** 关联的心智报告序号 */
   reportIndex?: number;
+  /**
+   * 3.0：调整证书（89.0 视图裁决）。
+   *
+   * mode = full：89.0 视图可用且 LCB > 0，证书放行全幅调整；
+   * mode = provisional：视图样本不足（不可用），退化为保守半步调整 +
+   *   严格判定观察窗（无明确改善即自动回滚）；
+   * mode = rejected：视图可用但 LCB ≤ 0（历史效果的高置信下界非正，
+   * 「假改进」嫌疑），本候选被拒绝。
+   */
+  certificate?: {
+    mode: 'full' | 'provisional' | 'rejected';
+    /** 89.0 口径的置信下界（视图可用时填写） */
+    lcb?: number;
+    /** 视图配对样本数 */
+    samples: number;
+    /** 所用置信参数 δ */
+    delta?: number;
+  };
+  /**
+   * 4.0：调整幅度元学习记录（启用 amplitudeMetaLearn 后的 adjust 条目填写）。
+   *
+   * band = 该次调整的幅度类（按 |Δ|/step 分档）；factor = 幅度先验因子
+   * （历史同类成功率 → 贝叶斯平滑 / 目标成功率，<1 收缩、>1 放宽）；
+   * trials = 判定入账时该幅度类的历史试验数。
+   */
+  amplitude?: {
+    band: 'tentative' | 'standard' | 'aggressive';
+    factor: number;
+    trials: number;
+  };
 }
 
 /** 调整报告（evaluateAndAdjust 产物） */
@@ -291,7 +357,18 @@ export interface AdjustmentReport {
    */
   status: 'adjusted' | 'observing' | 'committed' | 'rolled-back' | 'no-op' | 'frozen';
   /** 本轮应用的调整（保守原则：每轮至多 maxAdjustmentsPerRound 个） */
-  applied: Array<{ knob: string; label: string; from: number; to: number; reason: string; source?: 'reactive' | 'proactive' }>;
+  applied: Array<{
+    knob: string;
+    label: string;
+    from: number;
+    to: number;
+    reason: string;
+    source?: 'reactive' | 'proactive' | 'homeostatic';
+    /** 3.0：调整证书（89.0 视图裁决：full 全幅放行 / provisional 保守半步） */
+    certificate?: { mode: 'full' | 'provisional'; lcb?: number; samples: number };
+    /** 4.0：幅度元学习（幅度类 / 先验因子 / 历史试验数） */
+    amplitude?: { band: 'tentative' | 'standard' | 'aggressive'; factor: number; trials: number };
+  }>;
   /** 本轮自动回滚的调整 */
   rolledBack?: {
     knob: string;
@@ -372,6 +449,63 @@ export interface MetaControllerState {
   totalAdjustments: number;
   totalRollbacks: number;
   totalCommits: number;
+  // ── 3.0：稳定环 / 证书门 / 冲突仲裁（未启用稳定环时 undefined） ──
+  /** 3.0：死区稳定环统计（死区跳过 / 方向翻转 / 冷却跳过 / 斜坡衰减调整） */
+  stability?: {
+    deadbandSkips: number;
+    cooldownSkips: number;
+    directionFlips: number;
+    rampedAdjustments: number;
+    /** 各旋钮当前同向连续调整计数（斜坡位置） */
+    streaks: Array<{ knob: string; direction: 'up' | 'down'; count: number }>;
+  };
+  /** 3.0：调整证书门面板（各「旋钮×方向」臂最近一次 89.0 视图裁决） */
+  certificateGate?: {
+    decisions: Array<{
+      knob: string;
+      direction: 'up' | 'down';
+      mode: 'full' | 'provisional' | 'rejected';
+      lcb?: number;
+      samples: number;
+    }>;
+    rejected: number;
+    provisional: number;
+    full: number;
+  };
+  /** 3.0：内外环冲突仲裁（同参数被多方调整：最后写入者胜 + 冲突计数） */
+  arbitration?: {
+    conflicts: number;
+    arbitrated: number;
+    lastConflict?: { knob: string; winner: string; at: number };
+  };
+  // ── 4.0：认知负荷门 / 调整幅度元学习（未启用时 undefined） ──
+  /**
+   * 4.0：认知负荷面板（在调旋钮数 / 在观实验数 / 在跟踪 KPI 数 → 合成
+   * 负荷分 vs 上限；超限被拦截的次数）。未启用 cognitiveLoad 时 undefined。
+   */
+  cognitiveLoad?: {
+    activeAdjustments: number;
+    activeExperiments: number;
+    trackedKpis: number;
+    load: number;
+    threshold: number;
+    paused: boolean;
+    gateSkips: number;
+  };
+  /**
+   * 4.0：调整幅度元学习面板（各幅度类的历史成功率与当前幅度先验因子）。
+   * 未启用 amplitudeMetaLearn 时 undefined。
+   */
+  amplitudeLearning?: {
+    bands: Array<{
+      band: 'tentative' | 'standard' | 'aggressive';
+      trials: number;
+      commits: number;
+      successRate: number;
+      /** 当前幅度先验因子（<1 收缩 / 1 中性 / >1 放宽；零试验 = 1） */
+      factor: number;
+    }>;
+  };
 }
 
 // ─────────────────── 2.0 质级升级：预测 / 学习 / 安全 / 稳态 ───────────────────
@@ -487,4 +621,189 @@ export interface MetaStabilitySummary {
   learner: { totalTrials: number; arms: number; explorationWeight: number };
   /** 稳态目标带状态 */
   homeostasis: HomeostasisStatus[];
+}
+
+// ─────────────────── 3.0 世界性升级：稳定环 / 证书门 / 变更日志 / 校准 ───────────────────
+
+/**
+ * 3.0：调参死区稳定环配置（外环防震荡三件套：死区 + 斜坡 + 冷却）。
+ *
+ * 朴素比例外环在噪声下会极限环震荡：指标贴着目标带边缘抖动，控制器
+ * 每次都全力纠正，反而把旋钮推离均衡点。三件套对应三种阻尼：
+ * 1. 死区（deadbandDeviation）：归一化偏离 ≤ 死区半宽 → 判为测量噪声，
+ *    不产生调整（带内不动是稳态而非失职）；
+ * 2. 斜坡（rampStart / rampIncrement）：新方向的首次调整只走 rampStart
+ *    比例步长，同向连续调整逐步升幅（封顶全幅）；方向翻转即重置——
+ *    持续误差才配得上大动作，瞬时越界只配小步试探；
+ * 3. 冷却（cooldownReports）：commit/rollback 判定后强制冷却若干份报告，
+ *    不允许背靠背调整（给被调系统留出暂态消退时间）。
+ *
+ * 未配置（undefined）= 完全保持 2.0 行为（零漂移）。
+ */
+export interface StabilityLoopConfig {
+  /** 死区半宽（归一化偏离单位；缺省 0.25 = 偏离带宽 25% 以内不动） */
+  deadbandDeviation?: number;
+  /** 斜坡起点步长因子（新方向首次调整 ×rampStart；缺省 0.5 = 半步） */
+  rampStart?: number;
+  /** 同向连续调整的步长因子增量（线性升幅封顶 1；缺省 0.25） */
+  rampIncrement?: number;
+  /** 判定（commit/rollback）后的冷却报告数（缺省 1） */
+  cooldownReports?: number;
+  /**
+   * 稳定环候选方向表：旋钮 id → 该旋钮增大对其判定指标的影响方向
+   * （'positive' = 增大旋钮使指标上升）。提供后控制器可直接从稳态带
+   * 偏离生成 homeostatic 候选（不依赖心智报告的规则推荐）。
+   */
+  knobAffect?: Record<string, 'positive' | 'negative'>;
+}
+
+/**
+ * 3.0：调整证书门配置（89.0 视图：LCB > 0 才放行全幅自我调整）。
+ *
+ * 自我修改（阈值/参数变更）是单向门：改坏了要靠回滚兜底，不如改前
+ * 就要证书。证书原料 = 学习臂记录的历史调整效果配对样本
+ * （每次判定的 effectDelta），裁决 = 89.0 安全策略改进的经验伯恩斯坦
+ * 单侧下界（ebRadius 同式）：mean(deltas) − radius(σ̂, b−a, n, δ) > 0
+ * 才放行全幅调整。视图不可用（样本 < minSamples，如冷启动）时不装懂：
+ * 退化为保守半步调整 + 严格判定观察窗（无明确改善即自动回滚）。
+ *
+ * 未配置（undefined）= 完全保持 2.0 行为（零漂移）。
+ */
+export interface CertificateGateConfig {
+  /** 置信参数 δ ∈ (0,1)：P[错误放行假改进] ≤ δ（缺省 0.1） */
+  delta?: number;
+  /** 89.0 视图可用的最小配对样本数（不足 → provisional 半步；缺省 4） */
+  minSamples?: number;
+}
+
+/**
+ * 3.0：自我模型变更日志条目（一切自我修改入账：改动前后 + 理由 + 触发者）。
+ *
+ * 自我模型是「会改自己的模型」：配置（反馈窗口 / 异常阈值 / 稳态带…）
+ * 会被外环或人工修改。变更日志让每次自我修改可追溯、可逆——rollback
+ * 按日志逆向恢复（from 值写回），snapshot/restore 整体回滚。
+ */
+export interface SelfModelChange {
+  id: string;
+  timestamp: number;
+  /** 变更目标（自我模型自身的配置键，如 'anomalyZThreshold'） */
+  key: string;
+  /** 改动前取值 */
+  from: unknown;
+  /** 改动后取值 */
+  to: unknown;
+  /** 理由（为什么改） */
+  reason: string;
+  /** 触发者（谁改的：meta-controller / manual / system …） */
+  trigger: string;
+  /** 已被 rollbackSelfChanges 逆转 */
+  undone?: boolean;
+}
+
+/**
+ * 3.0：自我评估校准摘要（自评 vs 实际表现的滚动偏差追踪）。
+ *
+ * 「能力自评」（claimed）与「实际表现」（actual）的配对流进入滚动
+ * 追踪：偏差均值 + EMA 双口径，|biasEma| 超容忍带即告警——自评过高
+ * （overconfident，感觉良好 ≠ 表现良好）或自评过低（underconfident，
+ * 过度保守/求助）。calibrated 给出校正口径：把后续自评减去 biasEma
+ * 即得校准后的诚实自评。
+ */
+export interface SelfCalibrationSummary {
+  /** 已积累的配对样本数 */
+  samples: number;
+  /** 滚动窗口偏差均值（claimed − actual；正 = 自评偏高） */
+  biasMean: number;
+  /** 偏差 EMA（指数平滑，对趋势收敛快于窗口均值） */
+  biasEma: number;
+  /** 最新一次的校正后自评（claimed − biasEma） */
+  calibrated: number | null;
+  /** 校准状态：warming-up 样本不足 / calibrated 带内 / overconfident 偏高 / underconfident 偏低 */
+  state: 'warming-up' | 'calibrated' | 'overconfident' | 'underconfident';
+  /** 进入过高/过低告警态的翻转沿次数 */
+  alarms: number;
+  /** 最近一次告警方向 */
+  lastAlarm?: 'overconfident' | 'underconfident';
+}
+
+// ─────────────────── 4.0 世界性升级：自我效能 / 认知负荷 / 幅度元学习 ───────────────────
+
+/** 4.0：单任务类型的自我效能读数（Beta 后验 + 事后实测） */
+export interface SelfEfficacyTypeView {
+  taskType: string;
+  /** 已结算的任务数 */
+  trials: number;
+  successes: number;
+  /** Beta(α₀+s, β₀+f) 后验均值 = 预测成功率 */
+  predicted: number;
+  /** 后验 90% 可信区间（Beta 分位近似，Wilson 口径） */
+  ci90: { lower: number; upper: number };
+  /** 事后实测成功率（trials=0 为 null——预测先于经验，诚实分离） */
+  empirical: number | null;
+}
+
+/**
+ * 4.0：自我效能预测摘要（按任务类型的成功率预测 + 校准追踪）。
+ *
+ * 与 3.0 SelfCalibrationSummary 的分工：校准摘要追踪「自评 vs 实际」的
+ * 滚动偏差（单一全局口径）；效能预测按**任务类型**维护 Beta 后验——
+ * 三类任务历史各自分化（擅长/平庸/短板），预测携带区间而非点值，
+ * 校准追踪（biasEma / brierEma）度量「预测本身」的概率质量。
+ */
+export interface SelfEfficacySummary {
+  /** 各任务类型的 Beta 后验读数（按 trials 降序） */
+  types: SelfEfficacyTypeView[];
+  /** 预测-实际偏差 EMA（正 = 预测过高：把「预计能成」当「真能成」） */
+  calibrationBiasEma: number;
+  /** Brier 分数 EMA（预测质量：0=完美预测，0.25=瞎猜恒 0.5） */
+  brierEma: number;
+  /** 已结算的预测-结果对数 */
+  samples: number;
+  /** 校准状态：warming-up 预热 / calibrated 带内 / over-predicting 预测过高 / under-predicting 预测过低 */
+  state: 'warming-up' | 'calibrated' | 'over-predicting' | 'under-predicting';
+}
+
+/**
+ * 4.0：认知负荷计量配置（防「同时调太多不可归因」）。
+ *
+ * 调整中的旋钮、观察中的实验、跟踪中的 KPI 各占认知带宽；合成负荷分
+ * 超过 maxLoad 时暂停**新**调整（观察窗判定照常推进——已投入的观察
+ * 不作废），把并发调整压到可归因的水平。未配置（undefined）= 完全
+ * 保持既有行为（零漂移）。
+ */
+export interface CognitiveLoadConfig {
+  /**
+   * 在调旋钮的计数窗（最近 N 份报告内的 adjust 条目计为「在调整」；
+   * 缺省 4）——调整落地后系统需要连续几份报告消化其效果，期间的
+   * 新调整都是归因混淆源。
+   */
+  flightWindowReports?: number;
+  /** 在调旋钮权重（缺省 1） */
+  adjustmentWeight?: number;
+  /** 在观实验权重（缺省 1） */
+  experimentWeight?: number;
+  /** 在跟踪 KPI 单个权重（缺省 0.1） */
+  kpiWeight?: number;
+  /** 负荷上限（超过即暂停新调整；缺省 2） */
+  maxLoad?: number;
+}
+
+/**
+ * 4.0：调整幅度元学习配置（调参策略本身的学习）。
+ *
+ * 每个已判定的调整按幅度 |Δ|/step 归入幅度类（tentative ≤0.6 /
+ * standard ≤1.0 / aggressive >1.0），逐类累计 commit/rollback——
+ * 「大调整连续翻车」压低 aggressive 后验 → 后续同类调整的幅度先验
+ * 收缩；「小调整连续成功」抬高 tentative 后验 → 幅度先验放宽。
+ * 因子 = 贝叶斯平滑成功率 / target，零试验恒 1（零漂移）。
+ */
+export interface AmplitudeMetaLearnConfig {
+  /** 目标成功率（因子 = 平滑成功率/target；缺省 0.6） */
+  target?: number;
+  /** 幅度先验因子下限（缺省 0.25） */
+  minFactor?: number;
+  /** 幅度先验因子上限（缺省 1.5） */
+  maxFactor?: number;
+  /** Beta 平滑先验权重（缺省 1，即 Beta(1,1)） */
+  priorWeight?: number;
 }

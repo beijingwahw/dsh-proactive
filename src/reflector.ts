@@ -7,6 +7,11 @@
  * - 策略反馈：蒸馏策略应用结果回写，反向校准策略置信度
  * - 经验蒸馏：成功沉淀达到阈值时提炼可复用策略
  *
+ * 第四轮 R4-A6 新增维度（opt-in，未挂载零漂移）：
+ * - 失败知识库：失败的结构化沉淀（失败模式特征 + 触发条件 + 规避动作），
+ *   同模式合并计数、规避动作随重复升级；检索命中作为「规避建议」随计划
+ *   下发，采纳结果回填有效性（attachFailureKnowledgeBase）
+ *
  * 边界：只写记忆库 + 复盘，不做调度决策。
  * 与优化器（optimizer.ts）构成单向数据流的两端：
  *   记忆库 → 优化器 → 模型调度/任务执行 → 反思器 → 记忆更新 → 记忆库
@@ -32,7 +37,23 @@ import { buildPatternFingerprint } from './memory/long-term-memory.js';
 import type { MemoryGraph } from './memory/memory-graph.js';
 import type { ChangeEntry, ChangePayload } from './sync/distributed-sync.js';
 import type { Signal } from './sentinel.js';
+// 创世纪 70.0：部分信息分解（多模型组合的冗余/独占/协同四分诊断）
+import { pidFromJoint, oInformation, type PidReport, type OInfoReport } from './core/partial-info-decomposition.js';
+
+// 第二轮创世纪 82.0/90.0：众包聚合（多模型判定的信任票权）/ 偏好学习
+// （RLHF-lite：从偏好对学调度层价值序）
+import {
+  crowdVerdict,
+  PreferenceLedger,
+  type CrowdVerdictView,
+  type CrowdsourcedLabels,
+  type PreferenceLedgerView,
+} from './engines-frontier/autonomy25.js';
 import { distillRetention } from './core/information-bottleneck.js';
+// 第三轮模块域升级 A6：反事实臂台账（OPE 消费口径）+ 洞察去重衰减 / 沉淀价值评分（共用全层证据半衰期）
+import type { DiscretePolicy, Episode } from './core/off-policy-evaluation.js';
+import { tabularPolicy } from './core/off-policy-evaluation.js';
+import { decayFactor } from './core/evidence.js';
 
 /** 反思器配置 */
 export interface ReflectorConfig {
@@ -90,12 +111,181 @@ export interface CalibrationStatus {
   direction: 'overconfident' | 'underconfident' | 'calibrated' | 'insufficient';
   /** 滑动窗口容量 */
   windowSize: number;
-  /**
-   * 3.0 校准自修正量：后续预测置信度的建议偏移（过自信 → 负值收缩）。
-   * 样本 ≥ 20 且 |residualMean| > 0.1 时生效（= −residual × 0.5，±0.15 钳制），
-   * 否则为 0——样本不足或已校准时不动预测，避免噪声驱动的过度修正。
-   */
+/**
+ * 3.0 校准自修正量：后续预测置信度的建议偏移（过自信 → 负值收缩）。
+ * 样本 ≥ 20 且 |residualMean| > 0.1 时生效（= −residual × 0.5，±0.15 钳制），
+ * 否则为 0——样本不足或已校准时不动预测，避免噪声驱动的过度修正。
+ */
   correction: number;
+}
+
+// ───────────────────── 第三轮模块域升级 A6：反事实臂台账 / 洞察去重衰减 / 沉淀价值评分 ─────────────────────
+
+/**
+ * A6 升级 4：备选方案反事实臂（沉淀时的「当时还有哪些选择」结构化记录）
+ *
+ * 每个候选臂的估计成功概率来自记忆库贝叶斯后验（时间加权 + 小样本
+ * 收缩——不是拍脑袋概率）；证据不足（有效样本 < minSamples）的候选
+ * 不入账（诚实优先于覆盖度）。
+ */
+export interface CounterfactualArm {
+  modelId: string;
+  /** 估计成功概率（贝叶斯后验均值；实际臂无可用时以本次实测代替并标注 samples=0） */
+  estimatedProb: number;
+  /** 威尔逊下界（保守口径——备选臂采信门槛） */
+  wilsonLower: number;
+  /** 有效样本量（0 = 无先验，estimatedProb 为本次实测） */
+  samples: number;
+  /** 是否本次实际执行的臂 */
+  chosen: boolean;
+}
+
+/**
+ * A6 升级 4：一次节点沉淀的反事实台账记录（决策台账原子）
+ *
+ * 「实际选了谁 + 结果如何 + 当时还有什么备选及其估计」三元组。
+ * 供两个下游消费：决策台账（审计口径）与 88.0 离线策略评估
+ * （counterfactualOpeDataset 直接产出 Episode + 行为策略）。
+ */
+export interface CounterfactualOutcomeRecord {
+  at: number;
+  taskType: string;
+  nodeId: string;
+  /** 实际选择的模型（行为臂） */
+  chosenModel: string;
+  /** 实际结果（成功 1 / 失败 0 —— OPE 回报口径） */
+  outcome: 0 | 1;
+  /** 该节点质量分 */
+  quality: number;
+  /** 候选臂表（含实际臂） */
+  arms: CounterfactualArm[];
+  /** 行为策略对实际臂的选择概率（调度器探索率桥接；缺省均匀 1/K） */
+  chosenPropensity: number;
+}
+
+/**
+ * A6 升级 5：洞察账本条目（同类洞察合并计数 + 半衰期衰减）
+ *
+ * 「同类」= 同 key（taskType × subject）：重复出现的洞察合并为一条、
+ * 计数累加（去重），而不是每次沉淀都新开一条把账本灌满同质条目；
+ * 读取时按距 lastSeenAt 的年龄做半衰期衰减——长期不再出现的洞察
+ * 有效分自然衰减为遗忘候选（对接遗忘曲线 / 60.0 率失真语义）。
+ */
+export interface InsightLedgerEntry {
+  /** 洞察键（taskType::subject —— 同类合并的判据） */
+  key: string;
+  /** 洞察适用范围（任务类型；跨任务为 'global'） */
+  scope: string;
+  /** 洞察主体（模型 id / 记忆条目 id） */
+  subject: string;
+  /** 累计出现次数（同类合并计数） */
+  hits: number;
+  successes: number;
+  failures: number;
+  /** 原始成功率（successes / hits） */
+  rawScore: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  /** 半衰期新鲜度（0.5^(ageDays/halfLifeDays)） */
+  freshness: number;
+  /** 有效分 = rawScore × freshness（排序 / 遗忘判定口径） */
+  effectiveScore: number;
+}
+
+/** A6 升级 5：洞察账本视图（衰减后排序 + 遗忘候选分离） */
+export interface InsightLedgerView {
+  entries: InsightLedgerEntry[];
+  /** 有效分跌破阈值的遗忘候选（读取时判定，不删除底账） */
+  forgetCandidates: InsightLedgerEntry[];
+  /** 账本容量上限 */
+  maxEntries: number;
+}
+
+/**
+ * A6 升级 6（加分）：沉淀价值评分条目（历史命中频率先验 → 遗忘候选标注）
+ *
+ * 对蒸馏产物（语义/程序/策略）按「历史命中频率 × 应用成功率 × 新鲜度」
+ * 折算价值分：从未被命中且长期闲置的条目标为 forget-candidate——
+ * 喂给记忆库遗忘曲线（60.0 率失真语义）做先验，而非等价对待全部沉淀。
+ */
+export interface SedimentationValueEntry {
+  kind: 'semantic' | 'procedural' | 'strategy';
+  id: string;
+  /** 历史命中次数（本地挂账计数 + 记忆库 appliedTotal） */
+  hits: number;
+  successes: number;
+  successRate: number;
+  /** 距最近应用/蒸馏的天数 */
+  daysIdle: number;
+  /** 价值分 = log(1+hits)/log(1+hitSaturation) × successRate × 0.5^(daysIdle/halfLifeDays) */
+  value: number;
+  /** retain / forget-candidate（value < forgetThreshold） */
+  recommendation: 'retain' | 'forget-candidate';
+}
+
+// ───────────────────── 第四轮模块域升级 R4-A6：失败知识库（结构化失败沉淀 + 规避建议） ─────────────────────
+
+/** R4-A6 升级 3：失败错误类目（与反思引擎规则化兜底同口径的确定性分类） */
+export type FailureErrorCategory = 'timeout' | 'quality' | 'dependency' | 'transient';
+
+/**
+ * R4-A6 升级 3：失败模式条目（失败的结构化沉淀）
+ *
+ * 「失败模式特征 + 触发条件 + 规避动作」三元组——同一签名（任务类型 ×
+ * 根因 × 失败节点类型）的重复失败合并计数（occurrences），规避动作随
+ * 重复次数升级（超时：首次参数调优 → 第二次起直接规避涉事模型）。
+ * 检索命中时作为「规避建议」随计划下发（avoidanceAdvice）。
+ */
+export interface FailureModeEntry {
+  /** 内容寻址稳定 id（签名哈希——同模式跨次沉淀同 id，合并计数） */
+  id: string;
+  taskType: string;
+  /** 模式签名 `${taskType}::${rootCause}::${failedNodeType}` */
+  signature: string;
+  /** 根因（反思引擎 RootCauseCategory 口径） */
+  rootCause: 'timeout' | 'model-capability' | 'dependency' | 'transient';
+  /** 错误类目 */
+  errorCategory: FailureErrorCategory;
+  /** 失败节点类型 */
+  failedNodeType: string;
+  /** 涉事模型集合（同模式累计） */
+  implicatedModels: string[];
+  /** 触发条件（与程序记忆同构——可直接落为检索条件） */
+  triggers: ProceduralCondition[];
+  /** 规避动作（随 occurrences 升级） */
+  avoidance: ProceduralAction;
+  /** 同模式累计失败次数 */
+  occurrences: number;
+  /** 规避建议被采纳次数 */
+  avoidanceAdopted: number;
+  /** 采纳后成功的次数（规避有效性证据） */
+  avoidanceSuccesses: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+}
+
+/**
+ * R4-A6 升级 3：规避建议（检索命中时随计划下发）
+ *
+ * matchScore = 0.6 基础 + 0.2 节点类型匹配 + 0.2 错误线索匹配（确定性
+ * 加法——上下文给得越准建议越可信）；effectiveness 为规避建议采纳后的
+ * 实测成功率（无采纳记录时 undefined——诚实标注）。
+ */
+export interface AvoidanceAdvice {
+  entryId: string;
+  taskType: string;
+  signature: string;
+  rootCause: FailureModeEntry['rootCause'];
+  errorCategory: FailureErrorCategory;
+  /** 规避动作（调度层消费：avoid-model 剔除候选 / param-tune 调参） */
+  avoidance: ProceduralAction;
+  /** 同模式历史失败次数（先验强度） */
+  occurrences: number;
+  /** 触发上下文匹配分 0.6~1 */
+  matchScore: number;
+  /** 规避有效性 = avoidanceSuccesses / avoidanceAdopted（无采纳记录 undefined） */
+  effectiveness?: number;
+  rationale: string;
 }
 
 /**
@@ -191,11 +381,47 @@ export class Reflector implements IReflector {
     // 2. 经验沉淀（记忆更新）
     this.settleExperience(signal, plan, result);
 
+    // 2.2 第三轮 A6 升级 4：反事实结果台账（沉淀旁路——实际臂 + 结果 + 备选臂估计；
+    //     未挂载零介入，不改变任何既有沉淀行为）
+    if (this.counterfactualLedger) {
+      const nodeTypeById = new Map(plan.nodes.map((n) => [n.id, n.type] as const));
+      for (const node of result.nodeResults) {
+        if (!node.modelId) continue;
+        this.noteCounterfactualOutcome(nodeTypeById.get(node.nodeId) ?? taskType, node, plan.nodes.length);
+      }
+    }
+
+    // 2.4 第三轮 A6 升级 5/6：洞察入账（同类合并计数）+ 沉淀条目命中计数
+    //     （未挂载零介入；decisionInsights 的成败、命中记忆的成败均按结果入账）
+    if (this.insightLedger || this.sedimentationScoring) {
+      const now = this.insightLedger?.clock() ?? this.sedimentationScoring!.clock();
+      for (const insight of params.decisionInsights ?? []) {
+        this.noteInsightHit(insight.taskType, insight.modelId, insight.success, now);
+      }
+      for (const semanticId of params.appliedMemoryIds?.semantic ?? []) {
+        this.noteInsightHit(taskType, semanticId, result.success, now);
+        this.noteSedimentationHit('semantic', semanticId, result.success);
+      }
+      for (const proceduralId of params.appliedMemoryIds?.procedural ?? []) {
+        this.noteInsightHit(taskType, proceduralId, result.success, now);
+        this.noteSedimentationHit('procedural', proceduralId, result.success);
+      }
+      for (const strategyId of params.appliedStrategies ?? []) {
+        this.noteSedimentationHit('strategy', strategyId, result.success);
+      }
+    }
+
     // 2.5 统计学习反思（2.0：校准闭环 + 反事实遗憾）
     if (params.decisionInsights && params.decisionInsights.length > 0) {
       this.updateCalibration(params.decisionInsights);
     }
     this.analyzeCounterfactualRegret(signal, plan, result);
+
+    // 2.6 第四轮 R4-A6 升级 3：失败知识库沉淀（同模式失败的结构化规避记忆；
+    //     未挂载零介入，不改变任何既有沉淀/教训行为）
+    if (!result.success && this.failureKnowledgeBase) {
+      this.captureFailureMode(taskType, plan, result);
+    }
 
     // 3. 策略应用反馈闭环：有效策略越用越强，无效策略自然淘汰
     for (const strategyId of params.appliedStrategies ?? []) {
@@ -225,12 +451,17 @@ export class Reflector implements IReflector {
 
     // 4. 失败 → 教训提取（异步，不阻塞主流程）；成功 → 经验蒸馏
     if (!result.success) {
-      void this.reflection.extractLesson({ signal, taskType, result, plan }).then((lesson) => {
-        if (lesson) {
-          this.broadcast({ type: 'lesson-extracted', lessonId: lesson.id, rootCause: lesson.rootCause, lesson: lesson.lesson });
-          this.config.onLesson?.(lesson);
-        }
-      });
+      void this.reflection
+        .extractLesson({ signal, taskType, result, plan })
+        .then((lesson) => {
+          if (lesson) {
+            this.broadcast({ type: 'lesson-extracted', lessonId: lesson.id, rootCause: lesson.rootCause, lesson: lesson.lesson });
+            this.config.onLesson?.(lesson);
+          }
+        })
+        .catch(() => {
+          /* 教训提取/回调失败静默（异步旁路，不产生未处理 rejection） */
+        });
     } else {
       const fresh = this.memory.distillExperience();
       if (fresh.length > 0) {
@@ -427,6 +658,564 @@ export class Reflector implements IReflector {
       beta: options?.beta ?? 5,
       retentionFloor: Math.min(0.99, Math.max(0.01, options?.retentionFloor ?? 0.4)),
     };
+  }
+
+  /**
+   * 70.0：挂载 PID 组合诊断（幂等覆盖，挂载即生效——只读分析口径）。
+   *
+   * 多模型组合的「暗结构」第一次可见：combinationPid() 把 (模型A观点,
+   * 模型B观点, 最终决策成败) 的经验联合分布做 BROJA 部分信息分解——
+   * 协同 C > 0 的组合 = 单独平庸、联合有效（16.0 Shapley 只会平分功劳，
+   * 看不见这类组合；应保留并优先编排）；冗余 R 主导 = 两路可相互替代
+   * （择一降频省预算）；独占 U 主导 = 预算倾斜给携带信息的那一路。
+   * Ω（O 信息）作为组合健康度的单一只读仪表。不改变任何反思/沉淀
+   * 路径（零漂移）。
+   */
+  attachPidDiagnostics(): void {
+    this.pidDiagnosticsEnabled = true;
+  }
+
+  /**
+   * 82.0：挂载众包聚合（幂等覆盖，挂载即生效——咨询口径）。
+   *
+   * N 个模型对同一判定各自报标签时从「人人一票」升级为 Dawid–Skene：
+   * truthPosterior 作为聚合判定输出，workerReliability 作为各模型的
+   * 信任票权（哪个模型在哪类问题上可信，EM 从投票记录里自己学出来——
+   * 对角塌陷 = 自动摘牌，无需人工规则）。影子计算零漂移。
+   */
+  attachCrowdAggregation(): void {
+    this.crowdAggregationEnabled = true;
+  }
+
+  /** 82.0：众包聚合旗标（未挂载零介入） */
+  private crowdAggregationEnabled?: boolean;
+
+  /** 82.0：多模型聚合读数（未挂载 / 记录非法时 undefined；truth 可选给两口径正确率对照） */
+  crowdVerdictOf(labels: CrowdsourcedLabels, truth?: ReadonlyArray<number>): CrowdVerdictView | undefined {
+    return this.crowdAggregationEnabled ? crowdVerdict(labels, truth) : undefined;
+  }
+
+  /**
+   * 90.0：挂载偏好学习账本（幂等覆盖，挂载即生效——影子学习口径）。
+   *
+   * 人工/用户反馈从「打分」改录为「偏好对」（notePreferencePair），
+   * 攒够窗口量后 bradleyTerryMLE 学出效用向量——RLHF-lite：不训练模型
+   * 权重，只学调度层的价值序（指标改版不作废历史：偏好对是不变的原始
+   * 证据）。前置体检（传递性 + 拟合优度）不通过时 usable=false——B-T
+   * 效用不可用于决策排序。影子学习零漂移。
+   */
+  attachPreferenceLearning(options?: { minPairs?: number; l2?: number }): void {
+    this.preferenceLedger = new PreferenceLedger(options);
+  }
+
+  /** 90.0：偏好账本（未挂载零介入） */
+  private preferenceLedger?: PreferenceLedger;
+
+  /** 90.0：回填一次偏好对（winner ≻ loser；挂载时由人工反馈通道调用） */
+  notePreferencePair(winnerId: string, loserId: string): void {
+    this.preferenceLedger?.note(winnerId, loserId);
+  }
+
+  /** 90.0：效用学习读数（未挂载 / 样本不足 / 前置体检未过时 usable=false 或 undefined） */
+  preferenceView(): PreferenceLedgerView | undefined {
+    return this.preferenceLedger?.view();
+  }
+
+  // ───────────────────── 第三轮 A6 升级 4：反事实结果台账（沉淀时记录备选方案臂估计） ─────────────────────
+
+  /**
+   * A6 升级 4：挂载反事实结果台账（幂等覆盖，挂载即生效——沉淀旁路口径）。
+   *
+   * reflectOnOutcome 沉淀经验的同时，为每个节点记录「实际臂 + 结果 +
+   * 备选臂估计」的反事实台账：备选臂估计 = 记忆库贝叶斯后验（证据门槛
+   * minSamples 与 2.0 反事实遗憾分析共用 counterfactualMinSamples 配置）。
+   * 台账两个下游：决策台账（审计）与 88.0 离线策略评估
+   * （counterfactualOpeDataset 产出 Episode[] + 行为策略 μ）——
+   * 「日志策略好不好」第一次有了可评估的离线数据面。
+   * 未挂载零漂移（不计算、不落账、不广播）。
+   *
+   * @param options.clock 注入时钟（确定性验证用；缺省 Date.now）
+   * @param options.maxEntries 环形容量（缺省 256）
+   * @param options.propensity 行为策略对实际臂的选择概率提供器（调度器
+   *        探索率桥接；缺省均匀 1/K）
+   */
+  attachCounterfactualLedger(options?: { clock?: () => number; maxEntries?: number; propensity?: () => number }): void {
+    this.counterfactualLedger = {
+      clock: options?.clock ?? (() => Date.now()),
+      maxEntries: Math.max(16, options?.maxEntries ?? 256),
+      propensity: options?.propensity,
+      records: [],
+    };
+  }
+
+  /** A6 升级 4：反事实台账状态（未挂载零介入） */
+  private counterfactualLedger?: {
+    clock: () => number;
+    maxEntries: number;
+    propensity?: () => number;
+    records: CounterfactualOutcomeRecord[];
+  };
+
+  /**
+   * A6 升级 4：沉淀一次节点的反事实臂记录（私有——reflectOnOutcome 沉淀旁路调用）。
+   *
+   * 备选臂 = 记忆库全部模型画像中该任务类型有效样本 ≥ minSamples 者
+   * （剔除实际臂）；实际臂恒入账（无后验时以本次实测为概率、samples=0
+   * 标注——诚实记录证据量）。选择概率缺省 1/K（无探索率桥接时的
+   * 无信息口径）。
+   */
+  private noteCounterfactualOutcome(
+    taskType: string,
+    node: { nodeId: string; modelId: string; quality: number; success: boolean },
+    candidateCount: number,
+  ): void {
+    const ledger = this.counterfactualLedger;
+    if (!ledger) return;
+    const minSamples = this.config.counterfactualMinSamples ?? 3;
+    const arms: CounterfactualArm[] = [];
+    // 实际臂：恒入账（估计缺失时以本次实测代替，samples=0）
+    const chosenEstimate = this.memory.getBayesianEstimate?.(node.modelId, taskType);
+    arms.push({
+      modelId: node.modelId,
+      estimatedProb: chosenEstimate ? chosenEstimate.posteriorMean : node.success ? 1 : 0,
+      wilsonLower: chosenEstimate?.wilsonLower ?? 0,
+      samples: chosenEstimate?.effectiveSamples ?? 0,
+      chosen: true,
+    });
+    // 备选臂：证据门槛过滤（与 analyzeCounterfactualRegret 同一 minSamples 口径）
+    for (const profile of this.memory.getAllModelProfiles()) {
+      if (profile.id === node.modelId) continue;
+      const est = this.memory.getBayesianEstimate?.(profile.id, taskType);
+      if (!est || est.effectiveSamples < minSamples) continue;
+      arms.push({
+        modelId: profile.id,
+        estimatedProb: est.posteriorMean,
+        wilsonLower: est.wilsonLower,
+        samples: est.effectiveSamples,
+        chosen: false,
+      });
+    }
+    const k = Math.max(candidateCount, arms.length);
+    const record: CounterfactualOutcomeRecord = {
+      at: ledger.clock(),
+      taskType,
+      nodeId: node.nodeId,
+      chosenModel: node.modelId,
+      outcome: node.success ? 1 : 0,
+      quality: node.quality,
+      arms,
+      chosenPropensity: Number((ledger.propensity?.() ?? 1 / k).toFixed(6)),
+    };
+    ledger.records.push(record);
+    if (ledger.records.length > ledger.maxEntries) ledger.records.shift();
+  }
+
+  /** A6 升级 4：反事实台账读取（新→旧；未挂载恒空） */
+  counterfactualRecords(limit = 32): CounterfactualOutcomeRecord[] {
+    return this.counterfactualLedger?.records.slice(-limit).reverse() ?? [];
+  }
+
+  /**
+   * A6 升级 4：把台账转成 88.0 OPE 可直接消费的数据集（未挂载 undefined）。
+   *
+   * - 动作索引：记忆库全部模型 id 排序后的全局稳定编号（跨记录可比）
+   * - 回报：节点成功 = 1 / 失败 = 0（终端单步轨迹）
+   * - 行为策略 μ：台账内各臂被实际选择的经验频率（混合了探索与贪心的
+   *   真实行为分布——IS 估计的合法口径）；逐条记录的 chosenPropensity
+   *   另存于台账本体（逐决策 IS 消费）
+   */
+  counterfactualOpeDataset(): { episodes: Episode[]; behavior: DiscretePolicy; armIndexByModel: Record<string, number> } | undefined {
+    const ledger = this.counterfactualLedger;
+    if (!ledger) return undefined;
+    const armIndexByModel: Record<string, number> = {};
+    [...this.memory.getAllModelProfiles().map((p) => p.id)]
+      .sort()
+      .forEach((id, i) => {
+        armIndexByModel[id] = i;
+      });
+    const numActions = Math.max(1, Object.keys(armIndexByModel).length);
+    const choiceCounts = new Array<number>(numActions).fill(0);
+    let total = 0;
+    const episodes: Episode[] = [];
+    for (const record of ledger.records) {
+      const action = armIndexByModel[record.chosenModel] ?? 0;
+      episodes.push({ states: [0, 1], actions: [action], rewards: [record.outcome] });
+      choiceCounts[action] += 1;
+      total += 1;
+    }
+    // 行为策略 = 经验选择频率（无记录时均匀）
+    const probs = choiceCounts.map((c) => (total > 0 ? c / total : 1 / numActions));
+    return { episodes, behavior: tabularPolicy([probs]), armIndexByModel };
+  }
+
+  // ───────────────────── 第三轮 A6 升级 5：洞察去重与衰减 + A6 升级 6：沉淀价值评分 ─────────────────────
+
+  /**
+   * A6 升级 5：挂载洞察账本（幂等覆盖，挂载即生效——沉淀旁路口径）。
+   *
+   * 每次复盘把「调度决策洞察 + 命中的记忆条目」按 key（taskType::subject）
+   * 合并计数（同类洞察不再重复开条），读取时按半衰期衰减：
+   *   effectiveScore = rawScore × 0.5^(ageDays / halfLifeDays)
+   * 有效分跌破 forgetThreshold 的洞察列为遗忘候选（对接 60.0 遗忘语义）。
+   * 未挂载零漂移。
+   *
+   * @param options.halfLifeDays 半衰期（缺省 30 天——与全层证据口径一致）
+   * @param options.forgetThreshold 遗忘候选阈值（缺省 0.1）
+   * @param options.maxEntries 账本容量（缺省 512；满时淘汰最久未更新者——同类合并计数使高频洞察不被误杀）
+   * @param options.clock 注入时钟（确定性验证用）
+   */
+  attachInsightLedger(options?: {
+    halfLifeDays?: number;
+    forgetThreshold?: number;
+    maxEntries?: number;
+    clock?: () => number;
+  }): void {
+    this.insightLedger = {
+      halfLifeDays: Math.max(0.5, options?.halfLifeDays ?? 30),
+      forgetThreshold: Math.max(0, Math.min(1, options?.forgetThreshold ?? 0.1)),
+      maxEntries: Math.max(16, options?.maxEntries ?? 512),
+      clock: options?.clock ?? (() => Date.now()),
+      entries: new Map(),
+    };
+  }
+
+  /** A6 升级 5：洞察账本状态（未挂载零介入） */
+  private insightLedger?: {
+    halfLifeDays: number;
+    forgetThreshold: number;
+    maxEntries: number;
+    clock: () => number;
+    entries: Map<string, { scope: string; subject: string; hits: number; successes: number; failures: number; firstSeenAt: number; lastSeenAt: number }>;
+  };
+
+  /**
+   * A6 升级 6（加分）：挂载沉淀价值评分（幂等覆盖，挂载即生效——计数旁路口径）。
+   *
+   * 复盘时对「本次命中的语义/程序/策略记忆」计数（历史命中频率先验），
+   * sedimentationValueView() 折算价值分并标注 forget-candidate——
+   * 从未被命中且长期闲置的沉淀条目第一次有了量化遗忘依据。
+   * 未挂载零漂移。
+   */
+  attachSedimentationScoring(options?: { halfLifeDays?: number; hitSaturation?: number; forgetThreshold?: number; clock?: () => number }): void {
+    this.sedimentationScoring = {
+      halfLifeDays: Math.max(0.5, options?.halfLifeDays ?? 30),
+      hitSaturation: Math.max(1, options?.hitSaturation ?? 10),
+      forgetThreshold: Math.max(0, Math.min(1, options?.forgetThreshold ?? 0.15)),
+      clock: options?.clock ?? (() => Date.now()),
+      hits: new Map(),
+    };
+  }
+
+  /** A6 升级 6：沉淀价值评分状态（未挂载零介入） */
+  private sedimentationScoring?: {
+    halfLifeDays: number;
+    hitSaturation: number;
+    forgetThreshold: number;
+    clock: () => number;
+    hits: Map<string, { hits: number; successes: number }>;
+  };
+
+  /** A6 升级 5/6 共用：一次洞察入账（同类合并计数；未挂载账本时零介入） */
+  private noteInsightHit(scope: string, subject: string, success: boolean, at: number): void {
+    const ledger = this.insightLedger;
+    if (!ledger) return;
+    const key = `${scope}::${subject}`;
+    const entry = ledger.entries.get(key) ?? { scope, subject, hits: 0, successes: 0, failures: 0, firstSeenAt: at, lastSeenAt: at };
+    entry.hits += 1;
+    if (success) entry.successes += 1;
+    else entry.failures += 1;
+    entry.lastSeenAt = at;
+    ledger.entries.set(key, entry);
+    // 容量淘汰：满时剔除最久未更新者（同类合并计数使高频洞察永不被误杀）
+    if (ledger.entries.size > ledger.maxEntries) {
+      let oldestKey = key;
+      let oldestAt = entry.lastSeenAt;
+      for (const [k, e] of ledger.entries) {
+        if (e.lastSeenAt < oldestAt) {
+          oldestAt = e.lastSeenAt;
+          oldestKey = k;
+        }
+      }
+      ledger.entries.delete(oldestKey);
+    }
+  }
+
+  /** A6 升级 6：沉淀条目命中计数（本地先验，含成败分解；未挂载零介入） */
+  private noteSedimentationHit(kind: SedimentationValueEntry['kind'], id: string, success: boolean): void {
+    if (!this.sedimentationScoring) return;
+    const key = `${kind}:${id}`;
+    const prev = this.sedimentationScoring.hits.get(key) ?? { hits: 0, successes: 0 };
+    prev.hits += 1;
+    if (success) prev.successes += 1;
+    this.sedimentationScoring.hits.set(key, prev);
+  }
+
+  /** A6 升级 5：洞察账本视图（衰减后排序 + 遗忘候选分离；未挂载 undefined） */
+  insightLedgerView(): InsightLedgerView | undefined {
+    const ledger = this.insightLedger;
+    if (!ledger) return undefined;
+    const now = ledger.clock();
+    const decayed: InsightLedgerEntry[] = [];
+    for (const [key, e] of ledger.entries) {
+      const ageDays = Math.max(0, (now - e.lastSeenAt) / 86_400_000);
+      const freshness = decayFactor(ageDays * 86_400_000, ledger.halfLifeDays);
+      const rawScore = e.hits > 0 ? e.successes / e.hits : 0;
+      decayed.push({
+        key,
+        scope: e.scope,
+        subject: e.subject,
+        hits: e.hits,
+        successes: e.successes,
+        failures: e.failures,
+        rawScore: Number(rawScore.toFixed(6)),
+        firstSeenAt: e.firstSeenAt,
+        lastSeenAt: e.lastSeenAt,
+        freshness: Number(freshness.toFixed(6)),
+        effectiveScore: Number((rawScore * freshness).toFixed(6)),
+      });
+    }
+    decayed.sort((a, b) => b.effectiveScore - a.effectiveScore);
+    return {
+      entries: decayed.filter((e) => e.effectiveScore >= ledger.forgetThreshold),
+      forgetCandidates: decayed.filter((e) => e.effectiveScore < ledger.forgetThreshold),
+      maxEntries: ledger.maxEntries,
+    };
+  }
+
+  /** A6 升级 6：沉淀价值评分视图（历史命中频率先验 + 遗忘候选标注；未挂载 undefined） */
+  sedimentationValueView(): SedimentationValueEntry[] | undefined {
+    const scoring = this.sedimentationScoring;
+    if (!scoring) return undefined;
+    const now = scoring.clock();
+    const entries: SedimentationValueEntry[] = [];
+    const evaluate = (
+      kind: SedimentationValueEntry['kind'],
+      id: string,
+      appliedTotal: number,
+      appliedSuccesses: number,
+      lastActiveAt: number,
+    ): void => {
+      const local = scoring.hits.get(`${kind}:${id}`) ?? { hits: 0, successes: 0 };
+      const hits = appliedTotal + local.hits;
+      const successes = Math.min(appliedSuccesses + local.successes, hits);
+      const successRate = hits > 0 ? successes / hits : 0;
+      const daysIdle = Math.max(0, (now - lastActiveAt) / 86_400_000);
+      const freshness = decayFactor(daysIdle * 86_400_000, scoring.halfLifeDays);
+      const value = (Math.log(1 + hits) / Math.log(1 + scoring.hitSaturation)) * successRate * freshness;
+      entries.push({
+        kind,
+        id,
+        hits,
+        successes,
+        successRate: Number(successRate.toFixed(6)),
+        daysIdle: Number(daysIdle.toFixed(6)),
+        value: Number(value.toFixed(6)),
+        recommendation: value < scoring.forgetThreshold ? 'forget-candidate' : 'retain',
+      });
+    };
+    for (const m of this.memory.getAllSemanticMemories()) {
+      evaluate('semantic', m.id, m.appliedTotal, m.appliedSuccesses, m.lastAppliedAt ?? m.distilledAt);
+    }
+    for (const p of this.memory.getAllProceduralMemories()) {
+      evaluate('procedural', p.id, p.appliedTotal, p.appliedSuccesses, p.lastAppliedAt ?? p.distilledAt);
+    }
+    for (const s of this.memory.getAllStrategies()) {
+      evaluate('strategy', s.id, s.appliedTotal, s.appliedSuccesses, s.lastAppliedAt ?? s.distilledAt);
+    }
+    return entries.sort((a, b) => b.value - a.value);
+  }
+
+  // ───────────────────── 第四轮模块域升级 R4-A6：失败知识库 ─────────────────────
+
+  /**
+   * R4-A6 升级 3：挂载失败知识库（幂等覆盖，挂载即生效）。
+   *
+   * 失败不再只是「记录 + 异步教训」——每次失败复盘同步沉淀结构化失败
+   * 模式：**失败模式特征（根因 × 错误类目 × 失败节点类型）+ 触发条件 +
+   * 规避动作**。同签名重复失败合并计数（occurrences 累加，规避动作随
+   * 重复升级：超时首次建议调参、第二次起建议直接规避涉事模型）。
+   *
+   * 检索端（avoidanceAdvice）：计划下发前按任务类型（+ 可选失败节点类型 /
+   * 错误线索）检索命中条目作为「规避建议」随计划下发——同模式二次失败
+   * 时调度层第一次能在**事前**绕开已知坑（旧口径只有事后教训）。
+   * 采纳回填（noteAvoidanceAdopted）：规避建议被采纳后的任务成败回写，
+   * effectiveness = 采纳后成功率——规避有效性有了实测证据。
+   *
+   * 未挂载零漂移（不沉淀、不检索、不回填）。
+   *
+   * @param options.clock 注入时钟（确定性验证用；缺省 Date.now）
+   * @param options.maxEntries 容量上限（缺省 128；满时淘汰 occurrences 最低且最久未见者）
+   * @param options.minOccurrences 检索输出的最低出现次数（缺省 1——首次沉淀即可被检索）
+   */
+  attachFailureKnowledgeBase(options?: { clock?: () => number; maxEntries?: number; minOccurrences?: number }): void {
+    this.failureKnowledgeBase = {
+      clock: options?.clock ?? (() => Date.now()),
+      maxEntries: Math.max(8, options?.maxEntries ?? 128),
+      minOccurrences: Math.max(1, options?.minOccurrences ?? 1),
+      entries: new Map(),
+    };
+  }
+
+  /** R4-A6 升级 3：失败知识库状态（未挂载零介入） */
+  private failureKnowledgeBase?: {
+    clock: () => number;
+    maxEntries: number;
+    minOccurrences: number;
+    entries: Map<string, FailureModeEntry>;
+  };
+
+  /**
+   * R4-A6 升级 3：失败模式沉淀（私有——reflectOnOutcome 失败分支旁路调用）。
+   *
+   * 同签名（taskType × rootCause × failedNodeType）合并计数；规避动作按
+   * 根因 + 重复次数确定性推导：
+   * - timeout：首次 → 放大超时（param-tune ×2）；≥ 2 次 → 规避涉事模型
+   * - model-capability（质量不足）：规避涉事模型（能力不足换模型才有意义）
+   * - dependency：上游校验（param-tune verifyUpstream）
+   * - transient：有限重试（param-tune maxRetries 2）
+   */
+  private captureFailureMode(taskType: string, plan: ExecutionPlan, result: PlanExecutionResult): void {
+    const kb = this.failureKnowledgeBase;
+    if (!kb) return;
+    const failed = result.nodeResults.find((r) => !r.success);
+    if (!failed) return;
+    const now = kb.clock();
+    const failedNodeType = plan.nodes.find((n) => n.id === failed.nodeId)?.type ?? taskType;
+    const { errorCategory, rootCause } = classifyFailureText(failed.error);
+    const signature = `${taskType}::${rootCause}::${failedNodeType}`;
+    const id = this.stableId('fkb', signature);
+
+    let entry = kb.entries.get(id);
+    if (!entry) {
+      entry = {
+        id,
+        taskType,
+        signature,
+        rootCause,
+        errorCategory,
+        failedNodeType,
+        implicatedModels: [],
+        triggers: [
+          { dimension: 'task-type', operator: 'eq', value: taskType },
+          { dimension: 'root-cause', operator: 'eq', value: rootCause },
+        ],
+        avoidance: { type: 'param-tune', params: {}, rationale: '' },
+        occurrences: 0,
+        avoidanceAdopted: 0,
+        avoidanceSuccesses: 0,
+        firstSeenAt: now,
+        lastSeenAt: now,
+      };
+      kb.entries.set(id, entry);
+    }
+    entry.occurrences += 1;
+    entry.errorCategory = errorCategory;
+    entry.lastSeenAt = now;
+    if (failed.modelId && !entry.implicatedModels.includes(failed.modelId)) entry.implicatedModels.push(failed.modelId);
+    entry.avoidance = deriveAvoidanceAction(entry, failed.modelId);
+
+    // 容量淘汰：满时剔除 occurrences 最低且最久未见者（高频失败模式永不被误杀）
+    // ——数值比较：occurrences 是数字，字符串拼接比较会把 10 次的模式排在
+    // 9 次之前（"10::…" < "9::…" 字典序）而误杀高频模式
+    if (kb.entries.size > kb.maxEntries) {
+      let victimId = id;
+      let victimOccurrences = entry.occurrences;
+      let victimLastSeen = entry.lastSeenAt;
+      for (const [eid, e] of kb.entries) {
+        if (e.occurrences < victimOccurrences || (e.occurrences === victimOccurrences && e.lastSeenAt < victimLastSeen)) {
+          victimOccurrences = e.occurrences;
+          victimLastSeen = e.lastSeenAt;
+          victimId = eid;
+        }
+      }
+      kb.entries.delete(victimId);
+    }
+
+    this.broadcast({ type: 'failure-mode-captured', entryId: id, signature, occurrences: entry.occurrences, avoidance: entry.avoidance.type });
+  }
+
+  /**
+   * R4-A6 升级 3：规避建议检索（计划下发前的失败知识消费；未挂载 undefined）。
+   *
+   * @param taskType 任务类型（必匹配——失败模式的作用域）
+   * @param context.failedNodeType 失败节点类型（给定且匹配 → matchScore +0.2）
+   * @param context.errorHint 错误线索文本（分类后与条目根因匹配 → matchScore +0.2）
+   * @param limit 输出上限（缺省 3；按 occurrences × matchScore 降序）
+   */
+  avoidanceAdvice(
+    taskType: string,
+    context?: { failedNodeType?: string; errorHint?: string },
+    limit = 3,
+  ): AvoidanceAdvice[] | undefined {
+    const kb = this.failureKnowledgeBase;
+    if (!kb) return undefined;
+    const hintCause = context?.errorHint !== undefined ? classifyFailureText(context.errorHint).rootCause : undefined;
+    const advices: AvoidanceAdvice[] = [];
+    for (const entry of kb.entries.values()) {
+      if (entry.taskType !== taskType) continue;
+      if (entry.occurrences < kb.minOccurrences) continue;
+      const nodeTypeMatch = context?.failedNodeType !== undefined && context.failedNodeType === entry.failedNodeType;
+      const hintMatch = hintCause !== undefined && hintCause === entry.rootCause;
+      const matchScore = Math.min(1, 0.6 + (nodeTypeMatch ? 0.2 : 0) + (hintMatch ? 0.2 : 0));
+      advices.push({
+        entryId: entry.id,
+        taskType: entry.taskType,
+        signature: entry.signature,
+        rootCause: entry.rootCause,
+        errorCategory: entry.errorCategory,
+        avoidance: entry.avoidance,
+        occurrences: entry.occurrences,
+        matchScore: Number(matchScore.toFixed(6)),
+        ...(entry.avoidanceAdopted > 0 ? { effectiveness: Number((entry.avoidanceSuccesses / entry.avoidanceAdopted).toFixed(6)) } : {}),
+        rationale: `${entry.taskType} 已在该模式失败 ${entry.occurrences} 次（${entry.rootCause}@${entry.failedNodeType}${entry.implicatedModels.length > 0 ? `，涉事 ${entry.implicatedModels.join('/')}` : ''}）：${entry.avoidance.rationale}`,
+      });
+    }
+    return advices
+      .sort((a, b) => b.occurrences * b.matchScore - a.occurrences * a.matchScore || (a.entryId < b.entryId ? -1 : 1))
+      .slice(0, Math.max(1, limit));
+  }
+
+  /**
+   * R4-A6 升级 3：规避建议采纳回填（编排层在采纳建议的任务结算后调用）。
+   *
+   * 采纳后成功 → avoidanceSuccesses++：规避有效性（effectiveness）从
+   * 建议本身长出来——「同模式二次失败的建议采纳后确实成功了」第一次
+   * 有了实测证据链。未挂载空操作。
+   */
+  noteAvoidanceAdopted(entryId: string, success: boolean): void {
+    const kb = this.failureKnowledgeBase;
+    if (!kb) return;
+    const entry = kb.entries.get(entryId);
+    if (!entry) return;
+    entry.avoidanceAdopted += 1;
+    if (success) entry.avoidanceSuccesses += 1;
+  }
+
+  /** R4-A6 升级 3：失败知识库视图（按 occurrences 降序；未挂载 undefined） */
+  failureKnowledgeView(): FailureModeEntry[] | undefined {
+    const kb = this.failureKnowledgeBase;
+    if (!kb) return undefined;
+    return [...kb.entries.values()]
+      .sort((a, b) => b.occurrences - a.occurrences || (a.id < b.id ? -1 : 1))
+      .map((e) => ({ ...e, implicatedModels: [...e.implicatedModels] }));
+  }
+
+  /** 70.0：PID 挂载标志（未挂载零介入） */
+  private pidDiagnosticsEnabled = false;
+
+  /**
+   * 70.0：组合 PID 分解（未挂载返回 undefined）。
+   * @param joint p(x₁,x₂,s) 三维联合分布表（内层 = 决策成败维度）
+   */
+  combinationPid(
+    joint: ReadonlyArray<ReadonlyArray<ReadonlyArray<number>>>,
+  ): { pid: PidReport; oInformation?: OInfoReport } | undefined {
+    if (!this.pidDiagnosticsEnabled) return undefined;
+    try {
+      return { pid: pidFromJoint(joint), oInformation: oInformation(joint as never) };
+    } catch {
+      return undefined; // 联合表规格非法 → 诚实降级
+    }
   }
 
   /** 37.0：最近一次瓶颈定价读数（未挂载/未评估时 undefined） */
@@ -955,4 +1744,60 @@ export class Reflector implements IReflector {
 /** 任务指纹（taskType + complexity 分档，同步变更登记的稳定键） */
 function fingerprintOf(taskType: string, complexity: number): string {
   return crypto.createHash('sha256').update(`${taskType}:${Math.round(complexity * 10)}`).digest('hex').slice(0, 16);
+}
+
+// ───────────────────── 第四轮 R4-A6 失败知识库的文件级工具（确定性） ─────────────────────
+
+/**
+ * 失败文本 → 错误类目 + 根因（与反思引擎规则化兜底同口径的关键词分类；
+ * 确定性、零依赖——失败知识库的同步沉淀不能等异步教训提取）
+ */
+function classifyFailureText(error: string | undefined): { errorCategory: FailureErrorCategory; rootCause: FailureModeEntry['rootCause'] } {
+  const err = (error ?? '').toLowerCase();
+  if (err.includes('超时') || err.includes('timeout')) return { errorCategory: 'timeout', rootCause: 'timeout' };
+  if (err.includes('质量不达标') || err.includes('质量不足')) return { errorCategory: 'quality', rootCause: 'model-capability' };
+  if (err.includes('依赖')) return { errorCategory: 'dependency', rootCause: 'dependency' };
+  return { errorCategory: 'transient', rootCause: 'transient' };
+}
+
+/** 规避动作推导（根因 × 重复次数——确定性规则；超时二次起升级为规避模型） */
+function deriveAvoidanceAction(entry: FailureModeEntry, failedModelId: string | undefined): ProceduralAction {
+  switch (entry.rootCause) {
+    case 'timeout':
+      return entry.occurrences >= 2 && failedModelId
+        ? {
+            type: 'avoid-model',
+            params: { model: failedModelId },
+            rationale: `${entry.taskType} 在 ${failedModelId} 上累计 ${entry.occurrences} 次超时——调参救不了，直接规避该模型`,
+          }
+        : {
+            type: 'param-tune',
+            params: { param: 'timeoutMultiplier', value: 2 },
+            rationale: `${entry.taskType} 首次超时——节点超时上限放大 2 倍再观察`,
+          };
+    case 'model-capability':
+      return failedModelId
+        ? {
+            type: 'avoid-model',
+            params: { model: failedModelId },
+            rationale: `${failedModelId} 对 ${entry.taskType} 质量不足（能力短板非瞬时故障）——换能力更强的模型`,
+          }
+        : {
+            type: 'param-tune',
+            params: { param: 'maxRetries', value: 2 },
+            rationale: `${entry.taskType} 质量不足且涉事模型未知——有限重试后升级人工`,
+          };
+    case 'dependency':
+      return {
+        type: 'param-tune',
+        params: { param: 'verifyUpstream', value: true },
+        rationale: '上游产出质量亏空传导——下游执行前先校验上游产物',
+      };
+    default:
+      return {
+        type: 'param-tune',
+        params: { param: 'maxRetries', value: 2 },
+        rationale: '瞬时故障——有限重试（超过 2 次仍失败再深挖根因）',
+      };
+  }
 }

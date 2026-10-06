@@ -22,6 +22,36 @@
  *   域内随机必须只消费传入的 rng。
  *
  * 零漂移: 未挂载时一切路径与升级前逐位一致。
+ *
+ * ── R5 第五轮世界性进化（四轴）──
+ *
+ * A1【数学进化】PUCT 选择规则（AlphaZero 式先验上置信界，Rosin 2011
+ *    / Silver et al. 2017 谱系）：exploration='puct' 时选择分改为
+ *        Q(s,a) + c_puct · P(a|s) · √N(s) / (1 + N(s,a))
+ *    P(a|s) 由域的可选 priors() 提供并归一化（缺省均匀）——探索预算
+ *    按先验比例分配，N(s,a)→∞ 时先验项消失（与 UCB1 同为渐近一致：
+ *    每个子节点访问数 →∞，利用项主导）。未提供 priors 且均匀分布下
+ *    PUCT 仍是良定义的 UCB1 变体（√N/(1+N) 与 √(ln N/N) 同阶）。
+ *    缺省 'ucb1'——既有行为逐位不动（零漂移）。
+ *
+ * A2【性能进化】子树重用（subtree reuse）：
+ *    · advance(action)：执行根动作后把对应子树提升为新根（兄弟子树
+ *      丢弃、全子树深度重定基 −1、新根入边奖励清零）——已搜出的
+ *      后续着法知识跨决策步保留；
+ *    · search(root, budget, { reuseSubtree: true })：同根续算时统计量
+ *      （visits/valueSum/树）原样延续，迭代预算**增量**叠加——任意
+ *      时刻性的「读出不打断积累」。续算轮的随机流用 (seed ⊕ runIndex
+ *      常数) 派生种子——增量进化不复读旧样本（首轮种子不变，零漂移）。
+ *
+ * A3【数值稳健】PUCT 分母 (1 + N(s,a)) ≥ 1 恒正（除零护栏由构造
+ *    保证）；Q 项除法仅在 visits > 0 分支执行（零访问子节点走 +∞
+ *    先展开通道，与 UCB1 同护栏）；priors 负值/非有限值显式 throw。
+ *
+ * A4【性质测试】① 确定性：同 (seed, domain, budget) 两次运行逐位
+ *    一致（含 puct/重用路径，≥200 种子）；② 收敛：Bernoulli 臂域上
+ *    PUCT 与 UCB1 均收敛到真最优臂；③ 重用不变量：续算后根 visits
+ *    = 各轮迭代数之和、树节点数单调不降；advance 后主变化线连贯
+ *    （verify-r5-planning.mjs）。
  */
 
 /** 确定性 PRNG（mulberry32） */
@@ -47,6 +77,13 @@ export interface MctsDomain {
    * @returns 后继状态、即时奖励 r（建议 [0,1] 口径）、是否终局
    */
   step(state: string, action: string, rng: () => number): { state: string; reward: number; terminal: boolean };
+  /**
+   * R5 可选：状态处动作先验分布 P(a|s)（PUCT 的先验项来源）。
+   * 返回 Map/Record（值需为有限非负数；在 actions(state) 上归一化，
+   * 未列出的动作先验为 0；总和为 0 时回退均匀）；无先验知识返回
+   * undefined（均匀）。不实现此方法 = 均匀先验（缺省）。
+   */
+  priors?(state: string): ReadonlyMap<string, number> | Readonly<Record<string, number>> | undefined;
 }
 
 export interface UctConfig {
@@ -62,6 +99,10 @@ export interface UctConfig {
   progressiveWidenK: number;
   /** 渐进加宽指数 κ ∈ (0,1]（缺省 0.5） */
   progressiveWidenKappa: number;
+  /** R5：选择规则（缺省 'ucb1'——零漂移；'puct' 启用 AlphaZero 式 PUCT） */
+  exploration: 'ucb1' | 'puct';
+  /** R5：PUCT c_puct 系数（仅 exploration='puct' 生效；缺省 1.25） */
+  puctC: number;
 }
 
 export const DEFAULT_UCT_CONFIG: UctConfig = {
@@ -71,6 +112,8 @@ export const DEFAULT_UCT_CONFIG: UctConfig = {
   seed: 20260920,
   progressiveWidenK: 0,
   progressiveWidenKappa: 0.5,
+  exploration: 'ucb1',
+  puctC: 1.25,
 };
 
 interface MctsNode {
@@ -88,6 +131,8 @@ interface MctsNode {
   valueSum: number;
   terminal: boolean;
   depth: number;
+  /** R5：本节点各动作的归一化先验（PUCT 时惰性构建；null = 均匀口径） */
+  priors: Map<string, number> | null;
 }
 
 export interface MctsChildStat {
@@ -113,13 +158,19 @@ export interface MctsResult {
 
 /**
  * UCT 搜索器。bind(domain) 后可反复 search()（每次为独立完整运行，
- * 种子重置——同一预算逐位可复现）。
+ * 种子重置——同一预算逐位可复现）。R5：advance + reuseSubtree 支持
+ * 跨决策步的子树重用（统计量延续，见文件头 A2）。
  */
 export class UctSearch {
   private config: UctConfig;
   private domain: MctsDomain | undefined;
   private rng: () => number = mulberry32(1);
   private nodeCount = 0;
+  /** R5：上次 search 的根（advance/reuseSubtree 的载体） */
+  private lastRoot: MctsNode | null = null;
+  private lastRootState: string | null = null;
+  /** R5：续算轮序号（随机流派生用；独立运行恒 0） */
+  private reuseRunIndex = 0;
 
   constructor(config?: Partial<UctConfig>, domain?: MctsDomain) {
     // 仅合并未定义键（显式 undefined 不得覆盖缺省值——否则 UCB 系数变 NaN）
@@ -127,10 +178,16 @@ export class UctSearch {
     if (config) {
       for (const key of Object.keys(config) as Array<keyof UctConfig>) {
         const v = config[key];
-        if (v !== undefined) this.config[key] = v;
+        if (v !== undefined) (this.config as unknown as Record<string, unknown>)[key] = v;
       }
     }
     this.domain = domain;
+    if (this.config.exploration !== 'ucb1' && this.config.exploration !== 'puct') {
+      throw new Error(`UctSearch: exploration 需为 'ucb1' | 'puct'（收到 ${String(this.config.exploration)}）`);
+    }
+    if (!Number.isFinite(this.config.puctC) || this.config.puctC < 0) {
+      throw new Error(`UctSearch: puctC 需为非负有限数（收到 ${String(this.config.puctC)}）`);
+    }
   }
 
   /** 绑定/替换搜索域 */
@@ -139,26 +196,67 @@ export class UctSearch {
     return this;
   }
 
-  search(root: string, budget: { iterations?: number; timeMs?: number } = {}): MctsResult {
+  /**
+   * R5：执行根动作后的子树提升——对应子树成为新根（兄弟丢弃、深度
+   * 重定基 −1、新根入边奖励/动作清零），已积累的 visits/valueSum/树
+   * 结构原样保留。返回 false = 无可提升子树（该动作未展开过/无历史根）。
+   */
+  advance(action: string): boolean {
+    if (this.lastRoot === null || typeof action !== 'string') return false;
+    const child = this.lastRoot.children.get(action);
+    if (child === undefined) return false;
+    // 深度重定基：显式栈遍历（避免深树递归爆栈），全子树 depth −1
+    const stack: MctsNode[] = [child];
+    while (stack.length > 0) {
+      const node = stack.pop()!;
+      node.depth -= 1;
+      for (const c of node.children.values()) stack.push(c);
+    }
+    child.parent = null;
+    child.action = null;
+    child.incomingReward = 0;
+    this.lastRoot = child;
+    this.lastRootState = child.state;
+    return true;
+  }
+
+  search(root: string, budget: { iterations?: number; timeMs?: number } = {}, options: { reuseSubtree?: boolean } = {}): MctsResult {
     if (!this.domain) throw new Error('UctSearch: search 前必须 bind(domain)');
     const iterations = Math.max(1, budget.iterations ?? 400);
     const deadline = budget.timeMs !== undefined ? Date.now() + budget.timeMs : Number.POSITIVE_INFINITY;
-    this.rng = mulberry32(this.config.seed);
-    this.nodeCount = 1;
+    const canReuse =
+      options.reuseSubtree === true && this.lastRoot !== null && this.lastRootState === root;
+    if (canReuse) {
+      // 续算轮：随机流按轮序派生（seed ⊕ runIndex·黄金比常数——增量
+      // 进化不复读旧样本）；首轮（runIndex=0）与独立运行同种子
+      this.rng = mulberry32((this.config.seed + Math.imul(this.reuseRunIndex, 0x9e3779b9)) >>> 0);
+      this.reuseRunIndex += 1;
+      // nodeCount 延续（树上统计量与节点数都属「已付成本」）
+    } else {
+      this.rng = mulberry32(this.config.seed);
+      this.reuseRunIndex = 0;
+      this.nodeCount = 1;
+    }
 
-    const rootNode: MctsNode = {
-      state: root,
-      parent: null,
-      action: null,
-      incomingReward: 0,
-      children: new Map(),
-      untried: [...this.domain.actions(root)],
-      visits: 0,
-      valueSum: 0,
-      terminal: false,
-      depth: 0,
-    };
-    rootNode.terminal = rootNode.untried.length === 0;
+    let rootNode: MctsNode;
+    if (canReuse && this.lastRoot !== null) {
+      rootNode = this.lastRoot;
+    } else {
+      rootNode = {
+        state: root,
+        parent: null,
+        action: null,
+        incomingReward: 0,
+        children: new Map(),
+        untried: [...this.domain.actions(root)],
+        visits: 0,
+        valueSum: 0,
+        terminal: false,
+        depth: 0,
+        priors: null,
+      };
+      rootNode.terminal = rootNode.untried.length === 0;
+    }
 
     let done = 0;
     for (; done < iterations; done += 1) {
@@ -169,7 +267,7 @@ export class UctSearch {
     const children: MctsChildStat[] = [...rootNode.children.values()]
       .map((c) => ({ action: c.action!, visits: c.visits, meanValue: c.visits > 0 ? c.valueSum / c.visits : 0 }))
       .sort((a, b) => b.visits - a.visits || b.meanValue - a.meanValue);
-    return {
+    const result: MctsResult = {
       bestAction: children[0]?.action,
       rootValue: rootNode.visits > 0 ? rootNode.valueSum / rootNode.visits : 0,
       iterations: done,
@@ -177,6 +275,9 @@ export class UctSearch {
       children,
       principalVariation: this.extractPv(rootNode),
     };
+    this.lastRoot = rootNode;
+    this.lastRootState = root;
+    return result;
   }
 
   // ─────────────────────────── 单次迭代四阶段 ───────────────────────────
@@ -222,6 +323,7 @@ export class UctSearch {
         valueSum: 0,
         terminal: transition.terminal,
         depth: node.depth + 1,
+        priors: null,
       };
       this.nodeCount += 1;
       node.children.set(action, child);
@@ -253,21 +355,75 @@ export class UctSearch {
     }
   }
 
-  /** UCB1 选择（访问数 0 的子节点视为 +∞——必先展开） */
+  /**
+   * 选择规则（访问数 0 的子节点视为 +∞——必先展开）：
+   * · ucb1（缺省）: Q + c·√(ln N(s) / N(s,a))；
+   * · puct（R5）:    Q + c_puct·P(a|s)·√N(s)/(1+N(s,a))——分母 ≥ 1
+   *   恒正（除零护栏由构造保证），先验项随 N(s,a)→∞ 消失。
+   */
   private selectUcb(node: MctsNode): MctsNode {
     const logN = Math.log(Math.max(1, node.visits));
+    const sqrtN = Math.sqrt(Math.max(1, node.visits));
+    const puct = this.config.exploration === 'puct';
+    const priors = puct ? this.priorsAt(node) : null;
     let best: MctsNode | undefined;
     let bestScore = Number.NEGATIVE_INFINITY;
     for (const child of node.children.values()) {
       const score = child.visits === 0
         ? Number.POSITIVE_INFINITY
-        : child.valueSum / child.visits + this.config.explorationC * Math.sqrt(logN / child.visits);
+        : puct
+          ? child.valueSum / child.visits + (this.config.puctC * (priors?.get(child.action!) ?? 0) * sqrtN) / (1 + child.visits)
+          : child.valueSum / child.visits + this.config.explorationC * Math.sqrt(logN / child.visits);
       if (score > bestScore) {
         bestScore = score;
         best = child;
       }
     }
     return best!;
+  }
+
+  /**
+   * R5：节点处动作先验（惰性构建并缓存在 node.priors）。来源
+   * domain.priors(state)，在「全部动作」（不只剩余未试）上归一化；
+   * 无先验/总和为 0 → 均匀分布。负值/非有限值 = 契约破坏，显式 throw。
+   */
+  private priorsAt(node: MctsNode): Map<string, number> | null {
+    if (node.priors !== null) return node.priors;
+    const actions = node.terminal ? [] : this.domain!.actions(node.state);
+    if (actions.length === 0) {
+      node.priors = new Map();
+      return node.priors;
+    }
+    let raw: ReadonlyMap<string, number> | Readonly<Record<string, number>> | undefined;
+    try {
+      raw = this.domain!.priors?.(node.state);
+    } catch (err) {
+      throw new Error(`UctSearch: domain.priors("${node.state}") 抛出异常（${err instanceof Error ? err.message : String(err)}）`);
+    }
+    let result: Map<string, number> | null = null;
+    if (raw !== undefined && raw !== null) {
+      const entries: Array<[string, number]> =
+        raw instanceof Map ? [...raw.entries()] : Object.entries(raw as Readonly<Record<string, number>>);
+      let sum = 0;
+      for (const [a, p] of entries) {
+        if (typeof p !== 'number' || !Number.isFinite(p) || p < 0) {
+          throw new Error(`UctSearch: domain.priors("${node.state}") 中动作 "${a}" 的先验 ${String(p)} 需为非负有限数`);
+        }
+        sum += p;
+      }
+      if (sum > 0) {
+        result = new Map();
+        for (const a of actions) result.set(a, 0);
+        for (const [a, p] of entries) if (result.has(a)) result.set(a, p / sum);
+      }
+    }
+    if (result === null) {
+      // 均匀（缺省口径）
+      result = new Map();
+      for (const a of actions) result.set(a, 1 / actions.length);
+    }
+    node.priors = result;
+    return node.priors;
   }
 
   /** 随机 rollout：深度上限内均匀选动作，收集折扣回报（从该节点视角） */

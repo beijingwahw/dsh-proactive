@@ -17,17 +17,31 @@
  * 设计要点：
  * - 好奇心产出的探索目标经 goalEngine 注入哨兵执行，与自主闭环无缝衔接
  * - 探索预算与健康度联动，保证探索行为始终在安全边界内
+ * - 第三轮升级（69.0 盲区定向，缺省零漂移）：挂载 MapperBlindSpot
+ *   视图后，探索从「随机 + 经典好奇分」升级为拓扑盲区定向——预算优先
+ *   流向经验地形的稀疏带 / 边界前沿 / 孤岛（未挂载 → 逐位不变）
+ * - 第四轮升级（探索-利用预算自动平衡，缺省零漂移）：挂载
+ *   attachAdaptiveExploration 后，探索预算比例按「近期探索回报率」
+ *   EWMA 自动调节——回报高多拨（比例向 maxRatio 扩张）、连续无收获
+ *   收紧（比例向 minRatio 收缩）；零样本时有效比例恰等于基础比例
+ *   （挂载即零漂移），探索的预算第一次有了收益率反馈环
  */
 
 import { coverageFromTokens, lazyGreedy } from './core/submodular.js';
 import { fairDomainBudget } from './core/fair-division.js';
+// 创世纪 59.0：探索难度课程（掌握门限爬阶）
+import { ExplorationCurriculum } from './engines-frontier/genesis25.js';
+
+// 第二轮创世纪 91.0：新奇搜索（探索预算向行为空间空白定向——与 76.0 互补：
+// 91 生成侧搜新奇，76 评价侧判新奇）
+import { noveltyDirectionProbe, type NoveltyDirectionView } from './engines-frontier/autonomy25.js';
 
 /** 知识盲区候选 */
 export interface KnowledgeGap {
   /** 任务类型 */
   taskType: string;
   /** 盲区成因 */
-  reason: 'unexplored' | 'low-experience' | 'high-failure';
+  reason: 'unexplored' | 'low-experience' | 'high-failure' | 'topological';
   /** 接触次数（外部信号到达次数） */
   exposureCount: number;
   /** 已有成功经验数 */
@@ -36,6 +50,22 @@ export interface KnowledgeGap {
   explorationCount: number;
   /** 新颖度评分 0~1（越高越值得探索） */
   noveltyScore: number;
+}
+
+/**
+ * 69.0 Mapper 拓扑盲区视图（盲区定向好奇的只读输入）。
+ *
+ * 结构兼容 world-model.experienceMapperView() 的图口径：nodes 的成员
+ * 直接以任务类型标签给出（视图提供方负责映射），edges 为节点邻接。
+ * 引擎侧从拓扑计算三轴盲区信号：节点稀疏（成员少 = 经验空白带）、
+ * 边界前沿（度数低 = 经验大陆的边缘）、孤岛断裂（分量小 = 与主经验
+ * 大陆失连的知识岛）。
+ */
+export interface MapperBlindSpotView {
+  /** Mapper 节点（members = 该节点覆盖的任务类型） */
+  nodes: ReadonlyArray<{ members: ReadonlyArray<string> }>;
+  /** 节点邻接边（下标对） */
+  edges: ReadonlyArray<readonly [number, number]>;
 }
 
 /** 探索任务建议 */
@@ -103,6 +133,37 @@ export const DEFAULT_CURIOSITY_CONFIG: CuriosityEngineConfig = {
   noveltyExposureWeight: 0.3,
   noveltyScarcityWeight: 0.2,
 };
+
+/**
+ * 第四轮升级：探索-利用预算自动平衡配置（attachAdaptiveExploration）。
+ * 有效探索比例 = minRatio + (maxRatio − minRatio) × 回报率 EWMA——
+ * 挂载时 EWMA 初值取 (基础比例 − minRatio)/(maxRatio − minRatio)，
+ * 故零样本有效比例恰等于 explorationBudgetRatio（挂载即零漂移）。
+ */
+export interface AdaptiveExplorationOptions {
+  /** 有效比例下限（缺省 max(0.05, 基础比例/2)，钳位 (0, 基础比例]） */
+  minRatio?: number;
+  /** 有效比例上限（缺省 min(1, 基础比例×1.5)，钳位 [基础比例, 1]） */
+  maxRatio?: number;
+  /** 回报率 EWMA 平滑系数（缺省 0.4；越大近期样本权重越高） */
+  alpha?: number;
+}
+
+/** 探索-利用预算自动平衡遥测（adaptiveExplorationView 读数） */
+export interface AdaptiveExplorationTelemetry {
+  /** 基础比例（配置口径 explorationBudgetRatio） */
+  baseRatio: number;
+  minRatio: number;
+  maxRatio: number;
+  /** 近期探索回报率 EWMA（gainedKnowledge 0/1 流的指数加权均值） */
+  yieldEwma: number;
+  /** 当前有效探索比例（预算计算的实际取用值） */
+  effectiveRatio: number;
+  /** 已喂入 EWMA 的探索样本数 */
+  samples: number;
+  /** 最近一次样本后的走向（expand = 扩张 / tighten = 收紧 / steady = 持平） */
+  trend: 'expand' | 'steady' | 'tighten';
+}
 
 /** 知识状态提供器（由 index.ts 桥接长期记忆与世界模型） */
 export interface KnowledgeProvider {
@@ -241,6 +302,11 @@ export class CuriosityEngine {
 
   /**
    * 扫描知识盲区
+   *
+   * 第三轮升级（69.0 盲区定向，挂载即生效 / 未挂载零漂移）：挂载
+   * MapperBlindSpot 提供器后，经典盲区的新颖度与拓扑盲区分加权融合，
+   * 且「有经验、失败率不高但身处拓扑盲区（稀疏节点/边界前沿/孤岛）」
+   * 的类型以 topological 成因补全入池——这类盲区经典口径永远看不见。
    * @returns 盲区候选列表（按新颖度降序）
    */
   scanKnowledgeGaps(): KnowledgeGap[] {
@@ -282,7 +348,13 @@ export class CuriosityEngine {
       });
     }
 
-    return gaps.sort((a, b) => b.noveltyScore - a.noveltyScore);
+    // 文档契约：按新颖度降序返回（预算截断的 top-k 与 topGaps 读数口径）。
+    // 缺了这步排序时选择按 exposure 插入序进行——已探索类型的稀缺度衰减
+    // （1/(1+探索次数)）无法把其挤出预算窗口，同一盲区会被反复探索
+    gaps.sort((a, b) => b.noveltyScore - a.noveltyScore);
+
+    // 第三轮 69.0：拓扑盲区定向融合 + topological 成因补全（未挂载零漂移）
+    return this.applyMapperDirection(gaps);
   }
 
   /**
@@ -312,6 +384,63 @@ export class CuriosityEngine {
 
   private fairBudget = false;
 
+  // ─────────────── 第四轮升级：探索-利用预算自动平衡（缺省零漂移） ───────────────
+
+  /** 自适应探索预算状态（attachAdaptiveExploration 挂载；未挂载 undefined → 固定比例） */
+  private adaptiveExplorationState?: {
+    minRatio: number;
+    maxRatio: number;
+    alpha: number;
+    yieldEwma: number;
+    samples: number;
+    trend: 'expand' | 'steady' | 'tighten';
+  };
+
+  /**
+   * 挂载探索-利用预算自动平衡（幂等覆盖，挂载即生效——预算口径）。
+   *
+   * 探索预算比例从固定值升级为「近期探索回报率」的反馈调节：
+   * - 回报率 EWMA：recordExploration 的 gainedKnowledge（0/1 流）按
+   *   alpha 指数加权——近期探索收获权重高，远期逐渐淡忘
+   * - 有效比例 = minRatio + (maxRatio − minRatio) × EWMA：探索前热
+   *   （连续填补盲区）→ 比例向 maxRatio 扩张、预算变多；后冷（连续
+   *   无收获）→ 比例向 minRatio 收缩、预算回流核心任务
+   * - 零样本初值：EWMA 取使有效比例恰等于基础比例的点——挂载瞬间
+   *   预算逐位不变（零漂移），首个样本后才开始调节
+   * 未挂载 → proposeExplorations 仍按固定 explorationBudgetRatio
+   * （第三轮及以前行为，逐位不变）。
+   */
+  attachAdaptiveExploration(options?: AdaptiveExplorationOptions): void {
+    const base = Math.max(0.01, Math.min(1, this.config.explorationBudgetRatio));
+    const minRatio = Math.max(0.01, Math.min(options?.minRatio ?? Math.max(0.05, base / 2), base));
+    const maxRatio = Math.max(base, Math.min(options?.maxRatio ?? Math.min(1, base * 1.5), 1));
+    const alpha = Math.max(0.01, Math.min(1, options?.alpha ?? 0.4));
+    const yieldEwma = maxRatio > minRatio ? Math.max(0, Math.min(1, (base - minRatio) / (maxRatio - minRatio))) : 0.5;
+    this.adaptiveExplorationState = { minRatio, maxRatio, alpha, yieldEwma, samples: 0, trend: 'steady' };
+  }
+
+  /** 自适应探索预算遥测（未挂载 undefined） */
+  adaptiveExplorationView(): AdaptiveExplorationTelemetry | undefined {
+    const state = this.adaptiveExplorationState;
+    if (!state) return undefined;
+    return {
+      baseRatio: this.config.explorationBudgetRatio,
+      minRatio: Number(state.minRatio.toFixed(4)),
+      maxRatio: Number(state.maxRatio.toFixed(4)),
+      yieldEwma: Number(state.yieldEwma.toFixed(4)),
+      effectiveRatio: Number(this.effectiveExplorationRatio().toFixed(4)),
+      samples: state.samples,
+      trend: state.trend,
+    };
+  }
+
+  /** 有效探索比例（挂载态的预算取用值；未挂载 = 基础比例） */
+  private effectiveExplorationRatio(): number {
+    const state = this.adaptiveExplorationState;
+    if (!state) return this.config.explorationBudgetRatio;
+    return state.minRatio + (state.maxRatio - state.minRatio) * state.yieldEwma;
+  }
+
   /** 30.0：任务类型 → token 集（主题 = 共享 token；camelCase 与连字符统一拆分） */
   private static tokenize(taskType: string): string[] {
     return taskType
@@ -330,11 +459,15 @@ export class CuriosityEngine {
    * 加权覆盖惰性贪心——共享主题的盲区边际自动衰减（CELF 保证
    * ≥ (1−1/e)·OPT）；主题来自任务类型 token 集。候选不足预算时
    * 两者结果一致（全部选中）。
+   *
+   * 第四轮：挂载自适应探索预算后，比例取 effectiveExplorationRatio()
+   * （近期回报率反馈调节）；未挂载 → 固定 explorationBudgetRatio（零漂移）。
    */
   proposeExplorations(dispatchSlots: number, healthScore = 1): ExplorationProposal[] {
-    // 探索预算：基础比例 × 健康度调节（退化时收敛探索）
+    // 探索预算：探索比例（固定或回报率自适应）× 健康度调节（退化时收敛探索）
     const healthFactor = Math.max(0.2, Math.min(1, healthScore));
-    const budget = Math.floor(dispatchSlots * this.config.explorationBudgetRatio * healthFactor);
+    const ratio = this.adaptiveExplorationState ? this.effectiveExplorationRatio() : this.config.explorationBudgetRatio;
+    const budget = Math.floor(dispatchSlots * ratio * healthFactor);
     if (budget <= 0) return [];
 
     const gaps = this.scanKnowledgeGaps();
@@ -448,7 +581,125 @@ export class CuriosityEngine {
     this.explorations.push({ taskType, timestamp: Date.now(), gainedKnowledge, note });
     this.explorationCounts.set(taskType, (this.explorationCounts.get(taskType) ?? 0) + 1);
     if (this.explorations.length > 200) this.explorations.splice(0, this.explorations.length - 200);
+    // 第四轮：回报率 EWMA 更新（未挂载自适应预算 → 零介入，逐位不变）
+    const adaptive = this.adaptiveExplorationState;
+    if (adaptive) {
+      const prev = adaptive.yieldEwma;
+      adaptive.yieldEwma = prev + adaptive.alpha * ((gainedKnowledge ? 1 : 0) - prev);
+      adaptive.samples += 1;
+      adaptive.trend = adaptive.yieldEwma > prev + 1e-12 ? 'expand' : adaptive.yieldEwma < prev - 1e-12 ? 'tighten' : 'steady';
+    }
+    // 59.0：探索结局回填难度课程（未挂载零介入——只追加掌握状态机记账，
+    // 不改变探索派发/统计任何行为）
+    this.curriculum?.report(gainedKnowledge);
   }
+
+  /**
+   * 59.0：挂载探索难度课程（幂等覆盖，挂载即生效——记账 + 读数口径）。
+   *
+   * 探索结局（是否填补盲区）喂入掌握门限状态机（Beta(1,1) 共轭后验，
+   * 后验达标 + 连击才晋升——幸运连击推不高稀证据的后验）；curriculumView()
+   * 给出当前难度档——探索从均匀乱试升级为「带内练习、掌握爬阶」的
+   * 可审计画像（难度档建议由派发侧按需消费，引擎不强制）。
+   */
+  attachCurriculum(options?: { levelCount?: number; threshold?: number; promoteR?: number; demoteS?: number }): void {
+    this.curriculum = new ExplorationCurriculum(options);
+  }
+
+  /** 59.0：探索难度课程（未挂载 undefined） */
+  private curriculum?: ExplorationCurriculum;
+
+  /** 59.0：当前难度档读数（未挂载 undefined） */
+  curriculumView(): { level: number; levelCount: number; name: string } | undefined {
+    return this.curriculum?.view();
+  }
+
+  /**
+   * 91.0：挂载新奇搜索定向（幂等覆盖，挂载即生效——咨询口径）。
+   *
+   * 探索预算从「随机噪声 + 简单好奇分」升级为新奇定向：候选方向的预期
+   * 行为特征喂 noveltyScore（对档案的 kNN 距离）——novelty 越高分配越多
+   * 探索预算（好奇心 = 新奇分的单调函数，内在奖励有了可计算口径）。
+   * minCriterion 挂 MCNS 可行性门槛（预算禁区/安全边界内定向）。
+   * 不改变探索派发行为（零漂移）。
+   */
+  attachNoveltySearch(options?: { k?: number }): void {
+    this.noveltySearchOptions = { k: options?.k ?? 3 };
+  }
+
+  /** 91.0：新奇搜索配置（未挂载 undefined） */
+  private noveltySearchOptions?: { k: number };
+
+  /**
+   * 91.0：新奇定向读数（未挂载 / 无档案时 undefined）。
+   * @param candidates 候选方向的预期行为特征向量表
+   * @param archive 已探索行为档案（如 69.0 Mapper 节点坐标 / 经验轨迹表示）
+   */
+  noveltySearchView(
+    candidates: ReadonlyArray<ReadonlyArray<number>>,
+    archive: ReadonlyArray<ReadonlyArray<number>>,
+  ): NoveltyDirectionView | undefined {
+    return this.noveltySearchOptions ? noveltyDirectionProbe(candidates, archive, { k: this.noveltySearchOptions.k }) : undefined;
+  }
+
+  /**
+   * 第三轮 69.0：挂载 Mapper 拓扑盲区定向（幂等覆盖，挂载即生效）。
+   *
+   * 探索从「随机 + 经典好奇分」升级为盲区定向：provider 给出经验地形
+   * 的 Mapper 骨架视图（结构兼容 world-model.experienceMapperView），
+   * 引擎按三轴拓扑信号定分——
+   * - 稀疏（节点成员少 = 经验空白带）0.4
+   * - 前沿（节点度数低 = 经验大陆边缘）0.3
+   * - 孤岛（连通分量小 = 与主经验失连的知识岛）0.3
+   * 既有盲区的新颖度与拓扑分按 weight 融合；经典口径看不见的拓扑盲区
+   * 类型以 'topological' 成因补全入池。未挂载 → scanKnowledgeGaps /
+   * proposeExplorations 输出逐位不变（零漂移）。
+   * @param provider 视图提供器（数据不足 / 异常时返回 undefined 即诚实降级）
+   * @param options.weight 拓扑分融合权重（缺省 0.5）
+   */
+  attachMapperBlindSpot(provider: () => MapperBlindSpotView | undefined, options?: { weight?: number }): void {
+    this.mapperBlindSpot = {
+      provider,
+      weight: Math.max(0, Math.min(1, options?.weight ?? 0.5)),
+    };
+  }
+
+  /** 第三轮 69.0：Mapper 盲区定向配置（未挂载 undefined） */
+  private mapperBlindSpot?: { provider: () => MapperBlindSpotView | undefined; weight: number };
+
+  /**
+   * 第三轮 69.0：拓扑盲区读数（未挂载 / 视图缺席时 undefined）。
+   * 每个类型的 { 稀疏, 前沿, 孤岛, 综合 } 分（归一口径，审计可用）。
+   */
+  mapperBlindSpotView(): { scores: Array<{ taskType: string; sparsity: number; frontier: number; isolation: number; topoScore: number }>; insight: string } | undefined {
+    if (!this.mapperBlindSpot) return undefined;
+    let view: MapperBlindSpotView | undefined;
+    try {
+      view = this.mapperBlindSpot.provider();
+    } catch {
+      return undefined;
+    }
+    if (!view || view.nodes.length === 0) return undefined;
+    const scores = this.topoScores(view);
+    const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]);
+    const top = ranked[0];
+    return {
+      scores: ranked.map(([taskType, topoScore]) => {
+        const axes = this.topoAxes.get(taskType) ?? { sparsity: 0, frontier: 0, isolation: 0 };
+        return {
+          taskType,
+          sparsity: Number(axes.sparsity.toFixed(3)),
+          frontier: Number(axes.frontier.toFixed(3)),
+          isolation: Number(axes.isolation.toFixed(3)),
+          topoScore: Number(topoScore.toFixed(3)),
+        };
+      }),
+      insight: `盲区定向：${scores.size} 类型入图——头号拓扑盲区「${top?.[0] ?? '—'}」（综合 ${top ? top[1].toFixed(3) : '—'}：稀疏 ${top ? (this.topoAxes.get(top[0])?.sparsity ?? 0).toFixed(3) : '—'} / 前沿 ${top ? (this.topoAxes.get(top[0])?.frontier ?? 0).toFixed(3) : '—'} / 孤岛 ${top ? (this.topoAxes.get(top[0])?.isolation ?? 0).toFixed(3) : '—'}）——探索预算向经验地形的空白带定向`,
+    };
+  }
+
+  /** 三轴分缓存（topoScores 副产品，读数用） */
+  private topoAxes = new Map<string, { sparsity: number; frontier: number; isolation: number }>();
 
   /** 探索历史 */
   getExplorations(): ExplorationRecord[] {
@@ -478,6 +729,121 @@ export class CuriosityEngine {
 
   // ─────────────────────────── 内部实现 ───────────────────────────
 
+  /**
+   * 69.0 拓扑定向融合（scanKnowledgeGaps 专用；未挂载原样返回——零漂移）。
+   * ① 既有盲区新颖度 × (1−w) + 拓扑分 × w；② 视图中经典口径看不见的
+   * 类型以 topological 成因补全（noveltyScore = 拓扑分——纯定向口径）。
+   */
+  private applyMapperDirection(gaps: KnowledgeGap[]): KnowledgeGap[] {
+    if (!this.mapperBlindSpot) return gaps;
+    let view: MapperBlindSpotView | undefined;
+    try {
+      view = this.mapperBlindSpot.provider();
+    } catch {
+      return gaps; // 视图异常 → 诚实降级回经典口径
+    }
+    if (!view || view.nodes.length === 0) return gaps;
+
+    const topo = this.topoScores(view);
+    const weight = this.mapperBlindSpot.weight;
+    const blended = gaps.map((gap) => {
+      const topoScore = topo.get(gap.taskType);
+      if (topoScore === undefined) return gap;
+      return {
+        ...gap,
+        noveltyScore: Number((gap.noveltyScore * (1 - weight) + topoScore * weight).toFixed(3)),
+      };
+    });
+
+    const exposure = this.provider.getExposure();
+    const experience = this.provider.getExperienceCounts();
+    const seen = new Set(blended.map((gap) => gap.taskType));
+    for (const [taskType, topoScore] of topo) {
+      if (seen.has(taskType)) continue;
+      // 拓扑补全项同样吃探索稀缺衰减（1/(1+探索次数)）——同一盲区反复
+      // 探索边际递减，定向不等于钉死一处：填过一轮的盲区自动让位给
+      // 下一个未探索盲区
+      const explorationCount = this.explorationCounts.get(taskType) ?? 0;
+      blended.push({
+        taskType,
+        reason: 'topological',
+        exposureCount: exposure[taskType] ?? 0,
+        experienceCount: experience[taskType] ?? 0,
+        explorationCount,
+        noveltyScore: Number((topoScore / (1 + explorationCount)).toFixed(3)),
+      });
+    }
+    return blended.sort((a, b) => b.noveltyScore - a.noveltyScore);
+  }
+
+  /**
+   * 69.0 三轴拓扑盲区分（稀疏 0.4 / 前沿 0.3 / 孤岛 0.3，各轴跨类型
+   * 归一到 [0,1]；类型出现于多节点时按轴取最盲的一侧；孤岛轴按分量内
+   * 类型总数计——「知识岛」规模）。副产品缓存 topoAxes 供
+   * mapperBlindSpotView 审计读数。
+   */
+  private topoScores(view: MapperBlindSpotView): Map<string, number> {
+    // 节点规模 / 度数
+    const nodeSize = view.nodes.map((node) => Math.max(1, node.members.length));
+    const degree = new Array<number>(view.nodes.length).fill(0);
+    for (const [a, b] of view.edges) {
+      if (a >= 0 && a < view.nodes.length) degree[a] += 1;
+      if (b >= 0 && b < view.nodes.length) degree[b] += 1;
+    }
+    // 连通分量（union-find）；分量规模按「知识岛」计——分量内类型总数
+    // （成员去重：大陆 = 类型多的大岛，孤岛 = 类型少的小岛）
+    const parent = Array.from({ length: view.nodes.length }, (_, i) => i);
+    const find = (x: number): number => (parent[x] === x ? x : (parent[x] = find(parent[x])));
+    for (const [a, b] of view.edges) {
+      if (a < 0 || a >= view.nodes.length || b < 0 || b >= view.nodes.length) continue;
+      parent[find(a)] = find(b);
+    }
+    const compMembers = new Map<number, Set<string>>();
+    for (let i = 0; i < view.nodes.length; i += 1) {
+      const root = find(i);
+      let set = compMembers.get(root);
+      if (!set) {
+        set = new Set<string>();
+        compMembers.set(root, set);
+      }
+      for (const member of view.nodes[i].members) set.add(member);
+    }
+
+    // 类型 → 各轴原始分（多节点取最盲侧：size 最小 / degree 最小 / 知识岛最小）
+    const raw = new Map<string, { size: number; degree: number; comp: number }>();
+    view.nodes.forEach((node, ni) => {
+      for (const taskType of node.members) {
+        const prev = raw.get(taskType);
+        const size = nodeSize[ni] ?? 1;
+        const deg = degree[ni] ?? 0;
+        const comp = compMembers.get(find(ni))?.size ?? 1;
+        if (!prev) raw.set(taskType, { size, degree: deg, comp });
+        else raw.set(taskType, { size: Math.min(prev.size, size), degree: Math.min(prev.degree, deg), comp: Math.min(prev.comp, comp) });
+      }
+    });
+
+    // 各轴归一（除以最大值 → 最盲类型 = 1）
+    const axes = [...raw.entries()].map(([taskType, v]) => ({
+      taskType,
+      sparsity: 1 / v.size,
+      frontier: 1 / (1 + v.degree),
+      isolation: 1 / v.comp,
+    }));
+    const maxSparsity = Math.max(...axes.map((a) => a.sparsity), 1e-9);
+    const maxFrontier = Math.max(...axes.map((a) => a.frontier), 1e-9);
+    const maxIsolation = Math.max(...axes.map((a) => a.isolation), 1e-9);
+    const scores = new Map<string, number>();
+    this.topoAxes.clear();
+    for (const a of axes) {
+      const sparsity = a.sparsity / maxSparsity;
+      const frontier = a.frontier / maxFrontier;
+      const isolation = a.isolation / maxIsolation;
+      this.topoAxes.set(a.taskType, { sparsity, frontier, isolation });
+      scores.set(a.taskType, Number((0.4 * sparsity + 0.3 * frontier + 0.3 * isolation).toFixed(3)));
+    }
+    return scores;
+  }
+
   /** 生成探索任务描述 */
   private describeExploration(gap: KnowledgeGap): string {
     switch (gap.reason) {
@@ -487,6 +853,8 @@ export class CuriosityEngine {
         return `攻克高失败任务类型「${gap.taskType}」：失败率偏高，需探索更可靠的执行方案`;
       case 'low-experience':
         return `深化低经验任务类型「${gap.taskType}」：成功经验不足，需积累更多成功范例`;
+      case 'topological':
+        return `定向探索拓扑盲区「${gap.taskType}」：经验地形上身处稀疏/前沿/孤岛带（经典盲区口径看不见——定向好奇专属）`;
       default:
         return `探索任务类型「${gap.taskType}」`;
     }
@@ -501,6 +869,8 @@ export class CuriosityEngine {
         return `降低「${gap.taskType}」的失败率，提升该类任务的可靠性`;
       case 'low-experience':
         return `丰富「${gap.taskType}」的成功经验库，提升决策与模型分配的准确性`;
+      case 'topological':
+        return `把「${gap.taskType}」连回经验大陆：填补 Mapper 骨架的稀疏带/边缘/孤岛，扩大可迁移经验的覆盖面`;
       default:
         return `增强「${gap.taskType}」的处理能力`;
     }

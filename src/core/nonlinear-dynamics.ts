@@ -21,6 +21,15 @@
  *   验证锚点: logistic 映射 x→4x(1−x) 的 λ₁ = ln 2（解析已知）；
  *     白噪声 H ≈ 0.5；趋势叠加随机游走 H > 0.5。
  *
+ *   R5 进化（拓扑动力内核第五轮）: Wolf 法最大 Lyapunov 指数（wolfLyapunov，
+ *   Wolf et al. 1985）——Rosenstein 的「平均对数分离曲线取最陡段斜率」是
+ *   拟合口径，Wolf 是**逐步重整化的直接法**: 追踪一对轨迹的分离，分离
+ *   超阈即换邻居重定向（保持线性区），λ₁ = Σ ln(dₖ/dₖ₋₁)/Σk 纯 log 域
+ *   累加（无指数、无 exp——除零护栏: 零分离步跳过不贡献）。多起点
+ *   （3 轨迹）汇池平均。锚点: logistic r=4 → λ₁ ≈ ln2；周期窗口
+ *   （r=3.2/3.5）→ λ₁ ≈ 0（周期轨道上分离不增长——一维可观测口径的
+ *   诚实边界：横向收缩率不可见）；参数扫描与解析轨迹平均逐点对符号。
+ *
  * 零漂移: 未挂载时元认知输出与升级前逐位一致。
  */
 
@@ -94,6 +103,119 @@ export interface HurstResult {
   hurst: number;
   /** 各窗口的 (log n, log R/S) 点（回归原料） */
   points: Array<{ logN: number; logRS: number }>;
+}
+
+// ═══════════ R5: Wolf 法最大 Lyapunov 指数（重整化直接法） ═══════════
+
+export interface WolfOptions {
+  /** 替换阈值：分离超过该倍数 × 吸引子直径时换邻居重定向（缺省 0.05——Wolf 原文线性区口径） */
+  replacementThreshold?: number;
+  /** 时间近邻排除窗 |t−p| ≥ meanGap（缺省 5，与 Rosenstein 同口径——防平移复制） */
+  meanGap?: number;
+  /** 轨迹起点数（缺省 3: 首点/1/3 处/2/3 处——汇池平均的稳健口径） */
+  tracks?: number;
+}
+
+export interface WolfResult {
+  /** λ₁ 估计（每步，nat）= Σ ln(dₖ/dₖ₋₁) / Σ k——纯 log 域累加 */
+  lambda: number;
+  /** 累计演化步数（分母；零分离步跳过不计） */
+  steps: number;
+  /** 邻居替换次数（分离超阈 → 重定向回线性区；Wolf 法的 Signature 动作） */
+  replacements: number;
+  /** 追踪轨迹数 */
+  tracks: number;
+}
+
+/**
+ * Wolf 法最大 Lyapunov 指数（Wolf, Swift, Swinney & Vastano 1985——标量
+ * 序列版）。
+ *
+ * 与 Rosenstein 的差别: Rosenstein 取「平均分离曲线最陡段」的回归斜率
+ * （拟合口径，短窗噪声敏感）；Wolf 逐步追踪一对轨迹: 分离 dₖ 每步贡献
+ * ln(dₖ/dₖ₋₁)，分离超过 replacementThreshold × 吸引子直径（序列值域）即
+ * 把邻居重定向到当前参考点的最近邻（时间近邻排除），把分离拉回线性区
+ * ——重整化让对数增长率直接可加，不依赖任何窗口拟合。
+ *
+ * 数值纪律（R5 轴 3）: 全程 log 域（log(dₖ/dₖ₋₁) 逐项累加，无 exp）；
+ * 零分离步（重复值）跳过不贡献（d=0 的 ln 无定义——诚实跳过而非注入
+ * 噪声）；最近邻平局取下标小者（确定序）。
+ *
+ * 诚实边界: 周期轨道上 λ₁ ≈ 0（分离不增长——一维可观测口径看不见
+ * 横向收缩率），判「非混沌」正确、判「收缩强度」不可能。
+ */
+export function wolfLyapunov(series: ReadonlyArray<number>, options?: WolfOptions): WolfResult | undefined {
+  const threshold = options?.replacementThreshold ?? 0.05;
+  if (!Number.isFinite(threshold) || threshold <= 0) {
+    throw new Error(`wolfLyapunov: replacementThreshold 须为正数（得到 ${String(threshold)}）`);
+  }
+  const meanGap = Math.max(1, Math.floor(options?.meanGap ?? 5));
+  const trackCount = Math.max(1, Math.min(options?.tracks ?? 3, 12));
+  const n = series.length;
+  if (n < 32) return undefined;
+  for (const v of series) {
+    if (!Number.isFinite(v)) return undefined;
+  }
+  let lo = Number.POSITIVE_INFINITY;
+  let hi = Number.NEGATIVE_INFINITY;
+  for (const v of series) {
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  const diameter = hi - lo;
+  if (!(diameter > 1e-12)) return undefined; // 常值序列：分离恒零，无 Lyapunov 可言
+  const replaceAt = threshold * diameter;
+
+  /** 当前参考点的最近邻（时间近邻排除；平局取下标小者；全零分离返回 -1） */
+  const nearest = (t: number): number => {
+    let best = -1;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (let j = 0; j < n; j += 1) {
+      if (Math.abs(t - j) < meanGap) continue;
+      const d = Math.abs(series[t]! - series[j]!);
+      if (d > 0 && d < bestDist) {
+        bestDist = d;
+        best = j;
+      }
+    }
+    return best;
+  };
+
+  let zsum = 0;
+  let steps = 0;
+  let replacements = 0;
+  for (let tr = 0; tr < trackCount; tr += 1) {
+    const t0 = Math.min(n - 2, Math.floor((tr * (n - 1)) / trackCount));
+    let anchorT = t0; // 参考轨迹锚点（邻居与其同步推进；重定向后重锚）
+    let anchorP = nearest(t0);
+    if (anchorP < 0) continue;
+    let dPrev = Math.abs(series[anchorT]! - series[anchorP]!);
+    if (dPrev <= 0) continue;
+    for (let t = anchorT + 1; t < n; t += 1) {
+      const pt = anchorP + (t - anchorT); // 邻居与参考同步推进
+      if (pt >= n) break; // 邻居轨迹走到尽头
+      const d = Math.abs(series[t]! - series[pt]!);
+      if (d > 0 && dPrev > 0) {
+        zsum += Math.log(d / dPrev);
+        steps += 1;
+      }
+      if (d > replaceAt) {
+        // 分离超出线性区 → 重定向: 换当前参考点的最近邻，重锚同步起点
+        const q = nearest(t);
+        if (q < 0) break;
+        anchorT = t;
+        anchorP = q;
+        const dNew = Math.abs(series[t]! - series[q]!);
+        if (dNew <= 0) break;
+        dPrev = dNew;
+        replacements += 1;
+      } else {
+        dPrev = d; // 零分离步：跳过贡献，分离状态照常更新
+      }
+    }
+  }
+  if (steps < 8) return undefined;
+  return { lambda: zsum / steps, steps, replacements, tracks: trackCount };
 }
 
 /** R/S 分析（多窗口聚合回归；窗口数不足时返回 undefined） */

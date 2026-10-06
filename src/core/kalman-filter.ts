@@ -17,8 +17,33 @@
  *     趋势斜率的「事后最优」读数（检测缓慢漂移比滤波更早确认）。
  *
  *   随机游走稳态解析解（验证锚点）: q 过程噪声 / r 观测噪声,
- *     P∞ 满足 P∞ = q + r·P∞/(P∞+r) → P∞ = (q + √(q²+4qr))/2,
- *     K∞ = P∞/(P∞+r)——Riccati 迭代收敛于此（精确对照）。
+ *     后验 P∞ 满足 P² + q·P − q·r = 0 → P∞ = (√(q²+4qr) − q)/2
+ *     （等价地预测方差 P⁻∞ = P∞ + q = (q + √(q²+4qr))/2）——
+ *     Riccati 迭代收敛于此（精确对照，见 randomWalkSteadyState）。
+ *
+ * ── R5-A3 世界性进化（第五轮）──
+ * 数学进化（UKF 无迹卡尔曼）: UnscentedKalmanFilter——非线性模型的
+ *   确定性采样推断。对称 2n+1 sigma 点集（X₀ = x，X±ᵢ = x ± √(n+λ)·Lᵢ，
+ *   P = LLᵀ）经 f/h 映射后加权重构均值/协方差（权重 ΣWᵐ = 1）。
+ *   线性 f/h 下 UT **精确**重现矩（ΣWᶜ(Xᵢ−x̄)(Xᵢ−x̄)ᵀ = LLᵀ 逐项可验）
+ *   ⟹ UKF ≡ KF（验证锚点）；非线性下捕获三阶矩（对称点集），
+ *   优于 EKF 的一阶线性化（验证脚本 sin 观测下与求积真值对照）。
+ *   标量观测的特殊结构使更新全为一阶量：S 标量、K = P_xz/S、
+ *   P ← P − P_xzP_xzᵀ/S——无矩阵求逆。
+ *
+ * 性能进化（标量测量特化）: KalmanFilter.update 的通用矩阵链
+ *   (H·P·Hᵀ、P·Hᵀ、K·H、(I−KH)·P) 在标量观测（H 为 1×n）下全部退化为
+ *   向量运算——特化实现按与 matMul 链**完全相同的累加次序**重写
+ *   （c1[j] = ΣₖhₖPₖⱼ → S = Σⱼc1[j]hⱼ + r；Kᵢ = ΣₖPᵢₖhₖ/S；
+ *   P'ᵢⱼ = Σₖ[(δᵢₖ − Kᵢhₖ)Pₖⱼ]），结果与原实现**逐位一致**（验证
+ *   脚本逐位对照），去掉全部中间矩阵分配/转置——20000 步趋势滤波
+ *   实测提速（验证脚本耗时对照）。
+ *
+ * 数值稳健性（Joseph 型更新选项）: covarianceForm: 'joseph' 时
+ *   P ← (I−KH)P(I−KH)ᵀ + KRKᵀ（随后对称化）——两项均 PSD，长序列/
+ *   增益趋 1 的病态场景不产生负特征值，且**精确对称**（标准型
+ *   (I−KH)P 的舍入不对称随步数累积）。缺省 'standard' 保持旧路径。
+ *   UKF 的 sigma 点分解用尺度相对抖动阶梯的 Cholesky（P 病态时不崩）。
  *
  * 零漂移: 未挂载时一切路径与升级前逐位一致。
  */
@@ -51,11 +76,7 @@ function matAdd(A: Matrix, B: Matrix): Matrix {
 }
 
 function matSub(A: Matrix, B: Matrix): Matrix {
-  return A.map((row, i) => row.map((v, j) => v - B[i]![j]!));
-}
-
-function identity(n: number): Matrix {
-  return Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? 1 : 0)));
+  return A.map((row, i) => row.map((v, j) => v - B[i][j]));
 }
 
 /** 列向量 */
@@ -102,7 +123,7 @@ function normalQuantile(p: number): number {
   return -(((((c[0]! * q + c[1]!) * q + c[2]!) * q + c[3]!) * q + c[4]!) * q + c[5]!) / ((((d[0]! * q + d[1]!) * q + d[2]!) * q + d[3]!) * q + 1);
 }
 
-/** χ² 分布分位数（自由度 df、上侧概率 p） */
+/** χ² 分布分位数（自由度 df、累积概率 p——表中 0.997 即 NIS 门控缺省阈值的下侧分位） */
 export function chiSquareQuantile(p: number, df: number): number {
   const hit = CHI2_TABLE[`${df}:${p}`];
   if (hit !== undefined) return hit;
@@ -143,23 +164,31 @@ export interface KalmanStepResult {
   gated: boolean;
 }
 
+/** 协方差更新形式：standard = (I−KH)P（旧路径）；joseph = (I−KH)P(I−KH)ᵀ + KRKᵀ（PSD 保形） */
+export type CovarianceForm = 'standard' | 'joseph';
+
 /**
  * 线性高斯卡尔曼滤波器（dim ≤ 3 的小矩阵实现，标量观测）。
  *
  * predict()/update() 分离（无观测的心跳可只预测），step(z) = 预测 + 更新 +
  * 门控判定。所有数值在线更新，无历史缓冲（内存 O(dim²)）。
+ *
+ * R5-A3：update() 用标量测量特化实现（与原 matMul 链累加次序逐位一致，
+ * 免中间矩阵分配）；covarianceForm = 'joseph' 可选 PSD 保形更新。
  */
 export class KalmanFilter {
   private readonly model: KalmanModel;
   private readonly gateQuantile: number;
   private readonly gateThreshold: number;
+  private readonly covForm: CovarianceForm;
   private x: Vec;
   private P: Matrix;
 
-  constructor(model: KalmanModel, gateP = 0.997) {
+  constructor(model: KalmanModel, gateP = 0.997, opts?: { covarianceForm?: CovarianceForm }) {
     this.model = model;
     this.gateQuantile = gateP;
     this.gateThreshold = chiSquareQuantile(gateP, model.H.length);
+    this.covForm = opts?.covarianceForm ?? 'standard';
     this.x = [...model.x0];
     this.P = model.P0.map((row) => [...row]);
   }
@@ -177,18 +206,65 @@ export class KalmanFilter {
     return this.update(z);
   }
 
-  /** 观测更新（假设已 predict） */
+  /**
+   * 观测更新（假设已 predict）——标量测量特化（R5-A3）。
+   *
+   * 与原通用矩阵链相同的累加次序（逐位一致）：
+   *   Hx = Σₖ hₖxₖ；c1[j] = Σₖ hₖPₖⱼ；S = Σⱼ c1[j]hⱼ + r；
+   *   Kᵢ = (Σₖ Pᵢₖhₖ)/S；P'ᵢⱼ = Σₖ (δᵢₖ − Kᵢhₖ)·Pₖⱼ。
+   */
   update(z: number): KalmanStepResult {
     const { H, R } = this.model;
-    const Hx = asVec(matMul(H, asMatrix(this.x)))[0]!;
+    const h = H[0];
+    const n = this.x.length;
+    const r = R[0][0];
+    let Hx = 0;
+    for (let k = 0; k < n; k += 1) Hx += h[k] * this.x[k];
     const innovation = z - Hx;
-    // S = H·P·Hᵀ + R（标量观测 → 标量 S）
-    const S = matMul(matMul(H, this.P), matT(H))[0]![0]! + R[0]![0]!;
-    const PHt = matMul(this.P, matT(H));
-    const K = PHt.map((row) => row.map((v) => v / S));
-    this.x = asVec(matAdd(asMatrix(this.x), matMul(K, [[innovation]])));
-    const KH = matMul(K, H);
-    this.P = matMul(matSub(identity(this.x.length), KH), this.P);
+    // S = H·P·Hᵀ + r（c1 = H·P 的行向量，S 按 j 序累加——与 matMul 链同序）
+    let S = 0;
+    for (let j = 0; j < n; j += 1) {
+      let s = 0;
+      for (let k = 0; k < n; k += 1) s += h[k] * this.P[k][j];
+      S += s * h[j];
+    }
+    S += r;
+    // K = P·Hᵀ/S（PHtᵢ = Σₖ Pᵢₖhₖ，k 序与 matMul(P, Hᵀ) 同）
+    const K = new Array<number>(n);
+    for (let i = 0; i < n; i += 1) {
+      let ph = 0;
+      for (let k = 0; k < n; k += 1) ph += this.P[i][k] * h[k];
+      K[i] = ph / S;
+    }
+    // x ← x + K·y（与 matAdd(asMatrix(x), matMul(K, [[y]])) 同值）
+    for (let i = 0; i < n; i += 1) this.x[i] = this.x[i] + K[i] * innovation;
+    if (this.covForm === 'joseph') {
+      // Joseph 型：(I−KH)·P·(I−KH)ᵀ + K·r·Kᵀ（两项均 PSD），随后对称化
+      const IKH: Matrix = Array.from({ length: n }, (_, i) =>
+        Array.from({ length: n }, (_, j) => (i === j ? 1 : 0) - K[i] * h[j]),
+      );
+      const T = matMul(IKH, this.P); // (I−KH)P
+      const JP = matMul(T, matT(IKH)); // (I−KH)P(I−KH)ᵀ
+      for (let i = 0; i < n; i += 1) {
+        for (let j = 0; j < n; j += 1) {
+          JP[i][j] += K[i] * r * K[j];
+        }
+      }
+      this.P = JP.map((row, i) => row.map((v, j) => 0.5 * (v + JP[j][i])));
+    } else {
+      // 标准型：P'ᵢⱼ = Σₖ (δᵢₖ − Kᵢhₖ)·Pₖⱼ（k 序与 matMul(I−KH, P) 同）
+      const newP: Matrix = Array.from({ length: n }, () => new Array<number>(n).fill(0));
+      for (let i = 0; i < n; i += 1) {
+        const ikh = new Array<number>(n);
+        for (let k = 0; k < n; k += 1) ikh[k] = (i === k ? 1 : 0) - K[i] * h[k];
+        for (let j = 0; j < n; j += 1) {
+          let s = 0;
+          for (let k = 0; k < n; k += 1) s += ikh[k] * this.P[k][j];
+          newP[i][j] = s;
+        }
+      }
+      this.P = newP;
+    }
     const nis = (innovation * innovation) / Math.max(1e-12, S);
     const logLikelihood = -0.5 * (Math.log(2 * Math.PI * Math.max(1e-12, S)) + nis);
     return {
@@ -224,6 +300,242 @@ export class KalmanFilter {
 export function randomWalkSteadyState(q: number, r: number): { pInf: number; kInf: number } {
   const pInf = (Math.sqrt(q * q + 4 * q * r) - q) / 2;
   return { pInf, kInf: pInf / (pInf + r) };
+}
+
+// ─────────────────────────── UKF 无迹卡尔曼滤波器（R5-A3） ───────────────────────────
+
+/** 尺度相对抖动阶梯的 SPD Cholesky（sigma 点平方根分解用；0 级 = 精确） */
+function cholLowerJittered(A: Matrix): { L: Matrix; jitter: number } | undefined {
+  const n = A.length;
+  let maxDiag = 0;
+  for (let i = 0; i < n; i += 1) maxDiag = Math.max(maxDiag, Math.abs(A[i][i]));
+  if (!(maxDiag > 0) || !Number.isFinite(maxDiag)) return undefined;
+  for (const level of [0, 1e-12, 1e-10, 1e-8]) {
+    const jitter = level * maxDiag;
+    const L: Matrix = Array.from({ length: n }, () => new Array<number>(n).fill(0));
+    let ok = true;
+    for (let i = 0; i < n && ok; i += 1) {
+      for (let j = 0; j <= i; j += 1) {
+        let sum = A[i][j] + (i === j ? jitter : 0);
+        for (let k = 0; k < j; k += 1) sum -= L[i][k] * L[j][k];
+        if (i === j) {
+          if (!(sum > 0)) {
+            ok = false;
+            break;
+          }
+          L[i][j] = Math.sqrt(sum);
+        } else {
+          L[i][j] = sum / L[j][j];
+        }
+      }
+    }
+    if (ok) return { L, jitter };
+  }
+  return undefined;
+}
+
+/** 非线性模型规格：f 状态转移、h 标量观测、Q/R 噪声、UT 参数 */
+export interface UnscentedModel {
+  /** 状态转移 x⁺ = f(x)（非线性；长度须等于 dim） */
+  f: (x: Vec) => Vec;
+  /** 标量观测函数 z = h(x) + ε */
+  h: (x: Vec) => number;
+  /** 过程噪声协方差（dim×dim） */
+  Q: Matrix;
+  /** 观测噪声方差（标量观测） */
+  r: number;
+  /** 初始状态 */
+  x0: Vec;
+  /** 初始协方差 */
+  P0: Matrix;
+  /** UT 主标度 α（缺省 1；小值收缩 sigma 点分布） */
+  alpha?: number;
+  /** UT 高阶矩权重 β（缺省 2，高斯最优） */
+  beta?: number;
+  /** UT 自由参数 κ（缺省 0） */
+  kappa?: number;
+}
+
+export interface UnscentedStepResult {
+  x: Vec;
+  innovation: number;
+  innovationVar: number;
+  nis: number;
+  logLikelihood: number;
+  gated: boolean;
+}
+
+/**
+ * 无迹卡尔曼滤波器（UKF，R5-A3）：确定性 sigma 点采样推断非线性模型。
+ *
+ * 对称 2n+1 点集：X₀ = x，X_{±i} = x ± √(n+λ)·Lᵢ（P = LLᵀ 的第 i 列），
+ * λ = α²(n+κ) − n；权重 W⁰ₘ = λ/(n+λ)、Wⁱₘ = 1/(2(n+λ))（ΣWᵐ = 1）、
+ * W⁰ᶜ = W⁰ₘ + (1−α²+β)、Wⁱᶜ = Wⁱₘ。
+ * 线性 f/h 下 UT 精确重现矩（ΣWᶜ(Xᵢ−x̄)(Xᵢ−x̄)ᵀ = LLᵀ = P）⟹ UKF ≡ KF；
+ * 非线性下捕获至三阶矩（对称点集），优于 EKF 一阶线性化。
+ * 标量观测：S 标量、K = P_xz/S、P ← P − P_xzP_xzᵀ/S——全程无矩阵求逆。
+ */
+export class UnscentedKalmanFilter {
+  private readonly model: UnscentedModel;
+  private readonly dim: number;
+  private readonly wm: number[];
+  private readonly wc: number[];
+  private readonly gamma: number;
+  private readonly gateThreshold: number;
+  private x: Vec;
+  private P: Matrix;
+
+  constructor(model: UnscentedModel, gateP = 0.997) {
+    if (typeof model.f !== 'function' || typeof model.h !== 'function') {
+      throw new Error('UnscentedKalmanFilter: f 与 h 需为函数');
+    }
+    const dim = model.x0.length;
+    if (!Number.isInteger(dim) || dim < 1) throw new Error('UnscentedKalmanFilter: x0 需为非空向量');
+    if (
+      !Array.isArray(model.P0) ||
+      model.P0.length !== dim ||
+      model.P0.some((row) => !Array.isArray(row) || row.length !== dim || row.some((v) => !Number.isFinite(v)))
+    ) {
+      throw new Error('UnscentedKalmanFilter: P0 需为 dim×dim 有限数值矩阵');
+    }
+    if (
+      !Array.isArray(model.Q) ||
+      model.Q.length !== dim ||
+      model.Q.some((row) => !Array.isArray(row) || row.length !== dim || row.some((v) => !Number.isFinite(v)))
+    ) {
+      throw new Error('UnscentedKalmanFilter: Q 需为 dim×dim 有限数值矩阵');
+    }
+    if (!(model.r > 0) || !Number.isFinite(model.r)) throw new Error('UnscentedKalmanFilter: r 需 > 0');
+    const alpha = model.alpha ?? 1;
+    const beta = model.beta ?? 2;
+    const kappa = model.kappa ?? 0;
+    if (!(alpha > 0) || !Number.isFinite(alpha)) throw new Error('UnscentedKalmanFilter: alpha 需 > 0');
+    if (!Number.isFinite(beta)) throw new Error('UnscentedKalmanFilter: beta 需为有限数');
+    if (!Number.isFinite(kappa)) throw new Error('UnscentedKalmanFilter: kappa 需为有限数');
+    const lam = alpha * alpha * (dim + kappa) - dim;
+    if (!(dim + lam > 0)) throw new Error('UnscentedKalmanFilter: 需 n + λ > 0（检查 alpha/kappa）');
+    this.model = model;
+    this.dim = dim;
+    this.gamma = Math.sqrt(dim + lam);
+    this.wm = [lam / (dim + lam)];
+    this.wc = [lam / (dim + lam) + (1 - alpha * alpha + beta)];
+    for (let i = 0; i < 2 * dim; i += 1) {
+      this.wm.push(1 / (2 * (dim + lam)));
+      this.wc.push(1 / (2 * (dim + lam)));
+    }
+    this.gateThreshold = chiSquareQuantile(gateP, 1);
+    this.x = [...model.x0];
+    this.P = model.P0.map((row) => [...row]);
+  }
+
+  /** UT：生成 sigma 点（x 为中心，P 的列缩放 γ） */
+  private sigmaPoints(): Vec[] {
+    const n = this.dim;
+    const decomp = cholLowerJittered(this.P);
+    if (!decomp) throw new Error('UnscentedKalmanFilter: P 的 Cholesky 分解失败（协方差非正定）');
+    const L = decomp.L;
+    const pts: Vec[] = [[...this.x]];
+    for (let i = 0; i < n; i += 1) {
+      const plus = new Array<number>(n);
+      const minus = new Array<number>(n);
+      for (let k = 0; k < n; k += 1) {
+        plus[k] = this.x[k] + this.gamma * L[k][i];
+        minus[k] = this.x[k] - this.gamma * L[k][i];
+      }
+      pts.push(plus, minus);
+    }
+    return pts;
+  }
+
+  /** 一步预测：sigma 点过 f，加权重构均值/协方差（+ Q，对称化） */
+  predict(): void {
+    const n = this.dim;
+    const pts = this.sigmaPoints();
+    const Y = pts.map((p) => this.callF(p));
+    const xm = new Array<number>(n).fill(0);
+    for (let i = 0; i < Y.length; i += 1) {
+      for (let k = 0; k < n; k += 1) xm[k] += this.wm[i] * Y[i][k];
+    }
+    const Pm: Matrix = Array.from({ length: n }, () => new Array<number>(n).fill(0));
+    for (let i = 0; i < Y.length; i += 1) {
+      const w = this.wc[i];
+      for (let a = 0; a < n; a += 1) {
+        const da = Y[i][a] - xm[a];
+        for (let b = 0; b < n; b += 1) Pm[a][b] += w * da * (Y[i][b] - xm[b]);
+      }
+    }
+    for (let a = 0; a < n; a += 1) {
+      for (let b = 0; b < n; b += 1) {
+        this.P[a][b] = 0.5 * (Pm[a][b] + Pm[b][a]) + this.model.Q[a][b];
+      }
+    }
+    this.x = xm;
+  }
+
+  /** 观测更新（假设已 predict）：标量 S、K = P_xz/S、P ← P − P_xzP_xzᵀ/S */
+  update(z: number): UnscentedStepResult {
+    const n = this.dim;
+    const pts = this.sigmaPoints();
+    const Z = pts.map((p) => this.callH(p));
+    let zbar = 0;
+    for (let i = 0; i < Z.length; i += 1) zbar += this.wm[i] * Z[i];
+    let S = 0;
+    for (let i = 0; i < Z.length; i += 1) {
+      const d = Z[i] - zbar;
+      S += this.wc[i] * d * d;
+    }
+    S += this.model.r;
+    const Pxz = new Array<number>(n).fill(0);
+    for (let i = 0; i < pts.length; i += 1) {
+      const w = this.wc[i];
+      const dz = Z[i] - zbar;
+      for (let a = 0; a < n; a += 1) Pxz[a] += w * (pts[i][a] - this.x[a]) * dz;
+    }
+    const innovation = z - zbar;
+    for (let a = 0; a < n; a += 1) this.x[a] += (Pxz[a] / S) * innovation;
+    for (let a = 0; a < n; a += 1) {
+      for (let b = 0; b < n; b += 1) this.P[a][b] -= (Pxz[a] * Pxz[b]) / S;
+    }
+    // 对称化（截断误差防御）
+    for (let a = 0; a < n; a += 1) {
+      for (let b = a + 1; b < n; b += 1) {
+        const v = 0.5 * (this.P[a][b] + this.P[b][a]);
+        this.P[a][b] = v;
+        this.P[b][a] = v;
+      }
+    }
+    const nis = (innovation * innovation) / Math.max(1e-12, S);
+    const logLikelihood = -0.5 * (Math.log(2 * Math.PI * Math.max(1e-12, S)) + nis);
+    return { x: [...this.x], innovation, innovationVar: S, nis, logLikelihood, gated: nis > this.gateThreshold };
+  }
+
+  /** 一步预测 + 观测更新 */
+  step(z: number): UnscentedStepResult {
+    this.predict();
+    return this.update(z);
+  }
+
+  get state(): Vec {
+    return [...this.x];
+  }
+
+  get covariance(): Matrix {
+    return this.P.map((row) => [...row]);
+  }
+
+  private callF(p: Vec): Vec {
+    const y = this.model.f(p);
+    if (!Array.isArray(y) || y.length !== this.dim || y.some((v) => typeof v !== 'number' || !Number.isFinite(v))) {
+      throw new Error('UnscentedKalmanFilter: f 需返回长度 dim 的有限数值数组');
+    }
+    return y;
+  }
+
+  private callH(p: Vec): number {
+    const v = this.model.h(p);
+    if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error('UnscentedKalmanFilter: h 需返回有限数值');
+    return v;
+  }
 }
 
 // ─────────────────────────── 局部线性趋势滤波器 ───────────────────────────

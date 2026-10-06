@@ -43,6 +43,25 @@
  * 「永不停机且永不撒谎的统计」。Wilson 下界继续服务固定口径场景
  * （并行旁路，不替换）；凡「边看边停」的场景（进化淘汰、劣化判定、
  * 漂移侦测）一律升级为任意时刻有效口径。
+ *
+ * R5 第五轮进化（内核世界性进化·统计推断组）：
+ * - 数学：MixtureEProcess —— **混合 e-过程**（ε-混合 / robust-to-
+ *   unknown-effect-size）：对一组固定 λ 网格并行跑资本过程并取凸组合。
+ *   e-过程的凸组合仍是 e-过程（非负上鞅的凸组合仍是非负上鞅，
+ *   E ≤ 1 保持）→ Ville 不等式原样成立。单一可预测 λ 在真实效应
+ *   量未知时赌错方向幅度就浪费证据；混合网格对未知效应量稳健——
+ *   大效应由大 λ 分量收割、小效应由小 λ 分量细磨，任何量级都有
+ *   分量接近最优（Ramdas–Grünwald–Vovk–Shafer 学派的 mixture 思想）。
+ * - 数学：anytimeConfidenceSet —— **e-过程对偶置信集**（AV-CI）：
+ *   对 μ 网格逐点构造点零假设 H0: μ = μ₀ 的双向混合 e-过程
+ *   e(μ₀) = ½·e↑(μ₀) + ½·e↓(μ₀)（点零假设下两向上鞅 E=1，等权
+ *   平均仍是上鞅），拒绝集 {μ₀ : e(μ₀) ≥ 1/α}。Ville：
+ *   P(∃t: μ* 被拒) ≤ α —— 在**任意停止时刻**读取该置信集，
+ *   覆盖 ≥ 1−α（e-值与置信区间的对偶性落地成闭式可算的区间）。
+ * - 数值稳健：混合资本全程 **log 域**累积（log1p 逐因子 + 私有
+ *   log-sum-exp 聚合）：万步流的线性资本 0.5^10000 ≈ 1e-3010 早已
+ *   下溢为 0（信息全丢），log 域仍精确保持（logEValue 无损读取）；
+ *   eValue 读取端再做安全 exp（≥ 709.78 时饱和 +∞ 而非 Infinity 噪声）。
  */
 
 // ─────────────────────────── 缝合置信序列 ───────────────────────────
@@ -235,6 +254,212 @@ function lambdaAtMost(edge: number): number {
 function lambdaAtLeast(edge: number): number {
   // at-least 方向（H0: μ ≥ μ0）：λ ≤ 0，均值低于 μ0 才下注
   return Math.min(0, edge);
+}
+
+// ─────────────────────────── R5：混合 e-过程（log 域） ───────────────────────────
+
+/** 混合 e-过程配置（全部可选；缺省 λ 网格 0.05~0.5 六档等权） */
+export interface MixtureEProcessOptions {
+  /** λ 网格（绝对值；符号由 side 决定；各值会被钳到 [1e-4, 0.5]） */
+  lambdas?: number[];
+  /** 分量权重（缺省均匀；自动归一化，负权重钳 0） */
+  weights?: number[];
+}
+
+/** 缺省混合 λ 网格：小效应 0.05 细磨 → 大效应 0.5 强收（六档等权） */
+export const DEFAULT_MIXTURE_LAMBDAS: readonly number[] = [0.05, 0.1, 0.15, 0.25, 0.35, 0.5];
+
+/** exp 安全上界（log 资本 ≥ 此值时 eValue 饱和 +∞，避免 exp 溢出噪声） */
+const LOG_EXP_OVERFLOW = 709.782712893384;
+
+/**
+ * 混合 e-过程（ε-mixture 资本过程，log 域实现）。
+ *
+ * 数学：分量 j 的资本 W_j = Π_i (1 + λ_j (X_i − μ0)) 在零假设下是
+ * 非负上鞅（E[W_j] ≤ 1）；凸组合 W = Σ_j w_j W_j 仍是非负上鞅
+ * （上鞅的凸组合保持，Jensen/线性期望逐条成立）→ Ville：
+ *   P(∃t: W_t ≥ 1/α) ≤ α —— 任意停止时刻合法。
+ *
+ * 数值：每个分量以 logCapital_j = Σ log1p(λ_j(X_i − μ0)) 累积
+ * （|λ_j| ≤ 0.5 ⇒ 因子 ∈ [0.5, 1.5]，log1p 无损）；混合读取走
+ * log-sum-exp——万步流的 1e-3010 量级资本在线性域早已下溢为 0，
+ * log 域仍精确（logEValue 无损口径）。
+ */
+export class MixtureEProcess {
+  private readonly mu0Value: number;
+  private readonly lambdas: number[];
+  private readonly logWeights: number[];
+  private readonly logCapitals: number[];
+  private n = 0;
+  private mean = 0;
+  private peakLog = 0; // log 域历史峰值（审计）
+
+  constructor(
+    mu0: number,
+    side: EProcessSide,
+    options?: MixtureEProcessOptions,
+  ) {
+    this.mu0Value = Math.min(1 - 1e-9, Math.max(1e-9, mu0));
+    const rawLambdas = options?.lambdas ?? DEFAULT_MIXTURE_LAMBDAS;
+    const filtered = rawLambdas.map((l) => Math.abs(l)).filter((l) => Number.isFinite(l) && l >= 1e-4);
+    this.lambdas = (filtered.length > 0 ? filtered : [...DEFAULT_MIXTURE_LAMBDAS]).map((l) =>
+      Math.min(0.5, Math.max(1e-4, side === 'at-least' ? -l : l)),
+    );
+    const rawW = options?.weights;
+    const base = rawW && rawW.length === this.lambdas.length ? rawW.map((w) => Math.max(0, w)) : this.lambdas.map(() => 1);
+    const total = base.reduce((s, w) => s + w, 0);
+    // 全零权重（如调用方传全 0）回退均匀——避免 log(0/0)=NaN 逐点污染 e-值
+    this.logWeights = total > 0 ? base.map((w) => Math.log(w / total)) : base.map(() => -Math.log(base.length));
+    this.logCapitals = this.lambdas.map(() => 0);
+  }
+
+  /** 参考水位线 */
+  get mu0(): number {
+    return this.mu0Value;
+  }
+
+  /** λ 网格副本（审计用） */
+  get mixtureLambdas(): number[] {
+    return [...this.lambdas];
+  }
+
+  /** 观测一次 x ∈ [0,1]；返回更新后的混合 e-值 */
+  observe(x: number): number {
+    const v = Math.max(0, Math.min(1, x));
+    for (let j = 0; j < this.lambdas.length; j += 1) {
+      const factor = Math.max(0.5, 1 + this.lambdas[j]! * (v - this.mu0Value)); // |λ|≤0.5 ⇒ 因子 ≥ 0.5（冗余防御）
+      this.logCapitals[j]! += Math.log(factor);
+    }
+    this.n += 1;
+    this.mean += (v - this.mean) / this.n;
+    const logE = this.logEValue;
+    if (logE > this.peakLog) this.peakLog = logE;
+    return logE >= LOG_EXP_OVERFLOW ? Number.POSITIVE_INFINITY : Math.exp(logE);
+  }
+
+  /** 混合 e-值（log 域读取后安全 exp；log ≥ 709.78 饱和 +∞） */
+  get eValue(): number {
+    const logE = this.logEValue;
+    return logE >= LOG_EXP_OVERFLOW ? Number.POSITIVE_INFINITY : Math.exp(logE);
+  }
+
+  /** 混合 e-值的对数（无损口径：线性域下溢到 0 后仍精确可读） */
+  get logEValue(): number {
+    return mixtureLogSumExp(this.logCapitals, this.logWeights);
+  }
+
+  /** log 域历史峰值 */
+  get peakLogValue(): number {
+    return this.peakLog;
+  }
+
+  /** 样本量 */
+  get count(): number {
+    return this.n;
+  }
+
+  /** 是否已在水平 α 下拒绝零假设（log 域比较，无溢出） */
+  rejectedAt(alpha: number): boolean {
+    return this.logEValue >= -Math.log(alpha);
+  }
+
+  /** 任意时刻有效 p-值：p_t = min(1, exp(−logE))（超均匀） */
+  anytimePValue(): number {
+    const logE = this.logEValue;
+    if (logE <= 0) return 1;
+    return logE >= LOG_EXP_OVERFLOW ? 0 : Math.exp(-logE);
+  }
+}
+
+/** log 域凸组合读取：log Σ_j w_j e^{c_j}（log-sum-exp，防上下溢） */
+function mixtureLogSumExp(logCapitals: readonly number[], logWeights: readonly number[]): number {
+  let max = Number.NEGATIVE_INFINITY;
+  for (let j = 0; j < logCapitals.length; j += 1) {
+    const v = logCapitals[j]! + logWeights[j]!;
+    if (v > max) max = v;
+  }
+  if (max === Number.NEGATIVE_INFINITY || max === Number.POSITIVE_INFINITY) return max;
+  let sum = 0;
+  for (let j = 0; j < logCapitals.length; j += 1) {
+    sum += Math.exp(logCapitals[j]! + logWeights[j]! - max);
+  }
+  return max + Math.log(sum);
+}
+
+// ─────────────────────────── R5：e-过程对偶置信集（AV-CI） ───────────────────────────
+
+/** 任意时刻有效置信集读取视图 */
+export interface AnytimeConfidenceSet {
+  /** 置信集下端（空集时 +∞——诚实的不确定：什么都不包含） */
+  lower: number;
+  /** 置信集上端（空集时 −∞） */
+  upper: number;
+  /** 置信集是否为空（全部网格点被 e-过程拒绝） */
+  empty: boolean;
+  /** 覆盖参数（任意停止时刻覆盖 ≥ 1−α） */
+  alpha: number;
+  /** 网格步长 */
+  gridStep: number;
+  /** 被拒绝的网格点数（审计：证据对假设空间的切除量） */
+  rejected: number;
+  /** 网格点总数 */
+  grid: number;
+}
+
+/**
+ * 任意时刻有效置信集（e-过程对偶：拒绝 {μ₀ : e(μ₀) ≥ 1/α}）。
+ *
+ * 对每个网格点 μ₀ 构造**点零假设** H0: μ = μ₀ 的双向等权混合
+ * e-过程 e(μ₀) = ½·e↑(μ₀) + ½·e↓(μ₀)：点零下两个单向上鞅期望
+ * 都恰为 1，等权平均仍是上鞅 → Ville：P(∃t: e(μ*) ≥ 1/α) ≤ α。
+ * 保留集（未被拒绝的 μ₀）在任意停止时刻以 ≥ 1−α 覆盖真值。
+ *
+ * 与缝合置信序列（EmpiricalBernsteinSequence）的分工：CS 给
+ * 「半径随 n 收缩」的中心区间；本函数给「e-证据切除」的对偶区间——
+ * 二者数学口径同源（都时间一致），切除式区间在强证据下可非对称
+ * 收缩（证据说「不在这里」就真的切掉）。纯函数：对给定样本数组
+ * 一次性计算，复杂度 O(grid × n × |λ|)。
+ */
+export function anytimeConfidenceSet(
+  samples: readonly number[],
+  alpha: number,
+  options?: { grid?: number[]; lambdas?: number[] },
+): AnytimeConfidenceSet {
+  const grid =
+    options?.grid ??
+    Array.from({ length: 99 }, (_, i) => Math.min(1, Math.max(0, (i + 1) / 100))); // 0.01 ~ 0.99
+  let lower = Number.POSITIVE_INFINITY;
+  let upper = Number.NEGATIVE_INFINITY;
+  let rejectedCount = 0;
+  const logAlpha = -Math.log(alpha);
+  for (const mu0 of grid) {
+    // 双向等权混合：log e = lse(logUp + ln½, logDown + ln½)
+    const up = new MixtureEProcess(mu0, 'at-most', { lambdas: options?.lambdas });
+    const down = new MixtureEProcess(mu0, 'at-least', { lambdas: options?.lambdas });
+    for (const s of samples) {
+      const v = Math.max(0, Math.min(1, s));
+      up.observe(v);
+      down.observe(v);
+    }
+    const logHalf = Math.log(0.5);
+    const logE = mixtureLogSumExp([up.logEValue, down.logEValue], [logHalf, logHalf]);
+    if (logE >= logAlpha) {
+      rejectedCount += 1;
+    } else {
+      if (mu0 < lower) lower = mu0;
+      if (mu0 > upper) upper = mu0;
+    }
+  }
+  const empty = rejectedCount === grid.length;
+  return {
+    lower: empty ? Number.POSITIVE_INFINITY : lower,
+    upper: empty ? Number.NEGATIVE_INFINITY : upper,
+    empty,
+    alpha,
+    gridStep: grid.length > 1 ? Math.abs(grid[1]! - grid[0]!) : 0,
+    rejected: rejectedCount,
+    grid: grid.length,
+  };
 }
 
 // ─────────────────────────── e-BH 多重检验 ───────────────────────────

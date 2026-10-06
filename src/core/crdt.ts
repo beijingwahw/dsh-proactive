@@ -13,9 +13,14 @@
  *   - OR-Set (add-win): 元素带唯一标签，add 打标签 / remove 摘标签，
  *     合并 = 标签并集；并发 add+remove 中 add 胜（语义选择，非歧义）
  *   - LWW-Register: 时间戳偏序 + 节点 id 平局仲裁（全序保证合并唯一）
+ *   - 2P-Set (remove-win，R5): 两相集——add 集只增、tombstone 集只增，
+ *     元素一旦移除永不复活；与 OR-Set 的 add-win 互为对偶语义选择
+ *   - Delta-G-Counter (R5): 增量状态传播——只发增量不发全量，
+ *     增量合并闭包仍为 join-semilattice（收敛定理不动），
+ *     通信量从 O(节点数) 每条消息降到 O(活跃分量)
  *
  *   验证锚点: 随机操作流的任意置换应用 → 状态逐位相等（收敛定理的
- *   有限样本验证）；三律逐位检查。
+ *   有限样本验证）；三律逐位检查；delta 传播 ≡ 全量传播（等价证明）。
  *
  * 零漂移: 纯数据结构内核（引擎按需使用），未挂载零介入。
  */
@@ -23,9 +28,18 @@
 /** G-Counter（增长计数器；merge = 逐分量 max） */
 export class GCounter {
   private counts = new Map<string, number>();
+  /**
+   * 未收割增量（delta-state CRDT，R5 性能进化）：记录**自上次收割以来
+   * 被触碰分量的最新状态片段**（绝对分量值，非增量差——delta-state 语义
+   * 下「增量」= 部分状态，合并仍 = 逐分量 max，与全量合并代数等价；
+   * Almeida et al. 2018 delta-CRDT 口径）。
+   */
+  private pending = new Map<string, number>();
 
   increment(nodeId: string, by = 1): void {
-    this.counts.set(nodeId, (this.counts.get(nodeId) ?? 0) + Math.max(0, Math.floor(by)));
+    const delta = Math.max(0, Math.floor(by));
+    this.counts.set(nodeId, (this.counts.get(nodeId) ?? 0) + delta);
+    if (delta > 0) this.pending.set(nodeId, this.counts.get(nodeId)!);
   }
 
   value(): number {
@@ -44,10 +58,80 @@ export class GCounter {
     }
   }
 
+  /**
+   * 增量传播（R5）：自上次收割以来被触碰分量的状态片段（空对象 = 无
+   * 增量可发）。语义: 对等端 mergeDelta(d) 与 merge(本端全量) 终态逐位
+   * 相同——只发触碰分量（通常 1 条）不发全量 state()（全部活跃分量）。
+   */
+  drainDelta(): Record<string, number> {
+    const delta = Object.fromEntries(this.pending);
+    this.pending.clear();
+    return delta;
+  }
+
+  /** 增量合并（R5）：逐分量 max（与全量 merge 同一代数闭包） */
+  mergeDelta(delta: Record<string, number>): void {
+    for (const [k, v] of Object.entries(delta)) {
+      const num = Math.max(0, Math.floor(v));
+      if (num > (this.counts.get(k) ?? 0)) this.counts.set(k, num);
+    }
+  }
+
   clone(): GCounter {
     const c = new GCounter();
     c.merge(this);
     return c;
+  }
+}
+
+/**
+ * 2P-Set（两相集；R5 数学进化——remove-win 语义的形式化）。
+ *
+ * grow 集只增 + tombstone 集只增；has(e) = grow(e) ∧ ¬tomb(e)。
+ * 与 OR-Set 的 add-win 互为对偶语义选择:
+ *   OR-Set: remove 只能摘掉**见过的**标签——并发 add 胜（适合购物车：
+ *   你不知道别人正往里加什么）；
+ *   2P-Set: tombstone 一旦落下永不撤销——remove 胜（适合黑名单/撤回：
+ *   「删了就是删了」，永不被迟到的 add 复活）。
+ * 合并 = 两集分别并集 ⟹ join-semilattice ⟹ 三律成立 ⟹ 收敛定理适用。
+ */
+export class TwoPhaseSet {
+  private added = new Set<string>();
+  private tombed = new Set<string>();
+
+  add(element: string): void {
+    this.added.add(element);
+  }
+
+  /** 移除（打 tombstone——对未见过的元素同样生效：remove 永胜） */
+  remove(element: string): void {
+    this.tombed.add(element);
+  }
+
+  has(element: string): boolean {
+    return this.added.has(element) && !this.tombed.has(element);
+  }
+
+  /** 活跃元素（add 过且未 tomb） */
+  elements(): string[] {
+    return [...this.added].filter((e) => !this.tombed.has(e));
+  }
+
+  /** 合并 = 两集分别并（交换/结合/幂等三律的逐位检查锚点） */
+  merge(other: TwoPhaseSet): void {
+    for (const e of other.added) this.added.add(e);
+    for (const e of other.tombed) this.tombed.add(e);
+  }
+
+  /** 状态快照（可序列化口径） */
+  state(): { added: string[]; tombed: string[] } {
+    return { added: [...this.added], tombed: [...this.tombed] };
+  }
+
+  clone(): TwoPhaseSet {
+    const s = new TwoPhaseSet();
+    s.merge(this);
+    return s;
   }
 }
 

@@ -19,6 +19,11 @@
  * 自主智能层（目标引擎 / 元认知 / 策略进化 / 心跳循环）使系统在无外部信号时
  * 也能自我观察、自我改进、自我进化。
  * 全部资源在 fiber 卸载时按依赖逆序清理（cleanup）。
+ *
+ * 第四轮 R4-A17：① 第三/四轮模块域升级经 autonomy.modules.* 16 旗标接入
+ * 插件运行时（缺省全关——关 = 零挂载零注入，行为与升级前逐位一致）；② 主链
+ * 路深化三件套（跨步骤缓存 / 降级阶梯 / 步骤预取）经 autonomy.pipeline.* 旗标
+ * 缺省关闭接入（introspect 导出 moduleFlags 总览与 pipelineDeepening 读数）。
  */
 
 import fs from 'node:fs';
@@ -42,7 +47,7 @@ import { LLMClient, type ModelConfig } from './llm-client.js';
 import { Sentinel, type Signal, type SignalBatch } from './sentinel.js';
 import { ModelScheduler } from './model-scheduler.js';
 import { TaskExecutor } from './task-executor.js';
-import type { NodeRunner, PlanExecutionResult } from './types.js';
+import type { NodeRunner, PlanExecutionResult, ExecutionPlan } from './types.js';
 import { Optimizer } from './optimizer.js';
 import { Reflector } from './reflector.js';
 import { attachDashboard } from './dashboard/index.js';
@@ -78,8 +83,23 @@ import { renderSankeyHtml } from './symbiosis/observability.js';
 import { CuriosityEngine, type ExplorationProposal } from './curiosity-engine.js';
 import { SafetyGovernor } from './safety-governor.js';
 import { SymbiosisBridge } from './symbiosis/bridge.js';
+import { PlasticityLoop } from './plasticity/loop.js';
+import { Consolidator } from './plasticity/consolidation.js';
+import { ProbeOperations } from './plasticity/probes-ops.js';
+import { auditConstitution } from './plasticity/constitution.js';
 import { HostFusionLayer } from './host-fusion.js';
 import { resolveHostLLM, resolveHostModels, resolveHeaderProvider, resolveLocalKeyProvider, describeKeySources, KeyHealthManager } from './dsh-host.js';
+// 第四轮 R4-A17：模块域升级接线适配层（autonomy.modules.* 旗标 → attach / 构造配置片段）
+import {
+  attachPostConstructModuleUpgrades,
+  clientModuleUpgradeConfig,
+  cryptoModuleUpgradeConfig,
+  metaStabilityUpgradeConfig,
+  moduleFlagOverview,
+  sentinelModuleUpgradeConfig,
+  symbiosisMonetaryUpgradeConfig,
+  type ModuleUpgradeFlags,
+} from './engines-frontier/autonomy25.js';
 
 // ─────────────────────────── 插件配置类型 ───────────────────────────
 
@@ -139,6 +159,28 @@ export interface SchedulerConfig {
     enabled?: boolean;
     /** 心跳间隔（毫秒，缺省 30000） */
     heartbeatMs?: number;
+    /**
+     * 新臂入场探索（调度器 UCB 旋钮透传）。sampleFloor：每模型×任务
+     * 类型积累 N 样本前保持探索加成——中龄系统引入新模型时，冷启动
+     * 限定 UCB（总预算 30）给不出首发流量（桶内对照是 τ2 结构固化
+     * 的数据前提）。缺省关闭（沿用冷启动口径，零漂移）。
+     */
+    exploration?: {
+      enabled?: boolean;
+      sampleFloor?: number;
+      budget?: number;
+      bonus?: number;
+      /** G4 推荐反垄断：放弃历史推荐交动态选型的概率（0~1，缺省 0 零漂移） */
+      overrideRate?: number;
+    };
+    /**
+     * 创世纪 G4 · 快路径反垄断：reuseModels = false 时快路径只复用
+     * 计划结构、解钉历史模型指派（执行期重新选型——新臂获得入场
+     * 流量，桶内对照恢复供给）。缺省 true（旧行为零漂移）。
+     */
+    fastPath?: {
+      reuseModels?: boolean;
+    };
     /** 目标引擎配置覆盖 */
     goal?: Partial<import('./goal-engine.js').GoalEngineConfig>;
     /** 元认知配置覆盖 */
@@ -237,6 +279,40 @@ export interface SchedulerConfig {
         sankeyPath?: string;
         /** 每 N 拍心跳落盘一次（缺省 5） */
         everyNTicks?: number;
+      };
+      /**
+       * E 路线：τ1 可塑性学习闭环（缺省关闭；须同时 symbiosis.enabled = true）。
+       * 启用后每次任务结算（成败 + 逐节点真值）喂给三内核的参数级在线
+       * 学习（Beta 后验 / 门控校准 / 预算赌徒路由）；学习状态原子落盘，
+       * 每窗口自动遗忘门控（冻结探针对数损失退化即回滚本窗口）。
+       * 纯影子学习：不改变任何铸币/分红/信誉数值。
+       */
+      plasticity?: {
+        /** 是否启用（缺省 false；须同时 symbiosis.enabled = true） */
+        enabled?: boolean;
+        /** 学习状态持久化路径（如 .scheduler/plasticity.json；不设则内存态） */
+        persistPath?: string;
+        /** 每多少事件执行一轮遗忘门控（缺省 50） */
+        gateWindow?: number;
+        /** 每轮冻结的探针数（缺省 50） */
+        probeSize?: number;
+        /** 探针采样种子（门控决策可复现；缺省 0x9e3779b9） */
+        seed?: number;
+        /** τ2 固化：规则档案持久化路径（如 .scheduler/plasticity-rules.json） */
+        rulesPath?: string;
+        /** τ2 固化：每多少结算事件尝试一轮固化（缺省 200） */
+        consolidateEvery?: number;
+        /**
+         * 创世纪 G3 · 探针操作（缺省关闭）：检测对照市场流动性枯竭
+         * （饿死/陈旧臂），预算限定内注入真实微任务。探针是真实模型
+         * 调用（~10-50 token/条），绝非伪造结算。
+         */
+        probes?: {
+          /** 是否启用（缺省 false） */
+          enabled?: boolean;
+          /** 滚动每小时最多注入条数（缺省 6——央行预算） */
+          maxPerHour?: number;
+        };
       };
       /**
        * D 路线：全智能体接入（缺省关闭；须同时 symbiosis.enabled = true）。
@@ -819,6 +895,146 @@ export interface SchedulerConfig {
       /** 潜维数 r（缺省 3） */
       rank?: number;
     };
+    /**
+     * 创世纪升级（51.0→75.0）：五大新层 25 个内核的统一开关命名空间。
+     * 全部缺省关闭（false / 不挂载）——打开才挂载，关闭时引擎行为与
+     * 升级前逐位一致（零漂移是本仓库的宪法）。旗标名与各内核文件尾
+     * 「接线建议」块的建议对齐（统一收敛为 kernels.<camelCase>.enabled）。
+     */
+    kernels?: {
+      /** 51.0 投机解码：模型调度/任务执行的 drafter→verifier 配对经济裁决（咨询口径） */
+      speculativeDecoding?: { enabled?: boolean; maxK?: number };
+      /** 52.0 测试时计算：任务执行的高价值任务投票路数可达性计算（咨询口径） */
+      testTimeCompute?: { enabled?: boolean; alpha?: number };
+      /** 53.0 Whittle 指数：模型/租户两态臂的部分激活最优调度（动态选型升级） */
+      whittleIndex?: { enabled?: boolean; goodThreshold?: number; passiveHeal?: number; discount?: number };
+      /** 54.0 Lyapunov 漂移加罚：任务执行的任务类型背压账本与稳定性告警（观测口径） */
+      lyapunovBackpressure?: { enabled?: boolean; V?: number; priceThreshold?: number };
+      /** 55.0 Hawkes 自激发：哨兵到达流的自激发风暴判定与爆发外推（观测口径） */
+      hawkesBurstGuard?: { enabled?: boolean; windowSec?: number; burstShare?: number; minEvents?: number };
+      /** 56.0 置信传播：世界模型多源证据融合（旁路咨询口径） */
+      beliefPropagation?: { enabled?: boolean };
+      /** 57.0 变分推断：元认知平均场后验（6.0 自由能 q 分布供给方；旁路咨询） */
+      variationalInference?: { enabled?: boolean };
+      /** 58.0 朗之万采样：策略进化变异分布的 MALA 健康度体检（只读口径） */
+      langevinMutation?: { enabled?: boolean; steps?: number; seed?: number };
+      /** 59.0 课程学习：好奇心探索难度的掌握门限爬阶（记账 + 读数口径） */
+      curriculum?: { enabled?: boolean; levelCount?: number; threshold?: number };
+      /** 60.0 率失真：长期记忆 keep/compress/drop 三档压缩规划 + 影子价格 KPI（只读规划） */
+      rateDistortion?: { enabled?: boolean; budgetBits?: number };
+      /** 61.0 稳定匹配：共生市场双边偏好撮合（影子口径） */
+      stableMatching?: { enabled?: boolean };
+      /** 62.0 机制设计：共生市场 Myerson 保留价 + VCG 竞争出清（影子口径） */
+      mechanismDesign?: { enabled?: boolean };
+      /** 63.0 核仁：共生分账的 Shapley × 核仁双口径审计（影子口径） */
+      nucleolusAudit?: { enabled?: boolean };
+      /** 64.0 相关均衡：竞争性协调议题的无悔动态 CE 画像（影子口径） */
+      correlatedEquilibrium?: { enabled?: boolean };
+      /** 65.0 动态定价：共生费率档的 UCB/Thompson 学习定价（影子口径） */
+      dynamicPricing?: { enabled?: boolean; policy?: 'ucb' | 'thompson'; unit?: number; exploration?: number };
+      /** 66.0 模拟退火：策略进化种群的势阱深度与逃逸温度体检（只读口径） */
+      annealingEscape?: { enabled?: boolean };
+      /** 67.0 NSGA-II：模型调度「质量-成本-延迟」帕累托前沿菜单（只读口径） */
+      paretoFront?: { enabled?: boolean };
+      /** 68.0 压缩距离：长期记忆 NCD 近邻查重（零模型「内容相近」判据；只读咨询） */
+      compressionDistance?: { enabled?: boolean; threshold?: number };
+      /** 69.0 Mapper 图：世界模型经验地形骨架（拓扑盲区可见；只读口径） */
+      mapperGraph?: { enabled?: boolean; intervals?: number; overlap?: number; clusterEps?: number };
+      /** 70.0 部分信息分解：反思器多模型组合的冗余/独占/协同诊断（只读分析） */
+      pidDiagnostics?: { enabled?: boolean };
+      /** 71.0 A* 搜索：优化器最优子计划搜索（旁路咨询口径） */
+      astarSearch?: { enabled?: boolean };
+      /** 72.0 稀疏恢复：优化器质量归因的 Lasso+CV 稀疏 active 集（旁路分析） */
+      sparseRecovery?: { enabled?: boolean };
+      /** 73.0 最佳臂识别：基准报告的引擎锦标赛冠军裁决（纯报告附加） */
+      baiSelector?: { enabled?: boolean; budget?: number };
+      /** 74.0 镜像下降：决策引擎行动混合的无悔策略读数（咨询口径） */
+      mirrorDescent?: { enabled?: boolean; mirror?: 'entropic' | 'euclidean'; alpha?: number };
+      /** 75.0 在线校准：决策引擎概率口径前置层（门控激活后置信度被校准） */
+      onlineCalibration?: { enabled?: boolean; strategy?: 'platt' | 'isotonic' | 'blended'; lr?: number; window?: number };
+      /**
+       * 第二轮创世纪升级（76.0→100.0）：五大新层 25 个内核的统一开关。
+       * 全部缺省关闭（false / 不挂载）——打开才挂载，关闭时引擎行为与
+       * 升级前逐位一致（零漂移是本仓库的宪法）。旗标名与各内核文件尾
+       * 「接线建议」块的建议对齐（统一收敛为 kernels.<camelCase>.enabled）。
+       */
+      /** 76.0 新奇检测：哨兵「异常 = 没见过」双证据判定 + 新奇分序列变点监测（观测口径） */
+      noveltySentinel?: { enabled?: boolean; capacity?: number; halfLife?: number; minSamples?: number; changeAlpha?: number };
+      /** 77.0 因果发现：观测指标流 PC 学图（CPDAG 等价类，无向边 = 数据说不清；旁路咨询） */
+      causalDiscovery?: { enabled?: boolean; alpha?: number };
+      /** 78.0 典型相关：多源证据对齐的公共潜坐标系（私有噪声方向自动降权；旁路咨询） */
+      ccaAlignment?: { enabled?: boolean; lambda?: number };
+      /** 79.0 扩散映射：经验连续嵌入（与 69.0 Mapper 成对：骨架 + 连续坐标；旁路咨询） */
+      diffusionManifold?: { enabled?: boolean; k?: number; dims?: number };
+      /** 80.0 流式概要：哨兵高频流缓冲（键频上界/滑窗计数/等概率样本/重元素；观测口径） */
+      streamingSketch?: { enabled?: boolean; cmsEps?: number; cmsDelta?: number; window?: number; reservoirK?: number };
+      /** 81.0 论证：深思/反思结论的辩护链裁决（grounded 语义；影子计算） */
+      argumentation?: { enabled?: boolean };
+      /** 82.0 众包聚合：多模型判定的 Dawid–Skene 信任票权（对角塌陷 = 自动摘牌；咨询口径） */
+      crowdAggregation?: { enabled?: boolean };
+      /** 83.0 世界模型学习：调度轨迹学 T̂/r̂ + 值迭代 + Bellman 残差健康度（旁路咨询） */
+      worldModelLearning?: { enabled?: boolean; prior?: number };
+      /** 84.0 POMDP：决策引擎信念规划咨询（α-VI 点基下界 × QMDP 上界的信息价值间隙） */
+      pomdpPlanner?: { enabled?: boolean };
+      /** 85.0 符号求解：DAG 计划可行性静态裁决（SAT/UNSAT + 冲突账单 + 可行解计数） */
+      symbolicFeasibility?: { enabled?: boolean };
+      /** 86.0 分层技能：SMDP 宏动作时间信用分配 γ^k 体检（只读基准口径） */
+      optionsFramework?: { enabled?: boolean; episodes?: number };
+      /** 87.0 安全屏障：逐动作微分安全过滤（最小安全修改；infeasible 上报总督；咨询口径） */
+      safetyBarrier?: { enabled?: boolean; eta?: number };
+      /** 88.0 离线评估：金丝雀门控的反事实估值通道（DR + EB 置信区间；咨询口径） */
+      offPolicyEvaluation?: { enabled?: boolean; delta?: number; gamma?: number };
+      /** 89.0 安全策略改进：候选晋升的高置信证书（LCB > 0 才上线；咨询口径） */
+      safePolicyImprovement?: { enabled?: boolean; delta?: number; minSamples?: number };
+      /** 90.0 偏好学习：RLHF-lite 效用序（传递性 + 拟合优度双前置体检；影子学习） */
+      preferenceLearning?: { enabled?: boolean; minPairs?: number; l2?: number };
+      /** 91.0 新奇搜索：探索预算向行为空间空白定向（MCNS 可行性门槛；咨询口径） */
+      noveltySearch?: { enabled?: boolean; k?: number };
+      /** 92.0 自我对弈：策略进化对抗压力审计（可剥削度 + 联赛 exploiter 档案；影子计算） */
+      selfPlay?: { enabled?: boolean; leagueRounds?: number; seed?: number };
+      /** 93.0 AutoML Hyperband：引擎内超参自动寻优（连续配置 × 早停曲线；咨询口径） */
+      automlHyperband?: { enabled?: boolean; eta?: number; seed?: number };
+      /** 94.0 仿真校准：沙盒风洞修正（MMD² 域差 + 密度比换算真实口径；只读） */
+      simulationCalibration?: { enabled?: boolean };
+      /** 95.0 中断交接：ask-user 期望成本最优裁决（闭式 τ* = c_H + c_delay；咨询口径） */
+      interruptibleAutonomy?: { enabled?: boolean };
+      /** 96.0 全局工作空间：跨引擎意识总线（投标竞争 + 点火广播；心跳旁路仲裁） */
+      globalWorkspace?: { enabled?: boolean; threshold?: number; temperature?: number };
+      /** 97.0 元认知信心：决策置信度校准审计（M-ratio）+ 求助触发闭式阈值（观测口径） */
+      metacognitiveConfidence?: { enabled?: boolean };
+      /** 98.0 经验重放：长期记忆睡眠固化阶段（分层优先重放 + IS 加权；旁路口径） */
+      experienceReplay?: { enabled?: boolean; capacity?: number; alpha?: number; beta?: number };
+      /** 99.0 注意力经济：哨兵→优化器信息流拍卖（VCG 支付，谎报无利可图；影子口径） */
+      attentionEconomy?: { enabled?: boolean };
+      /** 100.0 自我边界：归因边界（防把环境红利记成功绩）+ 身份断点监控（影子计算） */
+      selfBoundary?: { enabled?: boolean };
+    };
+    /**
+     * 第四轮 R4-A17：模块域升级统一开关命名空间（autonomy.modules.*）。
+     * 把第三/四轮各模块的 attach 式 / 构造配置式升级收敛为 16 个缺省关闭
+     * 旗标（风格与 kernels.* 一致）——关 = 不挂载不注入，引擎行为与升级前
+     * 逐位一致（零漂移）；开 = 经 engines-frontier/autonomy25.ts 适配层
+     * 挂载（attachPostConstructModuleUpgrades / xxxModuleUpgradeConfig）。
+     */
+    modules?: import('./engines-frontier/autonomy25.js').ModuleUpgradeFlags;
+    /**
+     * 第四轮 R4-A17：主链路深化开关（跨步骤缓存 / 降级阶梯 / 步骤预取）。
+     * 全部缺省关闭——关闭时 10 步链路行为与升级前逐位一致；开启为纯性能 /
+     * 韧性增强（缓存命中结果与直算逐位一致、降级仅在异常时触发、预取经
+     * 代际守卫消费结果恒一致）。
+     */
+    pipeline?: {
+      /** 跨步骤派生值缓存（信号指纹 / 任务上下文推断的纯函数 LRU 记忆化） */
+      crossStepCache?: {
+        enabled?: boolean;
+        /** LRU 容量（缺省 256） */
+        capacity?: number;
+      };
+      /** 链路降级阶梯（第 5/6 步异常时：主路径 → 简化路径 → 兜底直通，逐级入审计） */
+      degradationLadder?: { enabled?: boolean };
+      /** 步骤并行化预取（执行等待期预取下一执行信号的经验检索，代际守卫消费） */
+      stepPrefetch?: { enabled?: boolean };
+    };
     /** 目标分解器注入（测试离线模拟） */
     decomposer?: import('./goal-engine.js').GoalDecomposer;
   };
@@ -843,22 +1059,94 @@ export class ToolError extends AppError {
   }
 }
 
+/** Tool 调用统计（第三轮 A17：introspect 的工具调用计数口径） */
+export interface ToolCallStats {
+  name: string;
+  /** 总调用次数（含被校验拒绝与执行失败） */
+  calls: number;
+  /** 入参校验拒绝次数 */
+  rejected: number;
+  /** handler 执行失败（抛出）次数 */
+  failures: number;
+  lastCalledAt?: number;
+}
+
+/**
+ * Tool 入参轻量校验（第三轮 A17：契约思想的零依赖自实现）。
+ *
+ * 校验口径与 parameters 声明一一对应：必填在场、类型匹配（string/number/
+ * boolean/array/object）、enum 成员资格；未声明的额外键放行（与官方
+ * JSON Schema 导出的 additionalProperties: true 一致）。返回 undefined =
+ * 通过；返回字符串 = 拒绝原因（调用方转 ToolError）。纯函数、确定性。
+ */
+export function validateToolInput(
+  parameters: ToolDefinition['parameters'],
+  args: Record<string, unknown>,
+): string | undefined {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+    return '入参必须是对象（key-value 形式）';
+  }
+  for (const [key, spec] of Object.entries(parameters)) {
+    const value = args[key];
+    if (value === undefined || value === null) {
+      if (spec.required) return `缺少必填参数 ${key}（${spec.type}）`;
+      continue;
+    }
+    const typeError = checkToolParamType(key, spec.type, value);
+    if (typeError) return typeError;
+    if (spec.enum && spec.enum.length > 0 && typeof value === 'string' && !spec.enum.includes(value)) {
+      return `参数 ${key} 的值 "${value}" 不在允许枚举内（${spec.enum.join(' / ')}）`;
+    }
+  }
+  return undefined;
+}
+
+function checkToolParamType(key: string, type: string, value: unknown): string | undefined {
+  switch (type) {
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value) ? undefined : `参数 ${key} 需为有限数字`;
+    case 'boolean':
+      return typeof value === 'boolean' ? undefined : `参数 ${key} 需为布尔值`;
+    case 'array':
+      return Array.isArray(value) ? undefined : `参数 ${key} 需为数组`;
+    case 'object':
+      return typeof value === 'object' && value !== null && !Array.isArray(value) ? undefined : `参数 ${key} 需为对象`;
+    default:
+      return typeof value === 'string' ? undefined : `参数 ${key} 需为字符串`;
+  }
+}
+
 /**
  * Tool 注册表服务
  *
  * cordis 核心未内置 Tool API，本插件以 provide('schedulerTools') 形式
  * 向宿主暴露 12 个 Tool 的注册、发现与调用能力。
+ *
+ * 第三轮 A17 升级（纯增量、零漂移——合法入参路径与升级前逐位一致）：
+ * - invoke 先经 validateToolInput 入参校验，非法入参在进入 handler 前
+ *   以 ToolError 拒绝（既有 handler 内的防御检查保持不动，双保险）；
+ * - 全部调用计数（calls / rejected / failures）经 stats() 导出，供
+ *   introspect 工具调用计数消费；
+ * - schemas() 导出每工具的官方 JSON Schema 文档（dsh-tools 子集口径）。
  */
 export class ToolRegistry {
   private tools = new Map<string, ToolDefinition>();
+  private readonly callStats = new Map<string, { calls: number; rejected: number; failures: number; lastCalledAt?: number }>();
+  private readonly statClock: () => number;
 
-  /** 注册一个 Tool（重名覆盖） */
+  constructor(options?: { /** 统计时钟（测试注入；缺省 Date.now） */ now?: () => number }) {
+    this.statClock = options?.now ?? Date.now;
+  }
+
+  /** 注册一个 Tool（重名覆盖；统计计数随新定义重置） */
   register(tool: ToolDefinition): void {
     this.tools.set(tool.name, tool);
+    this.callStats.delete(tool.name);
   }
 
   /** 注销一个 Tool */
   unregister(name: string): boolean {
+    this.callStats.delete(name);
     return this.tools.delete(name);
   }
 
@@ -872,11 +1160,56 @@ export class ToolRegistry {
     return [...this.tools.values()].map(({ name, description, parameters }) => ({ name, description, parameters }));
   }
 
-  /** 调用 Tool（未知名称抛 ToolError） */
+  /** 每工具官方 JSON Schema 文档（name + description + parameters 子集 schema） */
+  schemas(): Array<{ name: string; description: string; schema: Record<string, unknown> }> {
+    return [...this.tools.values()].map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      schema: toJsonSchemaParameters(tool.parameters),
+    }));
+  }
+
+  /** 调用统计（introspect 口径；未注册工具的未知调用不计入） */
+  stats(): { total: number; tools: ToolCallStats[] } {
+    const tools = [...this.tools.keys()].map((name) => {
+      const s = this.callStats.get(name);
+      return { name, calls: s?.calls ?? 0, rejected: s?.rejected ?? 0, failures: s?.failures ?? 0, ...(s?.lastCalledAt !== undefined ? { lastCalledAt: s.lastCalledAt } : {}) };
+    });
+    return { total: tools.reduce((sum, t) => sum + t.calls, 0), tools };
+  }
+
+  /** 清零调用统计（只清统计，不动注册表） */
+  resetStats(): void {
+    this.callStats.clear();
+  }
+
+  private statsFor(name: string): { calls: number; rejected: number; failures: number; lastCalledAt?: number } {
+    let stats = this.callStats.get(name);
+    if (!stats) {
+      stats = { calls: 0, rejected: 0, failures: 0 };
+      this.callStats.set(name, stats);
+    }
+    return stats;
+  }
+
+  /** 调用 Tool（未知名称抛 ToolError；非法入参在进入 handler 前被校验拒绝） */
   async invoke(name: string, args: Record<string, any> = {}): Promise<any> {
     const tool = this.tools.get(name);
     if (!tool) throw new ToolError(`未知 Tool: ${name}`);
-    return tool.handler(args ?? {});
+    const stats = this.statsFor(name);
+    stats.calls += 1;
+    stats.lastCalledAt = this.statClock();
+    const rejection = validateToolInput(tool.parameters, args ?? {});
+    if (rejection) {
+      stats.rejected += 1;
+      throw new ToolError(`Tool ${name} 入参校验失败: ${rejection}`);
+    }
+    try {
+      return await tool.handler(args ?? {});
+    } catch (err) {
+      stats.failures += 1;
+      throw err;
+    }
   }
 }
 
@@ -913,6 +1246,638 @@ function toJsonSchemaParameters(parameters: ToolDefinition['parameters']): Recor
   const schema: Record<string, unknown> = { type: 'object', properties, additionalProperties: true };
   if (required.length > 0) schema.required = required;
   return schema;
+}
+
+// ─────────────────────────── 第三轮 A17：10 步链路结构化审计轨迹 ───────────────────────────
+
+/** 10 步链路的步序元数据（与文件头注释的 1~10 步一一对应；审计口径的唯一事实源） */
+export const PIPELINE_STEPS = [
+  { step: 1, key: 'signal-intake', label: '信号接入' },
+  { step: 2, key: 'signal-aggregation', label: '信号聚合' },
+  { step: 3, key: 'priority-ranking', label: '优先级排序' },
+  { step: 4, key: 'strategy-decision', label: '战略决策' },
+  { step: 5, key: 'experience-retrieval', label: '经验检索' },
+  { step: 6, key: 'plan-generation', label: '计划生成' },
+  { step: 7, key: 'parallel-execution', label: '并行执行' },
+  { step: 8, key: 'quality-reflection', label: '质量反思' },
+  { step: 9, key: 'cascade-trigger', label: '级联触发' },
+  { step: 10, key: 'memory-consolidation', label: '反思与记忆更新' },
+] as const;
+
+/** 单条链路检查点（结构化审计轨迹的原子记录） */
+export interface PipelineCheckpoint {
+  /** 全局单调序号（缓冲内严格递增） */
+  seq: number;
+  /** 追踪 id（批次口径 batch-N / 信号口径为空） */
+  trace: string;
+  /** 步序 1~10 */
+  step: number;
+  stepKey: string;
+  label: string;
+  /** 时钟读数（毫秒；注入时钟时为注入值——确定性可重放） */
+  at: number;
+  /** 本步耗时（begin→end 区间；单点 mark 恒 0） */
+  durationMs: number;
+  /** 关键决策值（步序相关的结构化摘录） */
+  decisions?: Record<string, unknown>;
+  /** 结局（ok / fast-path / planned / failed / skipped / blocked / …） */
+  outcome: string;
+  detail?: Record<string, unknown>;
+}
+
+/** 审计轨迹摘要（introspect 导出口径） */
+export interface PipelineAuditSummary {
+  /** 逐步聚合（按步序升序；仅统计当前缓冲内样本） */
+  steps: Array<{ step: number; stepKey: string; label: string; count: number; totalDurationMs: number; outcomes: Record<string, number>; lastOutcome?: string }>;
+  /** 出现过检查点的步序（升序去重） */
+  coveredSteps: number[];
+  /** 从未出现检查点的步序（升序） */
+  missingSteps: number[];
+  /** 当前缓冲区检查点条数 */
+  checkpoints: number;
+  /** 环形覆盖丢弃的历史检查点累计数 */
+  dropped: number;
+  /** 导出序列的时序单调性（seq 严格递增 且 at 单调不减） */
+  monotonic: boolean;
+}
+
+/**
+ * 10 步链路结构化审计轨迹（第三轮 A17；环形缓冲 + 注入式时钟）。
+ *
+ * 纯记录口径——begin/end/mark 只写私有缓冲，不读不写任何引擎状态、
+ * 不抛异常（未知步序静默忽略）、不影响链路任何分支：缺省开启且零行为
+ * 影响。时钟经构造注入（缺省 Date.now），验证脚本可注入合成时钟获得
+ * 逐位可重放的轨迹。容量为环形上限，超出按 FIFO 覆盖最旧并累计 dropped。
+ */
+export class PipelineAuditTrail {
+  private readonly capacity: number;
+  private readonly now: () => number;
+  private readonly buffer: PipelineCheckpoint[] = [];
+  private readonly openSpans = new Map<string, number>();
+  private seq = 0;
+  private dropped = 0;
+
+  constructor(options?: {
+    /** 环形缓冲容量（缺省 1024，下限 16） */
+    capacity?: number;
+    /** 时钟注入（缺省 Date.now；确定性测试用） */
+    now?: () => number;
+  }) {
+    this.capacity = Math.max(16, Math.floor(options?.capacity ?? 1024));
+    this.now = options?.now ?? Date.now;
+  }
+
+  private static meta(step: number): { key: string; label: string } | undefined {
+    return PIPELINE_STEPS.find((s) => s.step === step);
+  }
+
+  private push(entry: Omit<PipelineCheckpoint, 'seq'>): void {
+    this.seq += 1;
+    this.buffer.push({ seq: this.seq, ...entry });
+    if (this.buffer.length > this.capacity) {
+      this.dropped += this.buffer.length - this.capacity;
+      this.buffer.splice(0, this.buffer.length - this.capacity);
+    }
+  }
+
+  /** 步骤开始（与 end 成对计时；决策值统一在 end 落账） */
+  begin(trace: string, step: number): void {
+    const meta = PipelineAuditTrail.meta(step);
+    if (!meta) return;
+    this.openSpans.set(`${trace}:${step}`, this.now());
+  }
+
+  /** 步骤结束（durationMs = end 时钟 − begin 时钟） */
+  end(trace: string, step: number, outcome: string, decisions?: Record<string, unknown>, detail?: Record<string, unknown>): void {
+    const meta = PipelineAuditTrail.meta(step);
+    if (!meta) return;
+    const key = `${trace}:${step}`;
+    const start = this.openSpans.get(key);
+    this.openSpans.delete(key);
+    const at = this.now();
+    this.push({
+      trace,
+      step,
+      stepKey: meta.key,
+      label: meta.label,
+      at,
+      durationMs: start === undefined ? 0 : Math.max(0, at - start),
+      ...(decisions !== undefined ? { decisions } : {}),
+      outcome,
+      ...(detail !== undefined ? { detail } : {}),
+    });
+  }
+
+  /** 单点检查点（无需计时的步骤：数据到位即落账，durationMs 恒 0） */
+  mark(trace: string, step: number, outcome: string, decisions?: Record<string, unknown>, detail?: Record<string, unknown>): void {
+    const meta = PipelineAuditTrail.meta(step);
+    if (!meta) return;
+    this.push({
+      trace,
+      step,
+      stepKey: meta.key,
+      label: meta.label,
+      at: this.now(),
+      durationMs: 0,
+      ...(decisions !== undefined ? { decisions } : {}),
+      outcome,
+      ...(detail !== undefined ? { detail } : {}),
+    });
+  }
+
+  /** 轨迹快照（浅拷贝；按 seq 升序） */
+  export(): PipelineCheckpoint[] {
+    return this.buffer.map((c) => ({ ...c, ...(c.decisions !== undefined ? { decisions: { ...c.decisions } } : {}), ...(c.detail !== undefined ? { detail: { ...c.detail } } : {}) }));
+  }
+
+  /** 轨迹摘要（introspect 口径：逐步计数 + 覆盖面 + 时序单调性自检） */
+  summary(): PipelineAuditSummary {
+    const steps = PIPELINE_STEPS.map((meta) => {
+      const hits = this.buffer.filter((c) => c.step === meta.step);
+      const outcomes: Record<string, number> = {};
+      for (const c of hits) outcomes[c.outcome] = (outcomes[c.outcome] ?? 0) + 1;
+      const last = hits[hits.length - 1];
+      return {
+        step: meta.step,
+        stepKey: meta.key,
+        label: meta.label,
+        count: hits.length,
+        totalDurationMs: hits.reduce((sum, c) => sum + (c.durationMs ?? 0), 0),
+        outcomes,
+        ...(last !== undefined ? { lastOutcome: last.outcome } : {}),
+      };
+    });
+    const coveredSteps = [...new Set(this.buffer.map((c) => c.step))].sort((a, b) => a - b);
+    const missingSteps = PIPELINE_STEPS.map((s) => s.step).filter((s) => !coveredSteps.includes(s));
+    let monotonic = true;
+    for (let i = 1; i < this.buffer.length; i += 1) {
+      const prev = this.buffer[i - 1]!;
+      const curr = this.buffer[i]!;
+      if (!(curr.seq === prev.seq + 1) || curr.at < prev.at) monotonic = false;
+    }
+    return { steps, coveredSteps, missingSteps, checkpoints: this.buffer.length, dropped: this.dropped, monotonic };
+  }
+
+  /** 清空轨迹与计数（测试口径） */
+  reset(): void {
+    this.buffer.length = 0;
+    this.openSpans.clear();
+    this.seq = 0;
+    this.dropped = 0;
+  }
+}
+
+// ─────────────────── 第四轮 R4-A17：主链路深化三件套（跨步骤缓存 / 降级阶梯 / 步骤预取） ───────────────────
+
+/** 跨步骤缓存读数（introspect / 验证口径） */
+export interface PipelineStepCacheStats {
+  /** 命中次数 */
+  hits: number;
+  /** 未命中次数（含代际失效） */
+  misses: number;
+  /** LRU 淘汰次数 */
+  evictions: number;
+  /** 当前条目数 */
+  size: number;
+  /** 容量上限 */
+  capacity: number;
+  /** 当前写入代数（每次 bump +1） */
+  generation: number;
+  /** 纯函数条目数（永不代际失效） */
+  pureEntries: number;
+}
+
+/**
+ * 深化 1：跨步骤派生值缓存（第四轮 R4-A17）。
+ *
+ * 链路中重复计算的纯派生值（信号指纹 sha256 / 任务上下文推断）的轻量
+ * LRU 记忆化——键 = 输入指纹，命中路径结果与直算逐位一致（纯函数同输入
+ * 同输出，构造对照可证）。两种条目：
+ * - pure（缺省 false）：纯函数值，永不失效（键即全部输入）；
+ * - 非 pure：携带写入代数，bump() 后视为陈旧（记忆写入点调用 bump——
+ *   陈旧即重算，杜绝跨写窗口读到旧值）。
+ *
+ * 纯容器：零引擎依赖、零 I/O、时钟无关；缺省不启用（autonomy.pipeline.
+ * crossStepCache），关闭时链路不经过本容器（零漂移）。
+ */
+export class PipelineStepCache<V = unknown> {
+  private entries = new Map<string, { value: V; generation: number; pure: boolean }>();
+  private hits = 0;
+  private misses = 0;
+  private evictions = 0;
+  private gen = 0;
+
+  constructor(public readonly capacity = 256) {}
+
+  /** 当前写入代数（每次 bump +1） */
+  get generation(): number {
+    return this.gen;
+  }
+
+  /** 推进写入代数：非 pure 条目全部视为陈旧（记忆写入点调用） */
+  bump(): void {
+    this.gen += 1;
+  }
+
+  /** 读取：pure 条目命中即返回；非 pure 条目须代数一致（陈旧则删除并计 miss） */
+  get(key: string): V | undefined {
+    const entry = this.entries.get(key);
+    if (entry === undefined) {
+      this.misses += 1;
+      return undefined;
+    }
+    if (!entry.pure && entry.generation !== this.gen) {
+      this.entries.delete(key);
+      this.misses += 1;
+      return undefined;
+    }
+    // LRU 新近度：命中即重插（Map 迭代序 = 插入序 → 淘汰最旧）
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    this.hits += 1;
+    return entry.value;
+  }
+
+  /** 写入（超出容量淘汰最旧条目并计数） */
+  set(key: string, value: V, options?: { pure?: boolean }): void {
+    if (this.entries.has(key)) this.entries.delete(key);
+    this.entries.set(key, { value, generation: this.gen, pure: options?.pure === true });
+    while (this.entries.size > this.capacity) {
+      const oldest = this.entries.keys().next();
+      if (oldest.done === true) break;
+      this.entries.delete(oldest.value);
+      this.evictions += 1;
+    }
+  }
+
+  /** 读数（introspect 口径） */
+  stats(): PipelineStepCacheStats {
+    let pureEntries = 0;
+    for (const entry of this.entries.values()) if (entry.pure) pureEntries += 1;
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      evictions: this.evictions,
+      size: this.entries.size,
+      capacity: this.capacity,
+      generation: this.gen,
+      pureEntries,
+    };
+  }
+
+  /** 清空（测试口径） */
+  clear(): void {
+    this.entries.clear();
+    this.hits = 0;
+    this.misses = 0;
+    this.evictions = 0;
+    this.gen = 0;
+  }
+}
+
+/** 单级降级的尝试记录（审计口径） */
+export interface DegradationAttempt {
+  /** 级序（1 = 主路径） */
+  rung: number;
+  /** 级名（main / simplified / fallback） */
+  name: string;
+  /** 该级抛出的异常消息（成功级无此键） */
+  error?: string;
+}
+
+/** 降级阶梯执行结果 */
+export interface DegradationLadderResult<T> {
+  /** 最终成功级的结果 */
+  result: T;
+  /** 成功级序（1 起；> 1 即发生过降级） */
+  usedRung: number;
+  /** 逐级尝试记录（按触发序——证明降级链按序触发） */
+  attempts: DegradationAttempt[];
+}
+
+/**
+ * 深化 2：链路降级阶梯（第四轮 R4-A17）。
+ *
+ * 某步骤（经验检索 / 计划生成）异常时的降级链：主路径 → 简化路径 → 兜底
+ * 直通——逐级尝试、逐级入审计（attempts 按序记录每级的名字与异常）。
+ * 任一级成功即返回该级结果；全部失败则抛出携带完整尝试轨迹的聚合错误
+ * （诚实上抛——上层走既有失败路径，不吞错）。
+ *
+ * 纯函数、零引擎依赖；run 支持 async（预取消费等异步主路径）。缺省不
+ * 启用（autonomy.pipeline.degradationLadder），关闭时链路不经过本函数。
+ */
+export async function runDegradationLadder<T>(
+  rungs: ReadonlyArray<{ name: string; run: () => T | Promise<T> }>,
+): Promise<DegradationLadderResult<T>> {
+  if (rungs.length === 0) throw new Error('降级阶梯为空（至少一级）');
+  const attempts: DegradationAttempt[] = [];
+  for (let i = 0; i < rungs.length; i += 1) {
+    const { name, run } = rungs[i]!;
+    try {
+      const result = await run();
+      attempts.push({ rung: i + 1, name });
+      return { result, usedRung: i + 1, attempts };
+    } catch (error) {
+      attempts.push({ rung: i + 1, name, error: (error as Error).message });
+    }
+  }
+  throw new Error(`降级阶梯全部失败：${attempts.map((a) => `L${a.rung}${a.name}${a.error ? `（${a.error}）` : ''}`).join(' → ')}`);
+}
+
+/** 步骤预取读数（introspect / 验证口径） */
+export interface StepPrefetchStats {
+  /** 预取发起次数 */
+  fired: number;
+  /** 消费次数 */
+  consumed: number;
+  /** 代际一致命中次数（免重算） */
+  hits: number;
+  /** 未命中次数（未发起 / 代际失效 → 直算） */
+  misses: number;
+}
+
+/** 单条预取条目（promise + 发起时代数） */
+interface PrefetchEntry<V> {
+  promise: Promise<V>;
+  generation: number;
+}
+
+/**
+ * 深化 3（加分）：步骤并行化预取（第四轮 R4-A17）。
+ *
+ * 无依赖步骤的预取口径：信号 i 执行等待期（第 7 步 await）预取下一执行
+ * 信号的第 5 步三重读取，消费时经代际守卫（发起与消费之间记忆代数一致才
+ * 用预取值，否则直算）——结果恒与串行直算一致，只降时延。
+ *
+ * 零引擎依赖；时钟无关。缺省不启用（autonomy.pipeline.stepPrefetch）。
+ */
+export class StepPrefetcher<V = unknown> {
+  private store = new Map<string, PrefetchEntry<V>>();
+  private statsRecord: StepPrefetchStats = { fired: 0, consumed: 0, hits: 0, misses: 0 };
+
+  constructor(private readonly generation: () => number = () => 0) {}
+
+  /** 发起预取（微任务调度——宿主 await 让出事件循环时执行；重复发起覆盖旧条目） */
+  fire(key: string, compute: () => V): void {
+    const generation = this.generation();
+    const promise = Promise.resolve().then(compute);
+    // 预取计算抛错且条目最终未被消费（批次边界 clear 作废）时，
+    // 挂一个空 catch 防 Node 未处理 Promise 拒绝；消费侧 await 的仍是原
+    // promise，拒绝照常上抛给调用方——只补漏，不改语义
+    void promise.catch(() => {});
+    this.store.set(key, { promise, generation });
+    this.statsRecord.fired += 1;
+  }
+
+  /** 消费预取：发起在案且代际一致 → 预取值（hit）；否则直算（miss）。结果恒一致。 */
+  async consume(key: string, recompute: () => V): Promise<{ value: V; hit: boolean }> {
+    this.statsRecord.consumed += 1;
+    const entry = this.store.get(key);
+    if (entry !== undefined && entry.generation === this.generation()) {
+      this.store.delete(key);
+      this.statsRecord.hits += 1;
+      return { value: await entry.promise, hit: true };
+    }
+    if (entry !== undefined) this.store.delete(key);
+    this.statsRecord.misses += 1;
+    return { value: recompute(), hit: false };
+  }
+
+  /** 读数（introspect 口径） */
+  stats(): StepPrefetchStats {
+    return { ...this.statsRecord };
+  }
+
+  /** 清空在途条目（批次边界口径——未消费的预取诚实作废，消费侧自动直算） */
+  clear(): void {
+    this.store.clear();
+  }
+}
+
+// ─────────────────────────── 第三轮 A17：fiber 资源清理审计注册表 ───────────────────────────
+
+/** 单条资源登记的审计视图 */
+export interface ResourceAuditEntry {
+  id: number;
+  kind: string;
+  label: string;
+  registeredAt: number;
+  /** held = 仍持有；released = 已释放；leaked = 登记未销账且无释放句柄；error = 释放抛错 */
+  status: 'held' | 'released' | 'leaked' | 'error';
+  releasedAt?: number;
+  /** 释放序（1 起；逆序释放中的实际次序） */
+  releasedOrder?: number;
+  error?: string;
+}
+
+/** 资源清理审计报告（disposeAll 产出 / audit 只读快照共用口径） */
+export interface ResourceAuditReport {
+  registered: number;
+  released: number;
+  leaked: number;
+  errored: number;
+  held: number;
+  /** 实际释放序（disposeAll 填充；audit() 为空数组） */
+  releaseOrder: Array<{ id: number; kind: string; label: string }>;
+  entries: ResourceAuditEntry[];
+}
+
+/**
+ * fiber 资源清理审计注册表（第三轮 A17）。
+ *
+ * 登记造册：interval / fiber / listener / watcher / server / persist 等一切
+ * dispose 句柄入册；卸载时 disposeAll() 按注册逆序释放（后注册者先释放——
+ * 与资源创建的依赖序天然相反），逐条 try/catch 记账并产出审计报告：
+ * 释放出错不阻断后续释放；登记时无释放句柄且事后未销账 → 漏释放（leaked）
+ * 显式告警。时钟可注入（缺省 Date.now）。纯登记容器，不含任何引擎依赖。
+ */
+export class ResourceRegistry {
+  private nextId = 1;
+  private releaseSeq = 0;
+  private readonly clock: () => number;
+  private readonly entries: Array<{
+    id: number;
+    kind: string;
+    label: string;
+    registeredAt: number;
+    dispose?: () => void;
+    releasedAt?: number;
+    releasedOrder?: number;
+    error?: string;
+  }> = [];
+
+  constructor(options?: { /** 时钟注入（缺省 Date.now） */ now?: () => number }) {
+    this.clock = options?.now ?? Date.now;
+  }
+
+  /** 登记一项资源（dispose 省略 = 只读登记——漏释放审计的观察对象）；返回登记 id */
+  register(kind: string, dispose?: () => void, label?: string): number {
+    const id = this.nextId;
+    this.nextId += 1;
+    this.entries.push({
+      id,
+      kind,
+      label: label ?? `${kind}#${id}`,
+      registeredAt: this.clock(),
+      ...(dispose !== undefined ? { dispose } : {}),
+    });
+    return id;
+  }
+
+  /** 外部销账（资源已由其它路径释放；无 dispose 句柄的只读登记用） */
+  markReleased(id: number): boolean {
+    const entry = this.entries.find((e) => e.id === id);
+    if (!entry || entry.releasedAt !== undefined) return false;
+    entry.releasedAt = this.clock();
+    this.releaseSeq += 1;
+    entry.releasedOrder = this.releaseSeq;
+    return true;
+  }
+
+  /** 仍持有的登记数 */
+  get size(): number {
+    return this.entries.filter((e) => e.releasedAt === undefined).length;
+  }
+
+  /** 按注册逆序释放全部未销账登记并产出审计报告（释放出错记账不阻断） */
+  disposeAll(): ResourceAuditReport {
+    const releaseOrder: Array<{ id: number; kind: string; label: string }> = [];
+    for (let i = this.entries.length - 1; i >= 0; i -= 1) {
+      const entry = this.entries[i]!;
+      if (entry.releasedAt !== undefined) continue; // 已提前销账——跳过
+      if (typeof entry.dispose === 'function') {
+        try {
+          entry.dispose();
+          entry.releasedAt = this.clock();
+          this.releaseSeq += 1;
+          entry.releasedOrder = this.releaseSeq;
+        } catch (err) {
+          entry.error = err instanceof Error ? err.message : String(err);
+        }
+      }
+      // 无 dispose 句柄且未销账 → 保持未释放状态，报告中以 leaked 呈现（漏释放检测）
+      if (entry.releasedAt !== undefined) releaseOrder.push({ id: entry.id, kind: entry.kind, label: entry.label });
+    }
+    return this.report(releaseOrder);
+  }
+
+  /** 只读审计快照（不释放任何资源） */
+  audit(): ResourceAuditReport {
+    return this.report([]);
+  }
+
+  private report(releaseOrder: ResourceAuditReport['releaseOrder']): ResourceAuditReport {
+    const entries: ResourceAuditEntry[] = this.entries.map((e) => ({
+      id: e.id,
+      kind: e.kind,
+      label: e.label,
+      registeredAt: e.registeredAt,
+      status: e.releasedAt !== undefined ? 'released' : e.error !== undefined ? 'error' : typeof e.dispose === 'function' ? 'held' : 'leaked',
+      ...(e.releasedAt !== undefined ? { releasedAt: e.releasedAt } : {}),
+      ...(e.releasedOrder !== undefined ? { releasedOrder: e.releasedOrder } : {}),
+      ...(e.error !== undefined ? { error: e.error } : {}),
+    }));
+    return {
+      registered: entries.length,
+      released: entries.filter((e) => e.status === 'released').length,
+      leaked: entries.filter((e) => e.status === 'leaked').length,
+      errored: entries.filter((e) => e.status === 'error').length,
+      held: entries.filter((e) => e.status === 'held').length,
+      releaseOrder,
+      entries,
+    };
+  }
+}
+
+// ─────────────────────────── 第三轮 A17：内核旗标总览（kernels.* 50 旗标） ───────────────────────────
+
+/** 单个 kernels.* 旗标的静态元数据 */
+export interface KernelFlagMeta {
+  /** 旗标名（kernels 命名空间的键） */
+  name: string;
+  /** 内核版本号（51.0 → 100.0） */
+  version: string;
+  /** 升级轮次（1 = 创世纪 51.0→75.0；2 = 第二轮创世纪 76.0→100.0） */
+  wave: 1 | 2;
+  /** 挂载点引擎（attachXxx 所在文件） */
+  scope: string;
+}
+
+/** 旗标开关态（元数据 + 运行时 enabled） */
+export interface KernelFlagState extends KernelFlagMeta {
+  enabled: boolean;
+}
+
+/** 内核旗标总览（introspect 导出口径） */
+export interface KernelFlagOverview {
+  total: number;
+  enabled: number;
+  disabled: number;
+  flags: KernelFlagState[];
+}
+
+/** kernels.* 命名空间 50 旗标的静态清单（与 SchedulerConfig.autonomy.kernels 一一对应） */
+export const KERNEL_FLAGS: ReadonlyArray<KernelFlagMeta> = [
+  { name: 'speculativeDecoding', version: '51.0', wave: 1, scope: 'model-scheduler' },
+  { name: 'testTimeCompute', version: '52.0', wave: 1, scope: 'task-executor' },
+  { name: 'whittleIndex', version: '53.0', wave: 1, scope: 'model-scheduler' },
+  { name: 'lyapunovBackpressure', version: '54.0', wave: 1, scope: 'task-executor' },
+  { name: 'hawkesBurstGuard', version: '55.0', wave: 1, scope: 'sentinel' },
+  { name: 'beliefPropagation', version: '56.0', wave: 1, scope: 'world-model' },
+  { name: 'variationalInference', version: '57.0', wave: 1, scope: 'meta-cognition' },
+  { name: 'langevinMutation', version: '58.0', wave: 1, scope: 'strategy-evolution' },
+  { name: 'curriculum', version: '59.0', wave: 1, scope: 'curiosity' },
+  { name: 'rateDistortion', version: '60.0', wave: 1, scope: 'long-term-memory' },
+  { name: 'stableMatching', version: '61.0', wave: 1, scope: 'symbiosis' },
+  { name: 'mechanismDesign', version: '62.0', wave: 1, scope: 'symbiosis' },
+  { name: 'nucleolusAudit', version: '63.0', wave: 1, scope: 'symbiosis' },
+  { name: 'correlatedEquilibrium', version: '64.0', wave: 1, scope: 'symbiosis' },
+  { name: 'dynamicPricing', version: '65.0', wave: 1, scope: 'symbiosis' },
+  { name: 'annealingEscape', version: '66.0', wave: 1, scope: 'strategy-evolution' },
+  { name: 'paretoFront', version: '67.0', wave: 1, scope: 'model-scheduler' },
+  { name: 'compressionDistance', version: '68.0', wave: 1, scope: 'long-term-memory' },
+  { name: 'mapperGraph', version: '69.0', wave: 1, scope: 'world-model' },
+  { name: 'pidDiagnostics', version: '70.0', wave: 1, scope: 'reflector' },
+  { name: 'astarSearch', version: '71.0', wave: 1, scope: 'optimizer' },
+  { name: 'sparseRecovery', version: '72.0', wave: 1, scope: 'optimizer' },
+  { name: 'baiSelector', version: '73.0', wave: 1, scope: 'benchmark' },
+  { name: 'mirrorDescent', version: '74.0', wave: 1, scope: 'decision-engine' },
+  { name: 'onlineCalibration', version: '75.0', wave: 1, scope: 'decision-engine' },
+  { name: 'noveltySentinel', version: '76.0', wave: 2, scope: 'sentinel' },
+  { name: 'causalDiscovery', version: '77.0', wave: 2, scope: 'world-model' },
+  { name: 'ccaAlignment', version: '78.0', wave: 2, scope: 'world-model' },
+  { name: 'diffusionManifold', version: '79.0', wave: 2, scope: 'world-model' },
+  { name: 'streamingSketch', version: '80.0', wave: 2, scope: 'sentinel' },
+  { name: 'argumentation', version: '81.0', wave: 2, scope: 'reflection-engine' },
+  { name: 'crowdAggregation', version: '82.0', wave: 2, scope: 'reflector' },
+  { name: 'worldModelLearning', version: '83.0', wave: 2, scope: 'world-model' },
+  { name: 'pomdpPlanner', version: '84.0', wave: 2, scope: 'decision-engine' },
+  { name: 'symbolicFeasibility', version: '85.0', wave: 2, scope: 'task-executor' },
+  { name: 'optionsFramework', version: '86.0', wave: 2, scope: 'task-executor' },
+  { name: 'safetyBarrier', version: '87.0', wave: 2, scope: 'task-executor' },
+  { name: 'offPolicyEvaluation', version: '88.0', wave: 2, scope: 'policy-evolver' },
+  { name: 'safePolicyImprovement', version: '89.0', wave: 2, scope: 'policy-evolver' },
+  { name: 'preferenceLearning', version: '90.0', wave: 2, scope: 'reflector' },
+  { name: 'noveltySearch', version: '91.0', wave: 2, scope: 'curiosity' },
+  { name: 'selfPlay', version: '92.0', wave: 2, scope: 'strategy-evolution' },
+  { name: 'automlHyperband', version: '93.0', wave: 2, scope: 'benchmark' },
+  { name: 'simulationCalibration', version: '94.0', wave: 2, scope: 'sandbox' },
+  { name: 'interruptibleAutonomy', version: '95.0', wave: 2, scope: 'decision-engine' },
+  { name: 'globalWorkspace', version: '96.0', wave: 2, scope: 'autonomy-loop' },
+  { name: 'metacognitiveConfidence', version: '97.0', wave: 2, scope: 'decision-engine' },
+  { name: 'experienceReplay', version: '98.0', wave: 2, scope: 'long-term-memory' },
+  { name: 'attentionEconomy', version: '99.0', wave: 2, scope: 'sentinel' },
+  { name: 'selfBoundary', version: '100.0', wave: 2, scope: 'self-model' },
+];
+
+/** 内核旗标总览（50 旗标开关态；enabled 仅在显式 === true 时为真——缺省关闭） */
+export function kernelFlagOverview(kernels?: NonNullable<SchedulerConfig['autonomy']>['kernels']): KernelFlagOverview {
+  const flags = KERNEL_FLAGS.map((meta) => ({
+    ...meta,
+    enabled: (kernels as Record<string, { enabled?: boolean }> | undefined)?.[meta.name]?.enabled === true,
+  }));
+  const enabled = flags.filter((f) => f.enabled).length;
+  return { total: flags.length, enabled, disabled: flags.length - enabled, flags };
 }
 
 /** 插件对外暴露的调度器服务面 */
@@ -960,6 +1925,8 @@ export interface SchedulerService {
   governor: SafetyGovernor;
   /** 宿主融合层（全宿主可观测 + 安全治理；未激活时 isActive()=false） */
   hostFusion: HostFusionLayer;
+  /** 10 步链路结构化审计轨迹（第三轮 A17；纯记录、缺省开启、零行为影响） */
+  pipelineAudit: PipelineAuditTrail;
   /** 手动提交任务（等价于 autonomous_execute Tool） */
   submitTask(task: string, urgency?: number): Signal;
 }
@@ -1051,6 +2018,16 @@ export const Config = Schema.object({
   autonomy: Schema.object({
     enabled: Schema.boolean().default(true),
     heartbeatMs: Schema.natural().default(30_000),
+    exploration: Schema.object({
+      enabled: Schema.boolean().default(false),
+      sampleFloor: Schema.natural().default(30),
+      budget: Schema.number().min(1),
+      bonus: Schema.number().min(0).max(1),
+      overrideRate: Schema.percent().default(0),
+    }).default({} as any),
+    fastPath: Schema.object({
+      reuseModels: Schema.boolean().default(true),
+    }).default({} as any),
   }).default({} as any),
   hostFusion: Schema.object({
     enabled: Schema.boolean().default(true),
@@ -1104,6 +2081,31 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
   const dataDir = path.resolve(cfg.dataDir ?? '.scheduler');
   fs.mkdirSync(dataDir, { recursive: true });
 
+  // ── 第四轮 R4-A17：模块域升级旗标（autonomy.modules.*，缺省全关）──
+  // 构造配置式升级（sentinel/llm/crypto/meta/symbiosis）在下述构造点按片段
+  // 注入（旗标关时片段为 {}，构造参数逐位不变）；attach 式升级集中在
+  // 「模块域升级接线」区块（引擎全部构造完成后调用 attachPostConstructModuleUpgrades）。
+  const modulesCfg: ModuleUpgradeFlags = cfg.autonomy?.modules ?? {};
+  const pipelineCacheOn = cfg.autonomy?.pipeline?.crossStepCache?.enabled === true;
+  const pipelineLadderOn = cfg.autonomy?.pipeline?.degradationLadder?.enabled === true;
+  const pipelinePrefetchOn = cfg.autonomy?.pipeline?.stepPrefetch?.enabled === true;
+
+  // ── 第三轮 A17：结构化审计设施（纯记录/登记容器，缺省开启、零行为影响）──
+  // pipelineAudit：10 步链路检查点环形缓冲（步序/时长/关键决策值/结局）；
+  // resources：fiber 资源清理审计注册表（卸载时逆序释放 + 漏释放检测）。
+  const pipelineAudit = new PipelineAuditTrail({ capacity: 1024 });
+  const resources = new ResourceRegistry();
+  /** 批次序号（审计 trace id 的确定性来源） */
+  let pipelineBatchSeq = 0;
+
+  // ── 第四轮 R4-A17：主链路深化三件套（跨步骤缓存 / 降级阶梯 / 步骤预取）──
+  // 容器恒建（纯记账零行为），读写仅在各旗标开启时发生——缺省全关 = 链路
+  // 不经过任何深化路径，行为与升级前逐位一致（零漂移）。
+  const pipelineStepCache = new PipelineStepCache(cfg.autonomy?.pipeline?.crossStepCache?.capacity ?? 256);
+  const stepPrefetcher = new StepPrefetcher<Step5Trio>(() => pipelineStepCache.generation);
+  /** 第 5 步降级触发计数（introspect 口径；旗标关恒 0） */
+  let pipelineLadderDegradations = 0;
+
   // ── 基础层 ──
   const cryptoEngine = cfg.encryption?.enabled
     ? new CryptoEngine({
@@ -1112,6 +2114,8 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
         algorithm: cfg.encryption.algorithm ?? 'aes-256-gcm',
         sensitiveFields: ['apiKey', 'masterKey', 'token'],
         fullFileEncryption: cfg.encryption.fullFileEncryption ?? true,
+        // R4-A17 modules.cryptoTieredKeys：密钥分级（旗标关时片段 {}，零注入）
+        ...cryptoModuleUpgradeConfig(modulesCfg),
       })
     : null;
 
@@ -1141,6 +2145,8 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     ...(cfg.autonomy?.robustStatistics?.enabled === true
       ? { robustLatency: { alpha: cfg.autonomy.robustStatistics.alpha } }
       : {}),
+    // R4-A17 modules.clientPriorityQueue：请求优先级队列（旗标关时片段 {}，零注入）
+    ...clientModuleUpgradeConfig(modulesCfg),
   });
   for (const model of mergedModels) llm.registerModel(model);
   // strategist 模型确保已注册（决策调用专用）
@@ -1281,7 +2287,17 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
   const modelScheduler = new ModelScheduler({
     llm,
     memory,
-    config: { costWeight: 0.2, economicFeedbackEnabled: schedulingFeedbackEnabled },
+    config: {
+      costWeight: 0.2,
+      economicFeedbackEnabled: schedulingFeedbackEnabled,
+      // 新臂入场探索（τ2 结构学习的数据前提）：冷启动限定 UCB（预算 30）
+      // 无法给中龄系统里的新模型首发流量——soak 与实测双重确认。
+      // sampleFloor：每模型×任务类型积累 N 样本前保持探索加成。
+      explorationEnabled: cfg.autonomy?.exploration?.enabled ?? true,
+      exploreSampleFloor: cfg.autonomy?.exploration?.sampleFloor,
+      exploreBudget: cfg.autonomy?.exploration?.budget,
+      exploreBonus: cfg.autonomy?.exploration?.bonus,
+    },
   });
 
   // ── 第三阶段（质级升级）：策略进化器 + 校准沙盒（「优化」本身可进化） ──
@@ -1355,6 +2371,8 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
 
   // ── 任务执行器（新架构：模型调度 → 任务执行；优化器喂入复用计划） ──
   // 4.0 弹性升级：模型级熔断（连续 5 次可用性失败隔离）+ 全抖动指数退避重试
+  /** 第 9 步级联触发累计计数（审计口径——cascadeHandler 内纯计数，不改变回注行为） */
+  let cascadeCount = 0;
   const taskExecutor = new TaskExecutor({
     config: {
       qualityThreshold: cfg.qualityThreshold,
@@ -1367,6 +2385,8 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       circuitCooldownMs: 60_000,
       retryBackoffBaseMs: 200,
       retryBackoffMaxMs: 8_000,
+      // 创世纪 G4：推荐反垄断（缺省 0 零漂移；启用探索时按配置放开）
+      explorationOverrideRate: cfg.autonomy?.exploration?.overrideRate ?? 0,
     },
     llm,
     modelScheduler,
@@ -1375,6 +2395,7 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     reflection: reflectionEngine,
     cascadeHandler: (newSignal) => {
       // 第 9 步级联触发 → 回注哨兵形成闭环
+      cascadeCount += 1; // A17 审计计数（纯记录）
       sentinel.ingest({ ...newSignal, source: 'cascade' });
     },
   });
@@ -1418,6 +2439,9 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       aggregationWindow: cfg.sentinel?.aggregationWindow ?? 0.5,
       signalSources: cfg.sentinel?.signalSources,
       watchDir: process.cwd(),
+      // R4-A17 modules.sentinelAdaptive：自适应聚合窗口 v2 + 风暴预算共享
+      //（旗标关时片段 {}，零注入——哨兵走既有固定窗口口径）
+      ...sentinelModuleUpgradeConfig(modulesCfg),
     },
     (batch) => {
       // 火忘调用：processBatch 内部已逐信号 try/catch，此处兜底捕获
@@ -1564,6 +2588,9 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       globalBreakerThreshold: 3,
       proactiveEnabled: true,
       ...cfg.autonomy?.metaLayer?.controller,
+      // R4-A17 modules.metaStabilityLoop：调参死区稳定环（旗标关时片段 {}，
+      // 零注入——仅补 stabilityLoop 键，不覆盖 metaLayer.controller 其余配置）
+      ...metaStabilityUpgradeConfig(modulesCfg),
       persistPath: path.join(dataDir, 'meta-controller-audit.json'),
       onAdjust: (entry) => {
         const { type: _kind, ...rest } = entry;
@@ -2216,10 +3243,25 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
   // 缺省关闭：影子系统不改变既有主链路行为；启用后 KPI 注入共生心跳，
   // 市场价 vs 统计估计的显著背离回流为自愈目标，任务成功铸币分红给模型智能体。
   const symbiosisEnabled = cfg.autonomy?.symbiosis?.enabled ?? false;
+  // 创世纪 G4：快路径复用历史模型指派（缺省 true = 旧行为逐位一致）
+  const fastPathReuseModels = cfg.autonomy?.fastPath?.reuseModels ?? true;
+  // 创世纪 G3：探针操作器（提升作用域——心跳闭包在 if 块外消费）
+  let probeOps: ProbeOperations | undefined;
+  // 创世纪 G5：固化器引用（宪法审计在心跳闭包内消费）
+  let genesisConsolidator: Consolidator | undefined;
+  logger.info(
+    '探索配置回显：exploration=%j（sampleFloor=%s budget=%s bonus=%s overrideRate=%s）fastPath.reuseModels=%s',
+    cfg.autonomy?.exploration?.enabled,
+    cfg.autonomy?.exploration?.sampleFloor,
+    cfg.autonomy?.exploration?.budget,
+    cfg.autonomy?.exploration?.bonus,
+    cfg.autonomy?.exploration?.overrideRate,
+    fastPathReuseModels,
+  );
   const futarchyEnabled = symbiosisEnabled && (cfg.autonomy?.symbiosis?.futarchy?.enabled ?? false);
   // C 路线：能量 Sankey 落盘（sankeyPath 设置即启用）
   const sankeyPath = symbiosisEnabled ? cfg.autonomy?.symbiosis?.observability?.sankeyPath : undefined;
-  const sankeyEveryNTicks = cfg.autonomy?.symbiosis?.observability?.everyNTicks ?? 5;
+  const sankeyEveryNTicks = Math.max(1, cfg.autonomy?.symbiosis?.observability?.everyNTicks ?? 5);
   let symbiosisTickCount = 0;
   const symbiosisBridge = symbiosisEnabled
     ? new SymbiosisBridge(
@@ -2254,6 +3296,9 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
             causalKernel,
             freeEnergy: freeEnergyEngine,
             ...(scientistMind && scientistAutoRegister ? { scientist: scientistMind } : {}),
+            // R4-A17 modules.symbiosisEconomy：货币治理（流通量目标带铸币税
+            // 调节；旗标关时片段 {}，零注入——央行不干预）
+            ...symbiosisMonetaryUpgradeConfig(modulesCfg),
           },
         },
         { checkGate: () => governor.checkGate() },
@@ -2261,6 +3306,44 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     : undefined;
   if (symbiosisBridge) {
     for (const model of mergedModels) symbiosisBridge.registerModel(model.id);
+
+    // ── E 路线：τ1 可塑性学习闭环（结算结局 → 参数级在线学习，缺省关闭）──
+    // 纯影子学习：铸币/分红/信誉数值逐位不变；遗忘门控（冻结探针退化
+    // 即回滚本窗口）与状态落盘由 loop 自理。未启用 = 本块零介入。
+    const plasticityCfg = cfg.autonomy?.symbiosis?.plasticity;
+    const plasticityLoop = plasticityCfg?.enabled
+      ? new PlasticityLoop({
+          persistPath: plasticityCfg.persistPath,
+          autoGate: {
+            window: plasticityCfg.gateWindow ?? 50,
+            probeSize: plasticityCfg.probeSize ?? 50,
+            seed: plasticityCfg.seed,
+          },
+        })
+      : undefined;
+    if (plasticityLoop) {
+      symbiosisBridge.attachPlasticity(plasticityLoop);
+      // 学习反哺调度：结算结局 → 参数更新 → 利用端评分乘数——
+      // 「学习改变行为」的最后一段闭环（未挂载恒 1，评分零漂移）
+      modelScheduler.attachPlasticityProfile(plasticityLoop);
+      // τ2 固化：稳定结构（保持集验证过的偏好）蒸馏为持久规则——
+      // 不随证据衰减，退役留痕；规则乘数叠加进调度评分链
+      const consolidator = new Consolidator({
+        persistPath: plasticityCfg?.rulesPath,
+        interval: plasticityCfg?.consolidateEvery ?? 200,
+      });
+      consolidator.bindSource(() => plasticityLoop.eventLog());
+      symbiosisBridge.attachConsolidation(consolidator);
+      modelScheduler.attachDurableRules(consolidator);
+      genesisConsolidator = consolidator;
+      // 创世纪 G3：探针操作器（流动性检测 + 预算纪律；未配置 = 零介入）
+      probeOps = plasticityCfg?.probes?.enabled ? new ProbeOperations({ maxPerHour: plasticityCfg.probes.maxPerHour }) : undefined;
+      logger.info(
+        'τ1 学习闭环 + τ2 固化已挂载（结算学习 + 调度反哺 + 结构蒸馏%s）：%s',
+        probeOps ? ' + G3 流动性操作' : '',
+        plasticityCfg?.persistPath ?? '内存态（未配置 persistPath）',
+      );
+    }
 
     // ── D 路线：全智能体接入（认知分工完全市场化，缺省关闭）──
     const agentsCfg = cfg.autonomy?.symbiosis?.agents;
@@ -2295,6 +3378,292 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       mergedModels.length,
       futarchyEnabled ? '，futarchy 进化表决开启（高成本进化由市场资助）' : '',
       attached.length > 0 ? `，全智能体接入：${attached.join(' / ')}` : '',
+    );
+  }
+
+  // ── 创世纪升级 51.0→75.0：五大新层 25 个内核接线（全部缺省关闭，零漂移）──
+  // 开关收敛于 autonomy.kernels 命名空间；挂载纪律与 21.0→50.0 先例一致：
+  // 缺省不 attach 即零介入，引擎行为与升级前逐位一致。
+  const kernelsCfg = cfg.autonomy?.kernels ?? {};
+  if (kernelsCfg.speculativeDecoding?.enabled === true) {
+    modelScheduler.attachSpeculativeDecoding({ maxK: kernelsCfg.speculativeDecoding.maxK });
+    logger.info('51.0 投机解码内核已挂载：drafter→verifier 配对经济裁决（maxK=%s）', kernelsCfg.speculativeDecoding.maxK ?? 64);
+  }
+  if (kernelsCfg.testTimeCompute?.enabled === true) {
+    taskExecutor.attachTestTimeCompute({ alpha: kernelsCfg.testTimeCompute.alpha });
+    logger.info('52.0 测试时计算内核已挂载：投票路数可达性计算（alpha=%s）', kernelsCfg.testTimeCompute.alpha ?? 0.2);
+  }
+  if (kernelsCfg.whittleIndex?.enabled === true) {
+    modelScheduler.attachWhittleIndex({
+      goodThreshold: kernelsCfg.whittleIndex.goodThreshold,
+      passiveHeal: kernelsCfg.whittleIndex.passiveHeal,
+      discount: kernelsCfg.whittleIndex.discount,
+    });
+    logger.info('53.0 Whittle 指数内核已挂载：两态臂部分激活最优调度（goodThreshold=%s, discount=%s）', kernelsCfg.whittleIndex.goodThreshold ?? 0.7, kernelsCfg.whittleIndex.discount ?? 0.95);
+  }
+  if (kernelsCfg.lyapunovBackpressure?.enabled === true) {
+    taskExecutor.attachBackpressureController({
+      V: kernelsCfg.lyapunovBackpressure.V,
+      priceThreshold: kernelsCfg.lyapunovBackpressure.priceThreshold,
+    });
+    logger.info('54.0 Lyapunov 背压内核已挂载：任务类型队列稳定性告警（V=%s）', kernelsCfg.lyapunovBackpressure.V ?? 8);
+  }
+  if (kernelsCfg.hawkesBurstGuard?.enabled === true) {
+    sentinel.attachHawkesBurstGuard({
+      windowSec: kernelsCfg.hawkesBurstGuard.windowSec,
+      burstShare: kernelsCfg.hawkesBurstGuard.burstShare,
+      minEvents: kernelsCfg.hawkesBurstGuard.minEvents,
+    });
+    logger.info('55.0 Hawkes 爆发监视内核已挂载：到达相关性数学口径（windowSec=%s, burstShare=%s）', kernelsCfg.hawkesBurstGuard.windowSec ?? 900, kernelsCfg.hawkesBurstGuard.burstShare ?? 0.5);
+  }
+  if (kernelsCfg.beliefPropagation?.enabled === true) {
+    worldModel.attachBeliefPropagation();
+    logger.info('56.0 置信传播内核已挂载：多源证据因子图融合（旁路咨询）');
+  }
+  if (kernelsCfg.variationalInference?.enabled === true) {
+    metaCognition.attachVariationalInference();
+    logger.info('57.0 变分推断内核已挂载：平均场后验（自由能 q 分布供给方）');
+  }
+  if (kernelsCfg.langevinMutation?.enabled === true) {
+    strategyEvolution.attachLangevinMutation({ steps: kernelsCfg.langevinMutation.steps, seed: kernelsCfg.langevinMutation.seed });
+    logger.info('58.0 朗之万采样内核已挂载：变异分布 MALA 健康度体检（只读）');
+  }
+  if (kernelsCfg.curriculum?.enabled === true) {
+    curiosity.attachCurriculum({ levelCount: kernelsCfg.curriculum.levelCount, threshold: kernelsCfg.curriculum.threshold });
+    logger.info('59.0 课程学习内核已挂载：探索难度掌握门限爬阶（记账 + 读数）');
+  }
+  if (kernelsCfg.rateDistortion?.enabled === true) {
+    memory.attachCompressionPlanner({ budgetBits: kernelsCfg.rateDistortion.budgetBits });
+    logger.info('60.0 率失真内核已挂载：记忆压缩规划 + 影子价格 KPI（只读，budgetBits=%s）', kernelsCfg.rateDistortion.budgetBits ?? 1_000_000);
+  }
+  if (symbiosisBridge) {
+    // 共生市场理论核（61.0→65.0，全部影子口径——不改变主链路铸币与结算）
+    const marketAttached: string[] = [];
+    if (kernelsCfg.stableMatching?.enabled === true) {
+      symbiosisBridge.attachStableMatching();
+      marketAttached.push('61.0 稳定匹配');
+    }
+    if (kernelsCfg.mechanismDesign?.enabled === true) {
+      symbiosisBridge.attachMechanismDesign();
+      marketAttached.push('62.0 机制设计');
+    }
+    if (kernelsCfg.nucleolusAudit?.enabled === true) {
+      symbiosisBridge.attachNucleolusAudit();
+      marketAttached.push('63.0 核仁');
+    }
+    if (kernelsCfg.correlatedEquilibrium?.enabled === true) {
+      symbiosisBridge.attachCorrelatedEquilibrium();
+      marketAttached.push('64.0 相关均衡');
+    }
+    if (kernelsCfg.dynamicPricing?.enabled === true) {
+      symbiosisBridge.attachDynamicPricing({
+        policy: kernelsCfg.dynamicPricing.policy,
+        unit: kernelsCfg.dynamicPricing.unit,
+        exploration: kernelsCfg.dynamicPricing.exploration,
+      });
+      marketAttached.push('65.0 动态定价');
+    }
+    if (marketAttached.length > 0) logger.info('共生市场理论核已挂载：%s（影子口径）', marketAttached.join(' / '));
+  }
+  if (kernelsCfg.annealingEscape?.enabled === true) {
+    strategyEvolution.attachAnnealingEscape();
+    logger.info('66.0 模拟退火内核已挂载：种群势阱深度与逃逸温度体检（只读）');
+  }
+  if (kernelsCfg.paretoFront?.enabled === true) {
+    modelScheduler.attachParetoFront();
+    logger.info('67.0 NSGA-II 内核已挂载：质量-成本-延迟帕累托前沿菜单（只读）');
+  }
+  if (kernelsCfg.compressionDistance?.enabled === true) {
+    memory.attachNcdDedup({ threshold: kernelsCfg.compressionDistance.threshold });
+    logger.info('68.0 压缩距离内核已挂载：NCD 近邻查重（threshold=%s，只读咨询）', kernelsCfg.compressionDistance.threshold ?? 0.65);
+  }
+  if (kernelsCfg.mapperGraph?.enabled === true) {
+    worldModel.attachMapperLens({
+      intervals: kernelsCfg.mapperGraph.intervals,
+      overlap: kernelsCfg.mapperGraph.overlap,
+      clusterEps: kernelsCfg.mapperGraph.clusterEps,
+    });
+    logger.info('69.0 Mapper 图内核已挂载：经验地形骨架与拓扑盲区（只读）');
+  }
+  if (kernelsCfg.pidDiagnostics?.enabled === true) {
+    reflector.attachPidDiagnostics();
+    logger.info('70.0 部分信息分解内核已挂载：多模型组合冗余/独占/协同诊断（只读）');
+  }
+  if (kernelsCfg.astarSearch?.enabled === true) {
+    optimizer.attachAstarPlanner();
+    logger.info('71.0 A* 搜索内核已挂载：最优子计划搜索（旁路咨询）');
+  }
+  if (kernelsCfg.sparseRecovery?.enabled === true) {
+    optimizer.attachSparseAttribution();
+    logger.info('72.0 稀疏恢复内核已挂载：质量归因 Lasso+CV active 集（旁路分析）');
+  }
+  if (kernelsCfg.baiSelector?.enabled === true) {
+    benchmark.attachBaiSelector({ budget: kernelsCfg.baiSelector.budget });
+    logger.info('73.0 最佳臂识别内核已挂载：基准引擎锦标赛冠军裁决（纯报告，budget=%s）', kernelsCfg.baiSelector.budget ?? 120);
+  }
+  if (kernelsCfg.mirrorDescent?.enabled === true) {
+    decisionEngine.attachNoRegretRouter({
+      mirror: kernelsCfg.mirrorDescent.mirror,
+      alpha: kernelsCfg.mirrorDescent.alpha,
+    });
+    logger.info('74.0 镜像下降内核已挂载：决策行动无悔混合策略读数（咨询口径）');
+  }
+  if (kernelsCfg.onlineCalibration?.enabled === true) {
+    decisionEngine.attachProbabilityCalibrator({
+      strategy: kernelsCfg.onlineCalibration.strategy,
+      lr: kernelsCfg.onlineCalibration.lr,
+      window: kernelsCfg.onlineCalibration.window,
+    });
+    logger.info('75.0 在线校准内核已挂载：决策概率口径前置层（门控激活后校准生效）');
+  }
+
+  // ── 第二轮创世纪升级 76.0→100.0：五大新层 25 个内核接线（全部缺省关闭，零漂移）──
+  // 开关同样收敛于 autonomy.kernels 命名空间；挂载纪律与 51.0→75.0 先例一致：
+  // 缺省不 attach 即零介入，引擎行为与升级前逐位一致。适配层见
+  // src/engines-frontier/autonomy25.ts（纯函数 / 自包含小对象，零引擎依赖）。
+  if (kernelsCfg.noveltySentinel?.enabled === true) {
+    sentinel.attachNoveltySentinel({
+      window: {
+        capacity: kernelsCfg.noveltySentinel.capacity,
+        halfLife: kernelsCfg.noveltySentinel.halfLife,
+        minSamples: kernelsCfg.noveltySentinel.minSamples,
+      },
+      changeAlpha: kernelsCfg.noveltySentinel.changeAlpha,
+    });
+    logger.info('76.0 新奇检测内核已挂载：信号判异从静态幅值阈值升级为「窗口深度 + kNN 计数比」双证据（观测口径）');
+  }
+  if (kernelsCfg.causalDiscovery?.enabled === true) {
+    worldModel.attachCausalLens({ alpha: kernelsCfg.causalDiscovery.alpha });
+    logger.info('77.0 因果发现内核已挂载：观测指标流 PC 学图（CPDAG 等价类；旁路咨询，alpha=%s）', kernelsCfg.causalDiscovery.alpha ?? 0.01);
+  }
+  if (kernelsCfg.ccaAlignment?.enabled === true) {
+    worldModel.attachCcaLens({ lambda: kernelsCfg.ccaAlignment.lambda });
+    logger.info('78.0 典型相关内核已挂载：多源证据对齐公共潜坐标系（旁路咨询，λ=%s）', kernelsCfg.ccaAlignment.lambda ?? 0.5);
+  }
+  if (kernelsCfg.diffusionManifold?.enabled === true) {
+    worldModel.attachDiffusionLens({ k: kernelsCfg.diffusionManifold.k, dims: kernelsCfg.diffusionManifold.dims });
+    logger.info('79.0 扩散映射内核已挂载：经验连续嵌入（旁路咨询，k=%s, dims=%s）', kernelsCfg.diffusionManifold.k ?? 10, kernelsCfg.diffusionManifold.dims ?? 2);
+  }
+  if (kernelsCfg.streamingSketch?.enabled === true) {
+    sentinel.attachStreamingSketch({
+      cmsEps: kernelsCfg.streamingSketch.cmsEps,
+      cmsDelta: kernelsCfg.streamingSketch.cmsDelta,
+      window: kernelsCfg.streamingSketch.window,
+      reservoirK: kernelsCfg.streamingSketch.reservoirK,
+    });
+    logger.info('80.0 流式概要内核已挂载：哨兵感官缓冲（键频/滑窗计数/等概率样本/重元素，观测口径）');
+  }
+  if (kernelsCfg.argumentation?.enabled === true) {
+    reflectionEngine.attachArgumentation();
+    logger.info('81.0 论证内核已挂载：深思/反思结论的辩护链裁决（影子计算）');
+  }
+  if (kernelsCfg.crowdAggregation?.enabled === true) {
+    reflector.attachCrowdAggregation();
+    logger.info('82.0 众包聚合内核已挂载：多模型判定 Dawid–Skene 信任票权（咨询口径）');
+  }
+  if (kernelsCfg.worldModelLearning?.enabled === true) {
+    worldModel.attachModelLearning({ prior: kernelsCfg.worldModelLearning.prior });
+    logger.info('83.0 世界模型学习内核已挂载：调度轨迹学 T̂/r̂ + 值迭代（旁路咨询，prior=%s）', kernelsCfg.worldModelLearning.prior ?? 2);
+  }
+  if (kernelsCfg.pomdpPlanner?.enabled === true) {
+    decisionEngine.attachPomdpPlanner();
+    logger.info('84.0 POMDP 内核已挂载：defer/execute/ask-user 的信念规划咨询（α-VI 下界 × QMDP 上界）');
+  }
+  if (kernelsCfg.symbolicFeasibility?.enabled === true) {
+    taskExecutor.attachSymbolicFeasibility();
+    logger.info('85.0 符号求解内核已挂载：DAG 计划可行性静态裁决（SAT/UNSAT + 冲突账单）');
+  }
+  if (kernelsCfg.optionsFramework?.enabled === true) {
+    taskExecutor.attachOptionsFramework();
+    logger.info('86.0 分层技能内核已挂载：SMDP 宏动作时间信用分配体检（只读基准）');
+  }
+  if (kernelsCfg.safetyBarrier?.enabled === true) {
+    taskExecutor.attachSafetyBarrier({ eta: kernelsCfg.safetyBarrier.eta });
+    logger.info('87.0 安全屏障内核已挂载：逐动作微分安全过滤（infeasible 上报总督，η=%s）', kernelsCfg.safetyBarrier.eta ?? 0.05);
+  }
+  if (kernelsCfg.offPolicyEvaluation?.enabled === true) {
+    policyEvolver.attachOpeGate({ delta: kernelsCfg.offPolicyEvaluation.delta, gamma: kernelsCfg.offPolicyEvaluation.gamma });
+    logger.info('88.0 离线评估内核已挂载：金丝雀门控反事实估值通道（DR + EB-CS，δ=%s）', kernelsCfg.offPolicyEvaluation.delta ?? 0.05);
+  }
+  if (kernelsCfg.safePolicyImprovement?.enabled === true) {
+    policyEvolver.attachSafeImprovementGate({
+      delta: kernelsCfg.safePolicyImprovement.delta,
+      minSamples: kernelsCfg.safePolicyImprovement.minSamples,
+    });
+    logger.info('89.0 安全策略改进内核已挂载：候选晋升高置信证书（LCB > 0 才上线，δ=%s）', kernelsCfg.safePolicyImprovement.delta ?? 0.05);
+  }
+  if (kernelsCfg.preferenceLearning?.enabled === true) {
+    reflector.attachPreferenceLearning({ minPairs: kernelsCfg.preferenceLearning.minPairs, l2: kernelsCfg.preferenceLearning.l2 });
+    logger.info('90.0 偏好学习内核已挂载：RLHF-lite 效用序（影子学习，minPairs=%s）', kernelsCfg.preferenceLearning.minPairs ?? 8);
+  }
+  if (kernelsCfg.noveltySearch?.enabled === true) {
+    curiosity.attachNoveltySearch({ k: kernelsCfg.noveltySearch.k });
+    logger.info('91.0 新奇搜索内核已挂载：探索预算向行为空间空白定向（咨询口径，k=%s）', kernelsCfg.noveltySearch.k ?? 3);
+  }
+  if (kernelsCfg.selfPlay?.enabled === true) {
+    strategyEvolution.attachSelfPlay({ leagueRounds: kernelsCfg.selfPlay.leagueRounds, seed: kernelsCfg.selfPlay.seed });
+    logger.info('92.0 自我对弈内核已挂载：策略进化对抗压力审计（影子计算，leagueRounds=%s）', kernelsCfg.selfPlay.leagueRounds ?? 60);
+  }
+  if (kernelsCfg.automlHyperband?.enabled === true) {
+    benchmark.attachHyperbandTuner({ eta: kernelsCfg.automlHyperband.eta, seed: kernelsCfg.automlHyperband.seed });
+    logger.info('93.0 AutoML Hyperband 内核已挂载：引擎内超参自动寻优（咨询口径，η=%s）', kernelsCfg.automlHyperband.eta ?? 3);
+  }
+  if (kernelsCfg.simulationCalibration?.enabled === true) {
+    policySandbox.attachSimCalibration();
+    logger.info('94.0 仿真校准内核已挂载：沙盒风洞修正（MMD² 域差 + 密度比换算真实口径，只读）');
+  }
+  if (kernelsCfg.interruptibleAutonomy?.enabled === true) {
+    decisionEngine.attachHandoffPolicy();
+    logger.info('95.0 中断交接内核已挂载：ask-user 期望成本最优裁决（闭式 τ* = c_H + c_delay）');
+  }
+  if (kernelsCfg.metacognitiveConfidence?.enabled === true) {
+    decisionEngine.attachMetacognitiveConfidence();
+    logger.info('97.0 元认知信心内核已挂载：决策置信度校准审计（M-ratio）+ 求助触发闭式阈值（观测口径）');
+  }
+  if (kernelsCfg.experienceReplay?.enabled === true) {
+    memory.attachExperienceReplay({
+      capacity: kernelsCfg.experienceReplay.capacity,
+      alpha: kernelsCfg.experienceReplay.alpha,
+      beta: kernelsCfg.experienceReplay.beta,
+    });
+    logger.info('98.0 经验重放内核已挂载：长期记忆睡眠固化阶段（旁路口径，capacity=%s）', kernelsCfg.experienceReplay.capacity ?? 512);
+  }
+  if (kernelsCfg.attentionEconomy?.enabled === true) {
+    sentinel.attachAttentionEconomy();
+    logger.info('99.0 注意力经济内核已挂载：哨兵→优化器信息流拍卖（VCG 支付，影子口径）');
+  }
+  if (kernelsCfg.selfBoundary?.enabled === true) {
+    selfModel.attachSelfBoundary();
+    logger.info('100.0 自我边界内核已挂载：归因边界 + 身份断点监控（影子计算）');
+  }
+
+  // ── 第四轮 R4-A17：模块域升级接线（autonomy.modules.* 16 旗标，全部缺省关闭，零漂移）──
+  // 集中挂载区块：第三/四轮各模块的 attach 式升级在此按旗标挂载（适配层
+  // engines-frontier/autonomy25.ts 的 attachPostConstructModuleUpgrades——
+  // 旗标关 = 对应 attach 不调用，引擎读数 undefined，行为与升级前逐位一致）。
+  // 构造配置式旗标（sentinelAdaptive / clientPriorityQueue / cryptoTieredKeys /
+  // metaStabilityLoop / symbiosisEconomy 的货币治理半边）已在上文各构造点
+  // 按片段注入；dashboardAlarmSources 在 attachDashboard 调用点接线。
+  const moduleAttached = attachPostConstructModuleUpgrades(
+    {
+      decisionEngine,
+      modelScheduler,
+      taskExecutor,
+      memory,
+      policyEvolver,
+      worldModel,
+      symbiosisBridge: symbiosisBridge ?? undefined,
+      tenantManager,
+      benchmark,
+    },
+    modulesCfg,
+  );
+  if (moduleAttached.length > 0) {
+    logger.info(
+      '模块域升级已挂载（%d/%d 旗标）：%s',
+      moduleAttached.length,
+      moduleFlagOverview(modulesCfg).total,
+      moduleAttached.join(' / '),
     );
   }
 
@@ -2692,6 +4061,46 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       ? {
           runSymbiosisTick: async (snapshot) => {
             const driftInsights = await symbiosisBridge.heartbeat(snapshot);
+            // 创世纪 G5 · 宪法审计（每 10 拍一次，约 5 分钟）：四条定律
+            // 的运行时合规检查——链完整 / 结构负债可溯源 / 央行两定律。
+            // 违宪即告警（审计是宪法不是建议）。
+            const pLoop = symbiosisBridge.plasticityLoop;
+            if (pLoop && genesisConsolidator && symbiosisTickCount % 10 === 0) {
+              const report = auditConstitution(pLoop, genesisConsolidator);
+              const failed = report.checks.filter((c) => !c.holds);
+              if (failed.length === 0) {
+                logger.info('宪法审计：全绿（%d 项检查）', report.checks.length);
+              } else {
+                logger.warn('宪法审计：违宪 %d/%d —%s', failed.length, report.checks.length, failed.map((c) => `${c.name}: ${c.detail}`).join('；'));
+              }
+            }
+            symbiosisTickCount += 1;
+            // 创世纪 G3 · 探针即公开市场操作：检测对照市场流动性枯竭
+            // （饿死/陈旧臂），预算限定内注入真实微任务（~10-50 token）——
+            // 真实调用、真实结算，绝非伪造证据。未启用零介入。
+            if (pLoop && probeOps) {
+              const now = Date.now();
+              for (const order of probeOps.due(pLoop.eventLog(), now)) {
+                if (!probeOps.admit(now)) break;
+                try {
+                  const res = await llm.chat(order.modelId, [{ role: 'user', content: '回复两个字：正常' }], { maxTokens: 16, timeout: 30_000 });
+                  const ok = (res?.content ?? '').trim().length > 0;
+                  probeOps.record(now);
+                  symbiosisBridge.settleTask(
+                    { success: ok, nodeResults: [{ modelId: order.modelId, success: ok, quality: ok ? 0.9 : 0.1, tokensUsed: res?.tokensUsed ?? 0 }] },
+                    { taskContext: order.taskContext },
+                  );
+                  logger.info('G3 流动性注入：%s @%s（%s；预算 %s/%s）', order.modelId, order.taskContext ?? '全局', order.reason, probeOps.used(now), '上限见配置');
+                } catch (err) {
+                  probeOps.record(now);
+                  symbiosisBridge.settleTask(
+                    { success: false, nodeResults: [{ modelId: order.modelId, success: false, quality: 0, error: err instanceof Error ? err.message : String(err) }] },
+                    { taskContext: order.taskContext },
+                  );
+                  logger.info('G3 流动性注入（失败入账，分型分账）：%s — %s', order.modelId, err instanceof Error ? err.message.slice(0, 80) : '未知错误');
+                }
+              }
+            }
             // B 路线：能量反哺调度——每轮心跳把经济健康度折算为调度乘数
             // （赚钱升权 / 亏损降权；开关关闭时 scheduler 侧乘数恒为 1）
             if (schedulingFeedbackEnabled) {
@@ -2742,6 +4151,37 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       : undefined,
   });
 
+  if (kernelsCfg.globalWorkspace?.enabled === true) {
+    // 缺省投标者 = 三引擎最小代表团（哨兵/进化/预算——遥测估计口径：信号
+    // 密度折算 novelty/urgency、目标关联折算 relevance；编排层可随时以
+    // 真实引擎读数替换，总线数学不因代表团的简省而改变）。
+    autonomyLoop.attachGlobalWorkspace(
+      [
+        {
+          id: 'sentinel',
+          bid: (ctx) => ({
+            novelty: Math.min(1, ctx.signals.length / 8),
+            relevance: ctx.goal ? 0.7 : 0.4,
+            confidence: 0.8,
+            urgency: Math.min(1, ctx.signals.length / 12),
+          }),
+          describe: (ctx) => (ctx.signals.length >= 4 ? ['异常爆发'] : ['常规信号流']),
+        },
+        {
+          id: 'evolution',
+          bid: (ctx) => ({ novelty: 0.3, relevance: ctx.goal ? 0.8 : 0.3, confidence: 0.6, urgency: 0.2 }),
+          describe: () => ['策略突破候选'],
+        },
+        {
+          id: 'budget',
+          bid: () => ({ novelty: 0.2, relevance: 0.5, confidence: 0.9, urgency: 0.6 }),
+          describe: () => ['预算告警监视'],
+        },
+      ],
+      { threshold: kernelsCfg.globalWorkspace.threshold, temperature: kernelsCfg.globalWorkspace.temperature },
+    );
+    logger.info('96.0 全局工作空间内核已挂载：跨引擎意识总线（心跳旁路仲裁，缺省三引擎代表团投标）');
+  }
   /**
    * 10 步链路编排主流程（第 3~10 步）
    *
@@ -2749,7 +4189,23 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
    * （规则快速路径 → 决策缓存 → strategist → 启发式兜底）
    */
   async function processBatch(batch: SignalBatch): Promise<void> {
+    // ── A17 审计：批次追踪 id + 第 1/2 步检查点（信号接入 / 聚合交付）──
+    pipelineBatchSeq += 1;
+    const traceId = `batch-${pipelineBatchSeq}`;
+    pipelineAudit.mark(traceId, 1, 'ok', {
+      signals: batch.signals.length,
+      sources: [...new Set(batch.signals.map((s) => s.source))],
+      reason: batch.reason,
+    });
+    pipelineAudit.mark(traceId, 2, 'ok', {
+      occurrences: batch.signals.reduce((sum, s) => sum + s.occurrences, 0),
+      types: [...new Set(batch.signals.map((s) => s.type))],
+      ...(batch.maxProvenanceDepth !== undefined ? { maxProvenanceDepth: batch.maxProvenanceDepth } : {}),
+    });
     broadcast({ type: 'batch-start', signalCount: batch.signals.length, signals: batch.signals.map((s) => ({ id: s.id, type: s.type })) });
+
+    // R4-A17 深化 3：批次边界清空预取在途条目（未消费预取作废——消费侧直算，零漂移）
+    if (pipelinePrefetchOn) stepPrefetcher.clear();
 
     // ── 自主智能·预见：世界模型学习本批信号到达规律 ──
     for (const signal of batch.signals) {
@@ -2763,8 +4219,13 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     // ── 第 3~4 步：决策引擎（优先级排序 + 战略决策） ──
     broadcast({ type: 'strategist-thinking', step: 3, message: '决策引擎四级流水线评估中' });
     const history = buildSignalHistory(batch.signals);
+    pipelineAudit.begin(traceId, 3);
     const decisions = await decisionEngine.decide(batch.signals, history);
     const sorted = [...batch.signals].sort((a, b) => (decisions.get(b.id)?.urgency ?? 0) - (decisions.get(a.id)?.urgency ?? 0));
+    pipelineAudit.end(traceId, 3, 'ok', {
+      order: sorted.map((s) => s.id),
+      urgencies: sorted.map((s) => decisions.get(s.id)?.urgency ?? 0),
+    });
 
     broadcast({ type: 'strategist-thinking', step: 4, message: '战略决策完成，按紧急度执行' });
     for (const signal of sorted) {
@@ -2779,16 +4240,43 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
         pendingCount: sentinel.getPendingSignals().length,
       });
       ctx.emit('scheduler/signal', signal);
+      // ── A17 审计：第 4 步检查点（战略决策结局——execute/defer/dismiss/ask-user）──
+      pipelineAudit.mark(traceId, 4, action, {
+        signalId: signal.id,
+        urgency: signal.urgency,
+        ...(decision?.source !== undefined ? { source: decision.source } : {}),
+        ...(decision?.confidence !== undefined ? { confidence: decision.confidence } : {}),
+      });
 
       try {
         if (action === 'execute') {
-          const result = await executeSignal(signal);
-          // 决策反馈闭环：成功执行 → 修正决策引擎缓存与规则计数器
-          const fingerprint = decisionEngine.fingerprint(signal);
-          decisionEngine.recordOutcome(signal.type, fingerprint, 'good');
-          // 自主智能：策略进化适应度回写 + 目标进度回写
-          strategyEvolution.recordOutcome(genome.id, 'good');
-          settleGoalProgress(signal.id, true);
+          // ── R4-A17 深化 3：步骤预取——本信号执行等待期（第 7 步 await）预取
+          // 下一执行信号的第 5 步三重读取（微任务在宿主 await 让出时执行；
+          // 消费侧经代际守卫，结果恒与直算一致——见 executeSignal 第 5 步）。
+          if (pipelinePrefetchOn) {
+            const nextExecute = sorted.slice(sorted.indexOf(signal) + 1).find((s) => (decisions.get(s.id)?.action ?? 'execute') === 'execute');
+            if (nextExecute) {
+              const prefetchSignal = nextExecute;
+              const inferredNext = inferTaskContextMemo(prefetchSignal);
+              stepPrefetcher.fire(`step5:${prefetchSignal.id}`, () => ({
+                lookup: optimizer.lookupExperience(prefetchSignal.type, inferredNext.complexity, inferredNext.features, { length: inferredNext.length }),
+                strategies: memory.getStrategies(prefetchSignal.type, 3),
+                lessons: reflectionEngine.getLessons(prefetchSignal.type, 3),
+              }));
+            }
+          }
+          const result = await executeSignal(signal, traceId);
+          // 决策反馈闭环：按真实结局修正决策引擎缓存与规则计数器
+          //（R4-A17 深化 1：指纹经跨步骤缓存——纯函数，命中与直算逐位一致）
+          // result 为 null（共识否决 / 治理拦截——未实际执行）记 acceptable：
+          // 既不误报成功抑制同类信号，也不误记失败驱动升级规则
+          const feedback = result === null ? 'acceptable' : result.success ? 'good' : 'failed';
+          const fingerprint = pipelineFingerprint(signal);
+          decisionEngine.recordOutcome(signal.type, fingerprint, feedback);
+          // 自主智能：策略进化适应度回写（同口径——失败/未执行不再虚记 good）
+          strategyEvolution.recordOutcome(genome.id, feedback);
+          // 目标进度回写：仅实际执行后结算（未执行 null 保持 pending 待重试，不虚记完成）
+          if (result !== null) settleGoalProgress(signal.id, result.success);
           // 自主智能·边界：治理器结果回写（熔断器 / 预算统计）
           governor.recordOutcome(result ? result.success : false, result?.totalTokens ?? 0, 0);
           // 自主智能·内在动机：探索任务回写好奇心收获
@@ -2809,9 +4297,10 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
         }
       } catch (err) {
         logger.error('信号 %s 处理失败: %s', signal.id, (err as Error).message);
+        pipelineAudit.mark(traceId, 4, 'failed', { signalId: signal.id, error: (err as Error).message });
         recordDecision(signal, action, 'failed', (err as Error).message);
-        // 失败反馈：驱动失败升级规则
-        const fingerprint = decisionEngine.fingerprint(signal);
+        // 失败反馈：驱动失败升级规则（R4-A17 深化 1：指纹经跨步骤缓存）
+        const fingerprint = pipelineFingerprint(signal);
         decisionEngine.recordOutcome(signal.type, fingerprint, 'failed');
         // 自主智能：失败适应度回写 + 目标进度回写
         strategyEvolution.recordOutcome(genome.id, 'failed');
@@ -2896,11 +4385,42 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     return { features, complexity, length };
   }
 
+  // ── 第四轮 R4-A17 深化 1：跨步骤派生值缓存读写口径（旗标关 = 直算，逐位一致）──
+  // 信号指纹（sha256）与任务上下文推断均为纯函数（键即全部输入），重复
+  // 信号（延迟重审回注 / 周期性监控告警同文复发）跨批次跨步骤命中缓存，
+  // 结果与直算逐位一致（同输入同输出）。旗标关时不经过缓存容器。
+  const pipelineFingerprint = (signal: Pick<Signal, 'type' | 'description'>): string => {
+    if (!pipelineCacheOn) return decisionEngine.fingerprint(signal);
+    const key = `fp:${signal.type}:${signal.description}`;
+    const cached = pipelineStepCache.get(key) as string | undefined;
+    if (cached !== undefined) return cached;
+    const value = decisionEngine.fingerprint(signal);
+    pipelineStepCache.set(key, value, { pure: true });
+    return value;
+  };
+  const inferTaskContextMemo = (signal: Signal): { features: string[]; complexity: number; length: number } => {
+    if (!pipelineCacheOn) return inferTaskContext(signal);
+    const key = `ctx:${signal.type}:${signal.description}`;
+    const cached = pipelineStepCache.get(key) as { features: string[]; complexity: number; length: number } | undefined;
+    if (cached !== undefined) return cached;
+    const value = inferTaskContext(signal);
+    pipelineStepCache.set(key, value, { pure: true });
+    return value;
+  };
+
+  /** 第 5 步三重读取产物（经验检索 + 蒸馏策略 + 历史教训——深化 2/3 的载荷口径） */
+  interface Step5Trio {
+    lookup: ReturnType<Optimizer['lookupExperience']>;
+    strategies: ReturnType<LongTermMemory['getStrategies']>;
+    lessons: ReturnType<ReflectionEngine['getLessons']>;
+  }
+
   /**
    * 执行单个信号（第 5~10 步）
+   * @param traceId 审计追踪 id（批次口径；A17 纯记录，不影响执行语义）
    * @returns 计划执行结果（共识未提交时返回 null）
    */
-  async function executeSignal(signal: Signal): Promise<PlanExecutionResult | null> {
+  async function executeSignal(signal: Signal, traceId = ''): Promise<PlanExecutionResult | null> {
     // 共识门控：集群模式下决策需经 Raft 提交
     if (raft) {
       const proposal = await raft.propose({
@@ -2919,17 +4439,89 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
       });
       if (!proposal.committed) {
         recordDecision(signal, 'execute', 'failed', '共识提案未提交');
+        pipelineAudit.mark(traceId, 5, 'skipped', { signalId: signal.id, reason: 'consensus-rejected' });
         return null;
       }
     }
 
     // 第 5 步：经验检索（优化器：记忆库 → 优化器，叠加蒸馏策略与历史教训）
     // 第二阶段升级：传入推断的 features/complexity/length，让程序/语义记忆的条件匹配真正生效
+    // R4-A17 深化接线（全部旗标缺省关 = 原直算路径，逐位一致）：
+    // ① 深化 1 crossStepCache：任务上下文推断经跨步骤缓存（纯函数记忆化）；
+    // ② 深化 2 degradationLadder：三重读取异常时 主路径→简化路径→兜底直通（逐级入审计）；
+    // ③ 深化 3 stepPrefetch：执行等待期预取的代际守卫消费（结果恒与直算一致）。
     const taskType = signal.type;
-    const inferred = inferTaskContext(signal);
-    const lookup = optimizer.lookupExperience(taskType, inferred.complexity, inferred.features, { length: inferred.length });
-    const strategies = memory.getStrategies(taskType, 3);
-    const lessons = reflectionEngine.getLessons(taskType, 3);
+    const inferred = inferTaskContextMemo(signal);
+    pipelineAudit.begin(traceId, 5);
+    const runStep5Trio = (): Step5Trio => ({
+      lookup: optimizer.lookupExperience(taskType, inferred.complexity, inferred.features, { length: inferred.length }),
+      strategies: memory.getStrategies(taskType, 3),
+      lessons: reflectionEngine.getLessons(taskType, 3),
+    });
+    let lookup: Step5Trio['lookup'];
+    let strategies: Step5Trio['strategies'];
+    let lessons: Step5Trio['lessons'];
+    let step5Ladder: DegradationLadderResult<Step5Trio> | undefined;
+    if (pipelineLadderOn) {
+      const policy = modelScheduler.getPolicy();
+      step5Ladder = await runDegradationLadder<Step5Trio>([
+        // L1 主路径：完整三重读取（features/complexity/length 全上下文）
+        { name: 'main', run: runStep5Trio },
+        // L2 简化路径：退化为裸任务类型检索（无特征上下文），跳过策略/教训读取
+        {
+          name: 'simplified',
+          run: () => ({
+            lookup: optimizer.lookupExperience(taskType, 0.5),
+            strategies: [],
+            lessons: [],
+          }),
+        },
+        // L3 兜底直通：零记忆检索（空推荐直通执行——链路不因经验检索故障中断）
+        {
+          name: 'fallback',
+          run: () => ({
+            lookup: {
+              recommendedModels: {},
+              historicalSuccessRate: 0,
+              avgExecutionTime: 0,
+              memoryLayer: 'none' as const,
+              rationale: `降级直通：经验检索不可用（任务类型 ${taskType}），无记忆推荐`,
+              avoidModels: [],
+              policyVersion: `${policy.id}@v${policy.version}`,
+            },
+            strategies: [],
+            lessons: [],
+          }),
+        },
+      ]);
+      ({ lookup, strategies, lessons } = step5Ladder.result);
+    } else if (pipelinePrefetchOn) {
+      ({ lookup, strategies, lessons } = (await stepPrefetcher.consume(`step5:${signal.id}`, runStep5Trio)).value);
+    } else {
+      ({ lookup, strategies, lessons } = runStep5Trio());
+    }
+    if (step5Ladder !== undefined && step5Ladder.usedRung > 1) {
+      pipelineLadderDegradations += 1;
+      pipelineAudit.mark(traceId, 5, 'degraded', {
+        signalId: signal.id,
+        rung: step5Ladder.usedRung,
+        attempts: step5Ladder.attempts.map((a) => `L${a.rung}:${a.name}${a.error ? `（${a.error}）` : ''}`),
+      });
+      logger.warn(
+        '第 5 步经验检索降级至 L%d：%s',
+        step5Ladder.usedRung,
+        step5Ladder.attempts.map((a) => `${a.name}${a.error ? `（${a.error}）` : ''}`).join(' → '),
+      );
+    }
+    pipelineAudit.end(traceId, 5, 'ok', {
+      taskType,
+      memoryLayer: lookup.memoryLayer,
+      ...(lookup.pattern !== undefined ? { patternConfidence: lookup.pattern.confidence } : {}),
+      strategies: strategies.length,
+      lessons: lessons.length,
+      features: inferred.features,
+      complexity: Number(inferred.complexity.toFixed(3)),
+    });
     broadcast({
       type: 'strategist-thinking',
       step: 5,
@@ -2955,15 +4547,10 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     // 第 6 步：计划生成
     // 经验快路径（优化器）：命中高置信度成熟模式时，直接复用历史最优成功计划，
     // 跳过 strategist LLM 重新规划（越用越快、越稳、越省 token）
-    let plan = optimizer.recallPlan(lookup, signal.description);
-    if (plan) {
-      broadcast({
-        type: 'strategist-thinking',
-        step: 6,
-        message: `经验快路径：复用历史成功计划（置信度 ${lookup.pattern!.confidence.toFixed(2)}，${plan.nodes.length} 节点），跳过 LLM 规划`,
-      });
-      logger.info('经验快路径命中：任务类型 %s 复用历史计划（%d 节点）', taskType, plan.nodes.length);
-    } else {
+    // R4-A17 深化 2：degradationLadder 开启时计划生成异常走三级降级
+    //（L1 快路径/LLM 规划 → L2 离线兜底单节点 → L3 兜底直通内联单节点计划）；
+    // 关闭时保持原路径逐位一致（LLM 失败仍走既有「兜底计划」分支）。
+    const runStep6LLM = async (throwOnChatError: boolean): Promise<ExecutionPlan> => {
       // 常规路径：strategist 输出 DAG，注入蒸馏策略与教训上下文
       let strategistOutput: string | undefined;
       try {
@@ -2989,10 +4576,84 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
         // 模型输出中的短索引反解回完整记忆 ID（未登记的索引原样保留）
         strategistOutput = aliasMap.decodeText(response.content);
       } catch (err) {
+        if (throwOnChatError) throw err;
         logger.warn('strategist 计划生成失败，使用兜底计划: %s', (err as Error).message);
       }
-      plan = taskExecutor.buildPlan(signal.description, strategistOutput, taskType);
+      return taskExecutor.buildPlan(signal.description, strategistOutput, taskType);
+    };
+    let plan: ExecutionPlan;
+    let fastPathHit = false;
+    let step6Ladder: DegradationLadderResult<{ plan: ExecutionPlan; fastPathHit: boolean }> | undefined;
+    if (pipelineLadderOn) {
+      step6Ladder = await runDegradationLadder<{ plan: ExecutionPlan; fastPathHit: boolean }>([
+        // L1 主路径：经验快路径 / strategist LLM 规划（LLM 失败上抛 → 降级）
+        {
+          name: 'main',
+          run: async () => {
+            const fastPlan = optimizer.recallPlan(lookup, signal.description);
+            if (fastPlan) return { plan: fastPlan, fastPathHit: true };
+            return { plan: await runStep6LLM(true), fastPathHit: false };
+          },
+        },
+        // L2 简化路径：离线兜底单节点计划（与既有 LLM 失败兜底同款口径）
+        { name: 'simplified', run: () => ({ plan: taskExecutor.buildPlan(signal.description, undefined, taskType), fastPathHit: false }) },
+        // L3 兜底直通：内联单节点计划（buildPlan 亦不可用时链路仍不中断）
+        {
+          name: 'fallback',
+          run: () => ({
+            plan: {
+              objective: signal.description,
+              nodes: [{ id: 'node-1', description: signal.description, type: taskType, dependsOn: [] }],
+              parallelismStrategy: 'sequential',
+              source: 'fallback',
+            },
+            fastPathHit: false,
+          }),
+        },
+      ]);
+      plan = step6Ladder.result.plan;
+      fastPathHit = step6Ladder.result.fastPathHit;
+    } else {
+      const fastPlan = optimizer.recallPlan(lookup, signal.description);
+      fastPathHit = fastPlan !== undefined;
+      if (fastPlan) {
+        // 创世纪 G4 · 快路径反垄断：缺省复用历史模型指派（零漂移）；
+        // 关闭后快路径只复用计划**结构**（怎么做），模型字段解钉——
+        // 执行期重新选型（探索与学习保留选择权；soak/实测双重确认
+        // 钉死会让新臂永久饿死、桶内对照断流）
+        plan = fastPathReuseModels ? fastPlan : { ...fastPlan, nodes: fastPlan.nodes.map((n) => ({ ...n, modelId: undefined })) };
+      } else {
+        plan = await runStep6LLM(false);
+      }
     }
+    if (step6Ladder !== undefined && step6Ladder.usedRung > 1) {
+      pipelineLadderDegradations += 1;
+      pipelineAudit.mark(traceId, 6, 'degraded', {
+        signalId: signal.id,
+        rung: step6Ladder.usedRung,
+        attempts: step6Ladder.attempts.map((a) => `L${a.rung}:${a.name}${a.error ? `（${a.error}）` : ''}`),
+      });
+      logger.warn(
+        '第 6 步计划生成降级至 L%d：%s',
+        step6Ladder.usedRung,
+        step6Ladder.attempts.map((a) => `${a.name}${a.error ? `（${a.error}）` : ''}`).join(' → '),
+      );
+    }
+    if (fastPathHit) {
+      broadcast({
+        type: 'strategist-thinking',
+        step: 6,
+        message: `经验快路径：复用历史成功计划（置信度 ${lookup.pattern!.confidence.toFixed(2)}，${plan.nodes.length} 节点），跳过 LLM 规划`,
+      });
+      logger.info('经验快路径命中：任务类型 %s 复用历史计划（%d 节点）', taskType, plan.nodes.length);
+    }
+    // ── A17 审计：第 6 步检查点（快路径复用 vs 重新规划）──
+    pipelineAudit.mark(traceId, 6, fastPathHit ? 'fast-path' : 'planned', {
+      signalId: signal.id,
+      fastPath: fastPathHit,
+      nodes: plan.nodes.length,
+      taskType,
+    });
 
     // 第 7~10 步：并行执行 + 质量反思 + 级联触发 + 经验沉淀
     // 4.0 治理闭环：主执行路径接入安全治理器（升级前仅自主循环子集动作受治理，
@@ -3000,6 +4661,8 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     const governance = governor.govern('autonomous-execute', lookup.pattern?.confidence ?? 0.8);
     if (!governance.allowed) {
       recordDecision(signal, 'execute', 'failed', `治理拦截：${governance.reason ?? 'unknown'}`);
+      pipelineAudit.mark(traceId, 7, 'blocked', { signalId: signal.id, blockedBy: governance.blockedBy, reason: governance.reason });
+      for (const st of [8, 9, 10]) pipelineAudit.mark(traceId, st, 'skipped', { signalId: signal.id, reason: 'governed' });
       broadcast({ type: 'execution-governed', signalId: signal.id, blockedBy: governance.blockedBy, reason: governance.reason });
       logger.warn('执行被安全治理器拦截 [%s]: %s', governance.blockedBy, governance.reason);
       return null;
@@ -3008,8 +4671,28 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     // 经验驱动选型：把记忆推荐模型组合（按节点类型，已剔除 avoid-model 目标）传入执行器
     // 4.0：avoidModels 负向约束贯通执行全程（调度选型 + 重试切换均排除）
     if (hotReload) hotReload.registerTask(signal.id, taskType);
+    const cascadesBefore = cascadeCount; // A17 审计：第 9 步级联计数基线
+    pipelineAudit.begin(traceId, 7);
     try {
       const result = await taskExecutor.executePlan(signal, plan, effectiveRecommended, { avoidModels: [...avoided] });
+      pipelineAudit.end(traceId, 7, result.success ? 'ok' : 'failed', {
+        signalId: signal.id,
+        nodes: plan.nodes.length,
+        successCount: result.successCount,
+        avgQuality: Number(result.avgQuality.toFixed(3)),
+        totalTokens: result.totalTokens,
+        ...(result.error !== undefined ? { error: result.error } : {}),
+      });
+      // ── A17 审计：第 8 步检查点（质量反思口径——质量分 vs 阈值 + 重试账目）──
+      pipelineAudit.mark(traceId, 8, result.avgQuality >= cfg.qualityThreshold ? 'passed' : 'below-threshold', {
+        signalId: signal.id,
+        avgQuality: Number(result.avgQuality.toFixed(3)),
+        threshold: cfg.qualityThreshold,
+        retries: result.nodeResults.reduce((sum, n) => sum + Math.max(0, n.attempts - 1), 0),
+      });
+      // ── A17 审计：第 9 步检查点（级联触发计数——执行期内新级联信号数）──
+      const cascaded = cascadeCount - cascadesBefore;
+      pipelineAudit.mark(traceId, 9, cascaded > 0 ? 'ok' : 'none', { signalId: signal.id, cascaded });
       ctx.emit('scheduler/plan-complete', result, signal);
       recordDecision(signal, 'execute', result.success ? (result.avgQuality >= 0.85 ? 'excellent' : 'good') : 'failed', result.success ? `平均质量 ${result.avgQuality.toFixed(2)}` : result.error ?? '执行失败');
 
@@ -3029,11 +4712,22 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
         },
         decisionInsights: taskExecutor.getAndClearDecisionInsights(),
       });
+      // R4-A17 深化：反思落盘后推进记忆写入代数（预取条目代际守卫的失效口径
+      //——第 5 步三重读取的记忆输入已被本次反思改写，陈旧预取自动降级直算）
+      pipelineStepCache.bump();
+      // ── A17 审计：第 10 步检查点（反思与记忆更新完成——沉淀/策略反馈/蒸馏）──
+      pipelineAudit.mark(traceId, 10, result.success ? 'ok' : 'recorded', {
+        signalId: signal.id,
+        success: result.success,
+        appliedStrategies: strategies.length,
+        ...(lookup.matchedSemanticId !== undefined ? { matchedSemantic: true } : {}),
+        matchedProcedural: (lookup.matchedProceduralIds ?? []).length,
+      });
 
       // ── 第五阶段 Phase 2.5：任务结算 → 能量经济（价值铸币闭环）──
       // 各模型按成功节点的质量加权分红；失败任务不铸币但记录贡献证据
       if (symbiosisBridge) {
-        symbiosisBridge.settleTask(result);
+        symbiosisBridge.settleTask(result, { taskContext: signal.type });
       }
       return result;
     } finally {
@@ -3070,7 +4764,45 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
   // ── 启动各引擎 ──
   if (broadcaster) {
     broadcaster.start();
-    attachDashboard(broadcaster, () => llm.getModelStatuses());
+    // R4-A17 modules.dashboardAlarmSources：统一告警源接线（安全总督熔断 /
+    // 元认知冻结 / 哨兵风暴预算 → /api/alarm-feed；旗标关时第三参缺席——
+    // 告警面板空态，零漂移）。真实读数源（非注入样例）：
+    // - safety-governor：kill switch / 熔断态 / 连续失败（governor.getStatus）
+    // - metacognition：外环全局冻结（metaController.getState().frozen）
+    // - sentinel：全局风暴预算激活（stormBudgetView，未配置时缺席）
+    const dashboardAlarmSources = modulesCfg.dashboardAlarmSources?.enabled === true
+      ? {
+          getAlarms: () => {
+            const alarms: Array<{ id: string; source: string; severity: 'info' | 'warning' | 'critical'; title: string; detail?: string; timestamp: number }> = [];
+            try {
+              const status = governor.getStatus();
+              if (status?.killSwitch) {
+                alarms.push({ id: 'governor-kill-switch', source: 'safety-governor', severity: 'critical', title: '安全总督 Kill Switch 已触发', detail: `熔断态 ${String(status.circuitState)}，连续失败 ${String(status.consecutiveFailures)}`, timestamp: Date.now() });
+              } else if (status?.circuitState === 'open') {
+                alarms.push({ id: 'governor-circuit-open', source: 'safety-governor', severity: 'critical', title: '安全总督熔断器开启', detail: `连续失败 ${String(status.consecutiveFailures)}`, timestamp: Date.now() });
+              } else if (typeof status?.consecutiveFailures === 'number' && status.consecutiveFailures >= 3) {
+                alarms.push({ id: 'governor-failure-streak', source: 'safety-governor', severity: 'warning', title: '治理连续失败累计中', detail: `连续失败 ${String(status.consecutiveFailures)} 次`, timestamp: Date.now() });
+              }
+            } catch { /* 治理器读数缺席时诚实跳过 */ }
+            try {
+              if (metaController.getState().frozen) {
+                alarms.push({ id: 'meta-layer-frozen', source: 'metacognition', severity: 'warning', title: '元认知外环全局冻结', detail: '调参已熔断（等待观察窗判定回滚/保留）', timestamp: Date.now() });
+              }
+            } catch { /* 元认知读数缺席时诚实跳过 */ }
+            try {
+              const storm = sentinel.stormBudgetView();
+              if (storm?.active) {
+                alarms.push({ id: 'sentinel-storm-budget', source: 'sentinel', severity: 'warning', title: '全局风暴预算收紧中', detail: `强度 ${storm.intensityPerSec?.toFixed(1) ?? '?'} 次/秒 ≥ 阈 ${storm.thresholdPerSec.toFixed(1)}（预算 ${storm.budgetPerSec.toFixed(1)}/s）`, timestamp: Date.now() });
+              }
+            } catch { /* 哨兵读数缺席时诚实跳过 */ }
+            return alarms;
+          },
+        }
+      : undefined;
+    attachDashboard(broadcaster, () => llm.getModelStatuses(), dashboardAlarmSources);
+    if (dashboardAlarmSources) {
+      logger.info('模块域升级已挂载（1 旗标）：dashboardAlarmSources —— 统一告警源接入 /api/alarm-feed（安全总督 / 元认知 / 哨兵风暴预算）');
+    }
   }
   sentinel.start();
   if (autonomyEnabled) {
@@ -3670,8 +5402,29 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
           // 21.0/22.0：已挂载数学内核的诊断快照（未挂载/未裁决的键不出现，
           // 保持返回对象简洁）
           const kernelDiagnostics = modelScheduler.getAttachedDiagnostics();
+          // 创世纪观测口径（未挂载/未产出时键缺席——缺席即零介入的证明）
+          const hawkes = sentinel.hawkesView();
+          const backpressure = taskExecutor.backpressureView();
+          const speculative = modelScheduler.getSpeculativeVerdict();
+          const pricing = symbiosisBridge?.dynamicPricingView();
           return {
             introspection: autonomyLoop.introspect(),
+            // ── 第三轮 A17 升级（纯增量字段）：内核旗标总览 + 链路审计摘要 + 工具调用计数 ──
+            kernelFlags: kernelFlagOverview(cfg.autonomy?.kernels),
+            // ── 第四轮 R4-A17 增量字段：模块域升级旗标总览（与 kernelFlags 同款）──
+            moduleFlags: moduleFlagOverview(cfg.autonomy?.modules),
+            // ── 第四轮 R4-A17 增量字段：主链路深化读数（任一深化旗标开启时在场；全关时键缺席——零漂移）──
+            ...(pipelineCacheOn || pipelineLadderOn || pipelinePrefetchOn
+              ? {
+                  pipelineDeepening: {
+                    crossStepCache: pipelineCacheOn ? pipelineStepCache.stats() : undefined,
+                    degradationLadder: pipelineLadderOn ? { degradations: pipelineLadderDegradations } : undefined,
+                    stepPrefetch: pipelinePrefetchOn ? stepPrefetcher.stats() : undefined,
+                  },
+                }
+              : {}),
+            pipelineAudit: pipelineAudit.summary(),
+            toolCalls: tools.stats(),
             ...(kernelDiagnostics.indexScheduling ? { indexScheduling: kernelDiagnostics.indexScheduling } : {}),
             ...(kernelDiagnostics.lastBwK ? { banditKnapsack: kernelDiagnostics.lastBwK } : {}),
             // 24.0/25.0：隐私预算账本快照与最近容量规划产物（未启用/未产出时不出现）
@@ -3679,6 +5432,14 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
             ...(lastCapacityPlan ? { capacity: lastCapacityPlan } : {}),
             // 28.0：最近尾部风险评估产物（未启用/未产出时不出现）
             ...(lastTailRisk ? { tailRisk: { modelId: lastTailRisk.modelId, p99: Math.round(lastTailRisk.p99), p999: Math.round(lastTailRisk.p999), xi: Number(lastTailRisk.gpd.xi.toFixed(3)), sigma: Math.round(lastTailRisk.gpd.sigma), exceedances: lastTailRisk.exceedances, samples: lastTailRisk.samples, p999Ci: lastTailRisk.p999Ci ? { lower: Math.round(lastTailRisk.p999Ci.lower), upper: Math.round(lastTailRisk.p999Ci.upper) } : undefined } } : {}),
+            // 55.0：Hawkes 爆发读数（激发份额 / 风暴判定 / 当前强度）
+            ...(hawkes ? { hawkesBurst: { excitationShare: Number(hawkes.excitationShare.toFixed(3)), burst: hawkes.burst, rateAtNow: Number(hawkes.forecast.rateAtNow.toFixed(3)), expectedNextMin: Number(hawkes.forecast.expected.toFixed(2)), events: hawkes.events } } : {}),
+            // 54.0：背压稳定性告警（对偶价格超阈时的瓶颈洞察）
+            ...(backpressure?.insight ? { backpressure: backpressure.insight } : {}),
+            // 51.0：最近一次投机配对裁决
+            ...(speculative ? { speculativeDecoding: { pair: speculative.verdict.pair, adopt: speculative.verdict.adopt, optimalK: speculative.verdict.optimalK, speedup: Number(speculative.verdict.speedup.toFixed(3)) } } : {}),
+            // 65.0：共生费率学习读数（影子口径）
+            ...(pricing ? { dynamicPricing: pricing } : {}),
           };
         }
         default:
@@ -3867,34 +5628,49 @@ export function apply(ctx: Context, config: Partial<SchedulerConfig>): void {
     curiosity,
     governor,
     hostFusion,
+    // 第三轮 A17：10 步链路结构化审计轨迹（export()/summary() 离线可审计）
+    pipelineAudit,
     submitTask: (task, urgency = 0.8) => sentinel.ingest({ type: 'manual-task', description: task, payload: { task }, source: 'manual', urgency }),
   };
   ctx.provide('scheduler', service);
   ctx.provide('schedulerTools', tools);
 
   // ─────────────────────────── cleanup（fiber 卸载时逆序清理） ───────────────────────────
+  // 第三轮 A17：资源登记造册 + 清理审计。disposeSequence 按既有清理顺序枚举全部
+  // dispose 句柄（interval / fiber / listener / watcher / server / persist），逆序注册
+  // 进 ResourceRegistry——disposeAll() 的逆序释放遂与升级前的清理序逐位一致；
+  // 释放逐条 try/catch 记账，漏释放（登记未销账且无句柄）在审计报告中显式告警。
+  const disposeSequence: Array<{ kind: string; label: string; dispose: () => void }> = [
+    { kind: 'service', label: 'host-fusion', dispose: () => hostFusion.dispose() },
+    ...hostToolDisposers.map((dispose, i) => ({ kind: 'listener', label: `host-tool#${i}`, dispose: () => dispose() })),
+    { kind: 'fiber', label: 'autonomy-loop', dispose: () => autonomyLoop.stop() },
+    ...(hotReload ? [{ kind: 'watcher', label: 'hot-reload', dispose: () => hotReload.stop() }] : []),
+    ...(raft ? [{ kind: 'server', label: 'raft', dispose: () => raft.stop() }] : []),
+    { kind: 'service', label: 'distributed-sync', dispose: () => sync.stop() },
+    { kind: 'watcher', label: 'sentinel', dispose: () => sentinel.stop() },
+    { kind: 'service', label: 'tenant-manager', dispose: () => tenantManager.dispose() },
+    ...(broadcaster ? [{ kind: 'server', label: 'progress-broadcaster', dispose: () => broadcaster.stop() }] : []),
+    { kind: 'client', label: 'llm-client', dispose: () => llm.dispose() },
+    { kind: 'persist', label: 'memory-graph', dispose: () => memoryGraph.save() },
+    { kind: 'persist', label: 'long-term-memory', dispose: () => memory.dispose() },
+  ];
+  for (let i = disposeSequence.length - 1; i >= 0; i -= 1) {
+    const entry = disposeSequence[i]!;
+    resources.register(entry.kind, entry.dispose, entry.label);
+  }
   ctx.effect(() => {
     return () => {
       logger.info('调度器卸载中，清理资源…');
-      hostFusion.dispose();
-      for (const dispose of hostToolDisposers) {
-        try {
-          dispose();
-        } catch {
-          /* 官方注册表可能已随宿主卸载 */
-        }
-      }
-      autonomyLoop.stop();
-      hotReload?.stop();
-      raft?.stop();
-      sync.stop();
-      sentinel.stop();
-      tenantManager.dispose();
-      broadcaster?.stop();
-      llm.dispose();
-      memoryGraph.save();
-      memory.dispose();
+      const report = resources.disposeAll();
       logger.info('调度器资源已清理');
+      logger.info(
+        '资源清理审计: 登记 %d / 释放 %d / 漏释放 %d / 出错 %d%s',
+        report.registered,
+        report.released,
+        report.leaked,
+        report.errored,
+        report.leaked > 0 ? `——漏释放: ${report.entries.filter((e) => e.status === 'leaked').map((e) => `${e.kind}:${e.label}`).join(', ')}` : '',
+      );
     };
   }, 'scheduler-cleanup');
 }
@@ -3929,6 +5705,13 @@ export {
   EVIDENCE_MIN_SAMPLES,
   EVIDENCE_RANK_BLEND,
   LEGACY_EVIDENCE_DISCOUNT,
+  // 第五轮 R5-A19 导出面收口：evidence 新增 API（wilson 上界 / logBeta /
+  // 贝叶斯因子阈值与计算 / 多源证据合成）补入显式名单
+  wilsonUpperBound,
+  logBeta,
+  BAYES_FACTOR_THRESHOLDS,
+  bayesFactor,
+  synthesizeEvidence,
 } from './core/evidence.js';
 export type { MemoryEvidence, EvidenceView } from './core/evidence.js';
 // ── 5.0 因果内核：因果边贝叶斯更新 + do-干预登记 + Shapley 反事实分红 ──
@@ -4020,6 +5803,520 @@ export * from './core/secret-sharing.js';
 export * from './core/multiscale-wavelet.js';
 // ── 50.0 矩阵补全内核：ALS 低秩潜因子 ──
 export * from './core/matrix-completion.js';
+// ════════════════ 创世纪升级 51.0→75.0：五大新层 25 个内核 ════════════════
+// 全部经根入口 re-export（含类型）；缺省关闭旗标见 SchedulerConfig.autonomy.kernels，
+// 挂载点见各引擎 attachXxx 方法与 src/engines-frontier/genesis25.ts 适配层。
+// 导出消歧：多个内核自带同构 RNG 工具 mulberry32（与 28.0 extreme-value 的
+// 导出冲突，ES 星导出歧义按既有先例显式消解——各内核内部实现不受影响，
+// 根入口的规范 mulberry32 以 extreme-value 版为准）；stable-matching 与
+// nucleolus 各有一个语义不同的 inCore（房屋市场核 / 合作博弈核），显式别名保留两者。
+// ── 51.0 投机解码内核：draft-verify 期望收益闭式（N(k,γ) + 最优深度 k*）──
+export * from './core/speculative-decoding.js';
+// ── 52.0 测试时计算内核：多数票可达性 + 幂律曲线 + 注水配给 + 早停 ──
+export * from './core/test-time-compute.js';
+// ── 53.0 Whittle 指数内核：不休眠两态臂补贴法 + 可索引性定理 ──
+export * from './core/whittle-index.js';
+// ── 54.0 Lyapunov 漂移加罚内核：[O(1/V), O(V)] 背压调度 + LP 对偶基准 ──
+export * from './core/lyapunov-drift.js';
+// ── 55.0 Hawkes 自激发内核：EM 拟合 + 残差诊断 + 爆发闭式外推 ──
+export * from './core/hawkes-process.js';
+// ── 56.0 置信传播内核：因子图 sum-product / max-product（含圈阻尼）──
+export * from './core/belief-propagation.js';
+// ── 57.0 变分推断内核：平均场 CAVI / 非共轭 Armijo（显式列表：mulberry32 与 28.0 冲突）──
+export {
+  conjugateLinearRegressionPosterior,
+  VI_KIND,
+  DEFAULT_VI_CONFIG,
+  VariationalEngine,
+  logisticRegressionLogJoint,
+} from './core/variational-inference.js';
+export type {
+  ConjugatePosterior,
+  ViKind,
+  LinearRegressionSpec,
+  GaussianVISpec,
+  VIProblem,
+  VIConfig,
+  VIFitOptions,
+  VIFitResult,
+  LogisticModel,
+} from './core/variational-inference.js';
+// ── 58.0 朗之万采样内核：ULA/MALA + 步长自标定 + W2(Bures)（显式列表：mulberry32 冲突）──
+export {
+  MALA_OPTIMAL_ACCEPT,
+  empiricalMeanCov,
+  ula,
+  mala,
+  tuneStep,
+  gaussianTarget,
+  doubleWellTarget,
+  w2Gaussian,
+  // R5-A19 导出面收口：蛙跳提案 / OU 动量刷新尺度 / 欠阻尼 MALA
+  leapfrogProposal,
+  ouRefreshScale,
+  underdampedMala,
+} from './core/langevin-sampling.js';
+export type {
+  LangevinTarget,
+  UlaOptions,
+  UlaResult,
+  MalaOptions,
+  MalaResult,
+  TuneStepOptions,
+  TuneStepResult,
+  GaussianTargetOptions,
+  GaussianTarget,
+  W2Report,
+} from './core/langevin-sampling.js';
+// ── 59.0 课程学习内核：掌握门限状态机 + Thompson 课程 + 多策略对照 ──
+export * from './core/curriculum-learning.js';
+// ── 60.0 率失真内核：Blahut-Arimoto + 记忆三档压缩规划（影子价格 λ*）──
+export * from './core/rate-distortion.js';
+// ── 61.0 稳定匹配内核：延迟接受 + 格极值 + TTC（显式列表：inCore/mulberry32 冲突）──
+export {
+  deferredAcceptance,
+  latticeExtremes,
+  isStable,
+  allStableMatchings,
+  topTradingCycles,
+  inCore as inCoreHousing,
+  randomMatchingProblem,
+  randomHousingMarket,
+  // R5-A19 导出面收口：容量约束 DA / 队列化 DA / 多对一稳定性 / 医院-居民市场
+  capacityDeferredAcceptance,
+  deferredAcceptanceQueued,
+  isStableManyToOne,
+  randomHospitalResidentsProblem,
+  ruralHospitalCheck,
+} from './core/stable-matching.js';
+export type {
+  StableMatchingProblem,
+  DeferredAcceptanceResult,
+  StabilityCheck,
+  LatticeExtremes,
+  AllStableMatchingsResult,
+  HousingMarketProblem,
+  TopTradingCyclesResult,
+  CoreCheck,
+  CoreCheckOptions,
+} from './core/stable-matching.js';
+// ── 62.0 机制设计内核：铁化虚拟价值 + Myerson 最优拍卖 + VCG（显式列表：mulberry32 冲突）──
+export {
+  makeDistributionGrid,
+  uniformUnitGrid,
+  empiricalGrid,
+  virtualValue,
+  virtualValueCurve,
+  ironVirtualValues,
+  myersonReserve,
+  myersonAuction,
+  secondPrice,
+  vcgAllocate,
+  // R5-A19 导出面收口：组合拍卖 VCG
+  combinatorialVcg,
+} from './core/mechanism-design.js';
+export type {
+  DistributionGrid,
+  IronPool,
+  IronedVirtualCurve,
+  VcgAuctionInput,
+  VcgOutcome,
+  MyersonOutcome,
+} from './core/mechanism-design.js';
+// ── 63.0 核仁内核：精确分数算术 LP + 逐级最小化最大抱怨（显式列表：inCore 冲突）──
+export {
+  Fraction,
+  frac,
+  solveLP,
+  MAX_EXACT_PLAYERS,
+  makeGame,
+  makeGameFromPairs,
+  coalitionMask,
+  coalitionMembers,
+  excess,
+  excessVector,
+  isImputation,
+  inCore as inCoreGame,
+  leastCore,
+  core,
+  nucleolus,
+  shapleyExact,
+  // R5-A19 导出面收口：批量等价加速核仁 / 对称类归并
+  nucleolusFast,
+  symmetryClasses,
+} from './core/nucleolus.js';
+export type {
+  ConstraintSense,
+  LPProblem,
+  LPSolution,
+  CoalitionValue,
+  CooperativeGame,
+  CoalitionExcess,
+  LeastCoreResult,
+  CoreStatus,
+  NucleolusRound,
+  NucleolusResult,
+} from './core/nucleolus.js';
+// ── 64.0 相关均衡内核：无悔动态学习 CE + 偏离审计 + Nash 枚举（显式列表：mulberry32 冲突）──
+export {
+  MAX_JOINT_ACTIONS,
+  normalGame,
+  jointIndexOf,
+  profileOfJoint,
+  payoffOf,
+  counterfactualPayoffs,
+  positiveRegretDistribution,
+  regretMatchingStep,
+  isCorrelatedEquilibrium,
+  expectedPayoffsUnder,
+  learnCE,
+  enumerateNash,
+  // R5-A19 导出面收口：CCE 检验 / 均衡间隙 / 向量化无悔 CE 学习
+  isCoarseCorrelatedEquilibrium,
+  equilibriumGaps,
+  learnCEFast,
+} from './core/correlated-equilibrium.js';
+export type {
+  NormalGame,
+  RegretMatchingStep,
+  CEDeviation,
+  CECheck,
+  LearnCEResult,
+  NashEquilibrium,
+} from './core/correlated-equilibrium.js';
+// ── 65.0 动态定价内核：UCB/Thompson 无悔定价 + 遗憾曲线 ──
+export * from './core/dynamic-pricing.js';
+// ── 66.0 模拟退火内核：Metropolis + 退火日程 + 势阱深度（TSP 测试台）──
+export * from './core/simulated-annealing.js';
+// ── 67.0 NSGA-II 内核：非支配排序 + 拥挤距离 + 2D 超体积 ──
+export * from './core/nsga2-pareto.js';
+// ── 68.0 压缩距离内核：LZW/NCD + 层次聚类 + 三角不等式审计（显式列表：mulberry32 冲突）──
+export {
+  LZW_SELF_DISTANCE_ASYMPTOTE,
+  pseudoRandomString,
+  lzwCompress,
+  compressedBits,
+  ncd,
+  ncdMatrix,
+  ncdCluster,
+  ncdTriangleAudit,
+  // R5-A19 导出面收口：LZ77 压缩 / NCD LZ77 口径 / 矩阵缓存统计与重置
+  lz77Compress,
+  ncdLz77,
+  ncdCacheStats,
+  resetNcdCache,
+} from './core/compression-distance.js';
+export type {
+  LzwResult,
+  NcdClusterOptions,
+  NcdClusterMerge,
+  NcdClusterResult,
+  NcdTriangleAudit,
+} from './core/compression-distance.js';
+// ── 69.0 Mapper 图内核：区间覆盖 × 单链聚类 × 圈基（经验地形骨架）──
+export * from './core/mapper-graph.js';
+// ── 70.0 部分信息分解内核：BROJA PID + O 信息（协同/冗余/独占可计算）──
+export * from './core/partial-info-decomposition.js';
+// ── 71.0 A* 搜索内核：可采纳启发最优搜索 + 一致性自证（网格世界测试台）──
+export * from './core/astar-search.js';
+// ── 72.0 稀疏恢复内核：Lasso 坐标下降 + KKT 证书 + OMP + CV 选 λ ──
+export * from './core/sparse-recovery.js';
+// ── 73.0 最佳臂识别内核：逐次减半 / 置信淘汰 / H 复杂度 ──
+export * from './core/best-arm-identification.js';
+// ── 74.0 镜像下降内核：Bregman 几何无悔更新 + 三点恒等式审计 ──
+export * from './core/mirror-descent.js';
+// ── 75.0 在线校准内核：门控 Platt/Isotonic + 漂移哨兵 ──
+export * from './core/online-calibration.js';
+// ── 创世纪接线适配层（引擎数据 → 内核输入的纯翻译；挂载点见各引擎 attachXxx）──
+export * from './engines-frontier/genesis25.js';
+
+// ════════════════ 第二轮创世纪升级 76.0→100.0：五大新层 25 个内核 ════════════════
+// 全部经根入口 re-export（含类型）；缺省关闭旗标见 SchedulerConfig.autonomy.kernels，
+// 挂载点见各引擎 attachXxx 方法与 src/engines-frontier/autonomy25.ts 适配层。
+// 导出消歧（第一轮先例同款）：8 个新内核自带同构 RNG 工具 mulberry32——根入口
+// 规范 mulberry32 仍以 28.0 extreme-value 版为准；gaussianNoise 以 differential-privacy
+// 版为准（76.0/86.0/87.0 的同名实现数学同构）；normalCdf 以 gaussian-process 版为准
+// （76.0/97.0 同构）；chiSquareQuantile 以 28.0 版为准；isStable 以 61.0 stable-matching
+// 版为准（81.0 的论证语义同名实现显式列表排除——语义不同不得混淆）；SimulateOptions
+// 以 59.0 curriculum-learning 版为准（90.0/87.0 各自别名保留语义）；ViolationReport
+// 以 15.0 runtime-verification 版为准（87.0 别名 BarrierViolationReport）；CalibrationReport
+// 以 75.0 online-calibration 版为准（94.0 别名 SimCalibrationReport）；Episode/DiscretePolicy
+// 以 88.0 off-policy-evaluation 版为准（83.0 别名 MdlEpisode、89.0 别名 SpiEpisode/
+// SpiDiscretePolicy——三个内核的 Episode 字段语义不同，别名全部保留）。
+// ── 76.0 新奇检测内核：自适应参考窗双证据（Mahalanobis 门控 + kNN 计数比）+ CUSUM 变点（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  normalQuantile,
+  chiSquareUpperTail,
+  ledoitWolfIntensity,
+  mahalanobisDepth,
+  knnNovelty,
+  noveltyAUC,
+  CUSUMDetector,
+  cusumARLSiegmund,
+  cusumARLMarkov,
+  calibrateThreshold,
+  DEFAULT_ADAPTIVE_WINDOW_CONFIG,
+  AdaptiveReferenceWindow,
+  // R5-A19 导出面收口：LOF 新奇评分 / 半空间深度
+  localOutlierFactor,
+  lofAUC,
+  halfspaceDepth1D,
+} from './core/novelty-detection.js';
+// ── 77.0 因果发现内核：PC 算法 CPDAG 等价类 + 偏相关/互信息检验（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  EDGE_STATE,
+  partialCorrelationTest,
+  mutualInformationTest,
+  pcAlgorithm,
+  cpdagFromDag,
+  edgesOfMixed,
+  vStructuresOf,
+  cpdagSummary,
+  randomDag,
+  dagFromEdges,
+  sampleLinearSem,
+  structuralHammingDistance,
+  // R5-A19 导出面收口：GES 贪婪等价搜索（lite）
+  gesLite,
+} from './core/causal-discovery.js';
+// ── 78.0 典型相关内核：CCA/岭正则 CCA + Jacobi 特征归约 ──
+export * from './core/canonical-correlation.js';
+// ── 79.0 扩散映射内核：流形嵌入 + 扩散距离 + 谱隙簇数（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  gaussianSampler,
+  pairwiseDistances,
+  knnGraph,
+  diffusionMaps,
+  diffusionDistance,
+  floydWarshall,
+  isomap,
+  swissRoll,
+  twoMoons,
+  nearestCentroidClassify,
+  // R5-A19 导出面收口：地标扩散嵌入 / 尺度扫描
+  landmarkDiffusion,
+  diffusionScaleSweep,
+} from './core/diffusion-maps.js';
+// ── 80.0 流式概要内核：CMS/指数直方图/蓄水池/Misra–Gries 四结构 ──
+export * from './core/streaming-sketch.js';
+// ── 81.0 论证内核：Dung 抽象论证框架 + grounded/preferred/stable 语义（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  MAX_ENUM_ARGUMENTS,
+  argumentFramework,
+  randomFramework,
+  isConflictFree,
+  defends,
+  isAdmissible,
+  isComplete,
+  isAcceptable,
+  groundedExtension,
+  completeExtensions,
+  preferredExtensions,
+  stableExtensions,
+  bruteForceSemantics,
+  EXTENSION_SEMANTICS,
+  acceptance,
+  formatArgumentSet,
+  // R5-A19 导出面收口：价值论证框架（VAF）听众语义与攻击检验
+  valueFramework,
+  inducedFramework,
+  allAudiences,
+  attackSucceeds,
+  valueAcceptance,
+  randomValueFramework,
+  VAF_MAX_VALUES,
+} from './core/argumentation.js';
+// ── 82.0 众包聚合内核：Dawid–Skene EM + 信任票权加权多数票 ──
+export * from './core/crowd-aggregation.js';
+// ── 83.0 世界模型学习内核：转移/奖励自学 + 值迭代 + 后继特征换目标（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  makeChain,
+  makeGridworld,
+  sampleTransition,
+  randomPolicy,
+  greedyPolicyFn,
+  epsGreedyPolicyFn,
+  collectEpisodes,
+  learnModel,
+  valueIteration,
+  bellmanResidual,
+  policyValue,
+  greedyActions,
+  greedyPolicyMatrix,
+  successorFeatures,
+  retarget,
+  qLearning,
+  dynaQ,
+  // R5-A19 导出面收口：优先级扫描 / 随机表格 MDP 生成器
+  prioritizedSweeping,
+  randomTabularMDP,
+} from './core/world-model-learning.js';
+// ── 84.0 POMDP 规划内核：α-向量值迭代 + 信念更新 + QMDP 上界 ──
+export * from './core/pomdp-planning.js';
+// ── 85.0 符号求解内核：DPLL SAT + 模型计数 + DIMACS lite ──
+export * from './core/symbolic-solver.js';
+// ── 86.0 分层技能内核：option/SMDP Q 学习 + 时间信用分配 γ^k（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  ACTIONS,
+  fourRoomsGridworld,
+  corridorGridworld,
+  primitiveOptions,
+  hallwayOptions,
+  smdpQLearning,
+  flatQLearning,
+  intraOptionQLearning,
+  solveSmdpExact,
+  optionBellmanResidual,
+  smokeTestPolicy,
+  // R5-A19 导出面收口：瓶颈态发现 / 图论中心性 / 选项自动生成
+  bottleneckStates,
+  articulationPoints,
+  stateBetweenness,
+  optionsFromBottlenecks,
+  optionTables,
+} from './core/options-framework.js';
+// ── 87.0 安全屏障内核：离散控制屏障函数 cbfFilter 最小安全修改（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  BARRIER_VIOLATION_TOL,
+  cbfFilter,
+  brakeDoubleIntegrator,
+  simulateClosedLoop,
+  violationReport,
+  // R5-A19 导出面收口：多屏障合取安全滤波
+  cbfFilterConjunction,
+} from './core/safety-barrier.js';
+// ── 88.0 离线评估内核：OIS/WIS/PDIS/DR 反事实估值 + EB 置信区间 ──
+export * from './core/off-policy-evaluation.js';
+// ── 89.0 安全策略改进内核：HCPI 高置信证书 + 集中率曲线（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  pdisEpisodeValue,
+  ebRadius,
+  safePolicyImprove,
+  concentrationCurve,
+  rejectionRate,
+  // R5-A19 导出面收口：多重校正（Bonferroni δ）/ 多策略安全改进
+  bonferroniDelta,
+  MULTI_CORRECTION,
+  safePolicyImproveMulti,
+} from './core/safe-policy-improvement.js';
+// ── 90.0 偏好学习内核：Bradley–Terry MLE + 拟合优度体检 + Elo（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  BT_FIT_DEFAULTS,
+  ELO_DEFAULTS,
+  GOF_DEFAULTS,
+  logistic,
+  stdNormalCdf,
+  chiSquarePValue,
+  ELO_SCALE,
+  utilityToEloScale,
+  eloScaleToUtility,
+  expectedScore,
+  predictPair,
+  thurstoneProbability,
+  btLogLoss,
+  bradleyTerryMLE,
+  eloUpdate,
+  eloSequence,
+  transitivityCheck,
+  btGoodnessOfFit,
+  simulatePreferences,
+  heldOutAccuracy,
+  rankByUtility,
+  // R5-A19 导出面收口：Plackett–Luce 排名模型（概率 / 对数似然 / MLE / 仿真）
+  plackettLuceProbability,
+  plackettLuceChoiceProbability,
+  plackettLuceLogProb,
+  plackettLuceMLE,
+  simulateRankings,
+} from './core/preference-learning.js';
+// ── 91.0 新奇搜索内核：行为空间 kNN 新奇定向 + MCNS 门槛 ──
+export * from './core/novelty-search.js';
+// ── 92.0 自我对弈内核：可剥削度 + 虚拟对弈 + 联赛 exploiter 训练（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  matrixGame,
+  transposeMatrix,
+  rockPaperScissors,
+  kuhnDealPayoff,
+  kuhnPokerMini,
+  expectedRowValues,
+  expectedValue,
+  valueOf,
+  bestResponse,
+  bestResponseColumn,
+  exploitability,
+  fictitiousPlay,
+  leaguePlay,
+  // R5-A19 导出面收口：最优反应弱点剖析 / 演化稳定性排名
+  bestResponseWeakness,
+  evolutionaryStabilityRank,
+} from './core/self-play.js';
+// ── 93.0 AutoML Hyperband 内核：无限早停预算分配 + 学习曲线 ──
+export * from './core/automl-hyperband.js';
+// ── 94.0 仿真校准内核：MMD²/能量距离域差 + 密度比再加权（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  mmd2,
+  medianHeuristicGamma,
+  energyDistance,
+  densityRatioClassifier,
+  reweightedStatistic,
+  weightedMmd2,
+  calibrateSim,
+  makeDomainGap,
+  // R5-A19 导出面收口：重要性权重截断 / 加权自助法
+  truncateWeights,
+  weightedBootstrap,
+} from './core/simulation-calibration.js';
+// ── 95.0 中断交接内核：闭式接管阈值 τ* + 可中断 Q 学习修正 ──
+export * from './core/interruptible-autonomy.js';
+// ── 96.0 全局工作空间内核：投标竞争 + 点火广播 + 不应期防垄断 ──
+export * from './core/global-workspace.js';
+// ── 97.0 元认知信心内核：meta-d′ 效率 M-ratio + 闭式求助阈值（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  probit,
+  typeOneDprime,
+  metaDprime,
+  confidenceAccuracyCurve,
+  optimalAskThreshold,
+  posteriorErrorProbability,
+  shouldAsk,
+  simulateMetacognition,
+  // R5-A19 导出面收口：meta-d′ 最大似然拟合 / 贝叶斯最优求助报告
+  metaDprimeFit,
+  bayesOptimalReport,
+} from './core/metacognitive-confidence.js';
+// ── 98.0 经验重放内核：分层优先重放 + IS 加权睡眠固化 ──
+export * from './core/experience-replay.js';
+// ── 99.0 注意力经济内核：凹价值曲线贪心出清（= 穷举最优）+ VCG 支付（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  unitDemandSource,
+  geometricSource,
+  saturatingSource,
+  concavityCheck,
+  allocateAttention,
+  greedyVsOptimal,
+  misreportGain,
+  // R5-A19 导出面收口：注意力衰减经济（衰减源 / 退出年龄 / 衰减与快速分配）
+  decayedSource,
+  decayExitAge,
+  allocateAttentionDecayed,
+  allocateAttentionFast,
+} from './core/attention-economy.js';
+// ── 100.0 自我边界内核：能动性归因（shuffle 对照互信息）+ 身份连续性（显式列表：与既有导出同名冲突按先例消歧，见上方消歧注释） ──
+export {
+  contingencyScore,
+  detectAgency,
+  doVsObserve,
+  identityContinuity,
+  simulateEnv,
+  // R5-A19 导出面收口：增量列联表 / 多步归因 / 他者心智模型与仿真
+  IncrementalContingency,
+  multiStepAttribution,
+  otherAgentModel,
+  simulateOtherAgent,
+  simulateChain,
+} from './core/self-boundary.js';
+// ── 第二轮创世纪接线适配层（引擎数据 → 内核输入的纯翻译；挂载点见各引擎 attachXxx）──
+export * from './engines-frontier/autonomy25.js';
 // 4.0 弹性内核：熔断器 / 指数退避 / 错误分型（可靠执行共享组件）
 export {
   CircuitBreaker,
@@ -4029,6 +6326,20 @@ export {
   classifyError,
   DEFAULT_CIRCUIT_BREAKER_CONFIG,
   DEFAULT_BACKOFF_CONFIG,
+  // R5-A19 导出面收口：Weibull 寿命模型 / 可用性闭环 / 冗余与维修增益 / 韧性预算
+  weibullLogSurvival,
+  weibullSurvival,
+  weibullHazard,
+  weibullMean,
+  weibullVariance,
+  weibullCoefficientOfVariation,
+  weibullDiagnostics,
+  steadyStateAvailability,
+  logDomainAvailability,
+  systemAvailability,
+  redundancyGainLog,
+  repairSpeedGainLog,
+  resilienceBudget,
 } from './core/resilience.js';
 export type { BreakerState, BreakerProbe, BreakerStatus, CircuitBreakerConfig, BackoffConfig, RetryClass, ErrorClassification } from './core/resilience.js';
 export * from './memory/long-term-memory.js';
@@ -4084,3 +6395,18 @@ export * from './symbiosis/bridge.js';
 // ── C 路线：生态可观测性（能量 Sankey 数据模型 + 自包含 HTML 渲染）──
 export * from './symbiosis/observability.js';
 export { attachDashboard } from './dashboard/index.js';
+// ── A18 遥测审计总线（第三轮新模块 src/telemetry/）：结构化事件总线 /
+//    指标注册表 / 追加式审计账 / 嵌套栈跟踪（注入时钟、纯内存、零 I/O）──
+export * from './telemetry/event-bus.js';
+export * from './telemetry/metrics.js';
+export * from './telemetry/audit-log.js';
+export * from './telemetry/trace.js';
+// 消歧：progress-ws 的 SeqGap（客户端缺口 {from,to}）与 event-bus 的
+// SeqGap（总线缓冲缺口 {fromSeq,toSeq,count}）同名；meta-types 的
+// AuditEntry（元认知审计轨迹）与 audit-log 的 AuditEntry（遥测审计账
+// 条目 + 哈希链字段）同名（export * 静默排除同名成员），显式导出主名
+// （既有根入口语义不变）+ 别名保留两者语义（SettlementReport 先例同款）
+export type { SeqGap } from './progress-ws.js';
+export type { SeqGap as TelemetrySeqGap } from './telemetry/event-bus.js';
+export type { AuditEntry } from './meta/meta-types.js';
+export type { AuditEntry as TelemetryAuditEntry } from './telemetry/audit-log.js';

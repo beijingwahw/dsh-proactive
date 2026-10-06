@@ -20,10 +20,18 @@
  *   Evolver 花大钱进化 → 卖策略基因变现 → Optimizer 买知识提升决策
  *   → 任务成功央行铸币分红（按 Wilson 信誉加权）→ Memory 卖沉淀知识
  *   持续抽取售后分成 → 能量流向高效智能体，低效者饥饿休眠。
+ *
+ * 三轮升级：三智能体构造函数均透传 AgentTrustConfig（观测封顶 +
+ * 冷启动额度——女巫抵抗的 agent 侧旋钮；缺省不配置 = 旧行为零漂移）。
+ *
+ * 四轮升级（激活）：构造函数再透传 ContributorProfileConfig（三维画像 +
+ * 突变检测的 agent 侧旋钮）——内置智能体由此获得画像能力：宿主只需
+ * `new MemoryAgent('memory', mem, {}, undefined, { buckets: 8 })` 即激活，
+ * 缺省不配置 = 零记录零漂移。
  */
 
 import type { LongTermMemory, TaskPatternMemory } from '../memory/long-term-memory.js';
-import { AgentBase, type ActionResult, type AgentGoal, type AgentProposal, type ExecutionGrant, type ListingView, type Perception } from './agent.js';
+import { AgentBase, type ActionResult, type AgentGoal, type AgentProposal, type AgentTrustConfig, type ContributorProfileConfig, type ExecutionGrant, type ListingView, type Perception } from './agent.js';
 
 // ─────────────────────────── MemoryAgent ───────────────────────────
 
@@ -57,8 +65,10 @@ export class MemoryAgent extends AgentBase {
     id: string,
     private readonly memory: LongTermMemory,
     config: MemoryAgentConfig = {},
+    trust?: AgentTrustConfig,
+    profile?: ContributorProfileConfig,
   ) {
-    super(id);
+    super(id, Date.now(), trust, profile);
     this.cfg = {
       listingBasePrice: config.listingBasePrice ?? 10,
       listingConfidenceThreshold: config.listingConfidenceThreshold ?? 0.5,
@@ -167,8 +177,10 @@ export class OptimizerAgent extends AgentBase {
     id: string,
     config: OptimizerAgentConfig = {},
     private readonly onPurchase?: (assetId: string, refId: string, price: number) => void,
+    trust?: AgentTrustConfig,
+    profile?: ContributorProfileConfig,
   ) {
-    super(id);
+    super(id, Date.now(), trust, profile);
     this.cfg = {
       maxBudget: config.maxBudget ?? 20,
       reserveBalance: config.reserveBalance ?? 30,
@@ -296,8 +308,10 @@ export class EvolverAgent extends AgentBase {
     id: string,
     private readonly runCycle?: () => Promise<EvolutionCycleOutcome>,
     config: EvolverAgentConfig = {},
+    trust?: AgentTrustConfig,
+    profile?: ContributorProfileConfig,
   ) {
-    super(id);
+    super(id, Date.now(), trust, profile);
     this.cfg = {
       evolutionCost: config.evolutionCost ?? 50,
       evolutionBalanceThreshold: config.evolutionBalanceThreshold ?? 60,

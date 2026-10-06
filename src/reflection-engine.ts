@@ -19,6 +19,11 @@
  * - 反思从"事后统计"进化为"主动诊断"，每次失败都产出可复用的教训
  * - 阈值不再是静态配置，而是随系统能力演化的活参数
  * - 评审模型可注入，冒烟测试可离线模拟
+ *
+ * 第四轮 R4-A6 新增维度（opt-in，未挂载零漂移）：
+ * - 反思深度分级：轻反思（统计快检 / z 检验）与重反思（全链归因）按
+ *   失败代价分级路由；轻反思检出统计异常 → 同事件升级触发重反思
+ *   （attachDepthGrading → gradedReflect / depthStats）
  */
 
 import type { NodeResult, PlanExecutionResult, ExecutionPlan } from './types.js';
@@ -26,6 +31,9 @@ import type { Signal } from './sentinel.js';
 import { decayFactor } from './core/evidence.js';
 import type { CausalKernel } from './core/causal-kernel.js';
 import { selectRiskControlledThreshold, type RiskControlResult } from './core/conformal.js';
+
+// 第二轮创世纪 81.0：论证内核（深思/反思的裁决语义——辩护链存在性）
+import { conflictAdjudication, type ConflictAdjudicationView } from './engines-frontier/autonomy25.js';
 
 /** 评审模型签名（可注入） */
 export type JudgeModel = (params: {
@@ -147,6 +155,138 @@ export interface ReflectionVerdict {
   dimensions?: { completeness: number; correctness: number; maintainability: number; comment: string };
 }
 
+// ───────────────────── 第三轮模块域升级 A6：重试策略 bandit 化 ─────────────────────
+
+/** A6 升级 3：bandit 臂（重试同模型 / 换模型重试） */
+export type RetryBanditArm = 'retry-same' | 'retry-switch';
+
+/**
+ * A6 升级 3：重试 bandit 决策读数
+ *
+ * ε 递减 ε-greedy：以 ε 概率探索另一臂、1-ε 贪心选「历史平均失败成本
+ * 更低」的臂；ε 随拉动总数指数衰减（ε = max(εmin, ε0·decay^n)）——
+ * 早期多试（收集两臂成本证据）、后期少试（吃收敛红利）。
+ */
+export interface RetryBanditDecision {
+  /** 选中的臂 */
+  arm: RetryBanditArm;
+  /** 本次决策的探索率 */
+  epsilon: number;
+  /** 本次是否探索（true = 随机臂；false = 贪心臂 / 冷启动初始化拉） */
+  explored: boolean;
+  /** 两臂累计拉动数 */
+  pulls: Record<RetryBanditArm, number>;
+  /** 两臂平均失败成本（未拉动为 0） */
+  avgCost: Record<RetryBanditArm, number>;
+  /** 当前贪心最优臂（平均成本更低者；无数据时 retry-same） */
+  greedyArm: RetryBanditArm;
+}
+
+/** A6 升级 3：重试 bandit 状态总览（失败成本账本） */
+export interface RetryBanditStatus {
+  /** 当前探索率 */
+  epsilon: number;
+  /** 两臂拉动数 */
+  pulls: Record<RetryBanditArm, number>;
+  /** 总拉动数 */
+  totalPulls: number;
+  /** 两臂平均失败成本 */
+  avgCost: Record<RetryBanditArm, number>;
+  /** 入账总失败成本（对照固定规则的结算口径） */
+  totalCost: number;
+  /** 当前贪心最优臂 */
+  greedyArm: RetryBanditArm;
+}
+
+// ───────────────────── 第四轮模块域升级 R4-A6：反思深度分级（轻 / 重按代价路由） ─────────────────────
+
+/** R4-A6 升级 2：反思深度（轻 = 统计快检 / 重 = 全链归因） */
+export type ReflectionDepth = 'light' | 'heavy';
+
+/**
+ * R4-A6 升级 2：轻反思快检（统计口径——不逐节点归因，代价 1 单位）
+ *
+ * 对失败质量在近窗历史上做 z 检验：z ≤ escalationZ 判「异常」
+ * （该失败显著偏离该任务类型的常态分布——不是噪声，值得深挖）。
+ */
+export interface LightReflectionCheck {
+  /** 快检窗口样本量（< 3 时基线不足，z 置 0 不判异常——诚实降级） */
+  windowSamples: number;
+  /** 近窗质量均值 */
+  recentMean: number;
+  /** 近窗质量标准差（std < 0.05 时以 0.05 为尺度下限——零方差窗口仍有区分度） */
+  stdDev: number;
+  /** 本次失败质量 */
+  quality: number;
+  /** z 分 = (quality − mean) / max(std, 0.05) */
+  zScore: number;
+  /** 异常判定（z ≤ escalationZ） */
+  anomaly: boolean;
+  verdict: string;
+}
+
+/** R4-A6 升级 2：重反思的节点归因项 */
+export interface HeavyAttributionNode {
+  nodeId: string;
+  type: string;
+  /** 责任占比 0~1（全链合计 1——失败责任第一次被定量分摊） */
+  contribution: number;
+  note: string;
+}
+
+/** R4-A6 升级 2：重反思全链归因（失败节点 + 上游传导的责任分摊） */
+export interface HeavyAttribution {
+  failedNodeId: string;
+  /** 归因链（按责任占比降序，至多 5 项） */
+  chain: HeavyAttributionNode[];
+  /** 根因提示（教训库最近同任务类型根因；无教训时 'unknown'） */
+  rootCauseHint: RootCauseCategory;
+  /** 消费的教训条数 */
+  consultedLessons: number;
+}
+
+/** R4-A6 升级 2：分级反思结论（轻 / 重 + 轻→重升级链） */
+export interface DepthGradedReflection {
+  depth: ReflectionDepth;
+  /** 触发分级的失败代价 */
+  failureCost: number;
+  /** 分级阈值（cost ≥ threshold → 重反思） */
+  threshold: number;
+  /** 轻反思快检（depth='light' 时必有） */
+  quickCheck?: LightReflectionCheck;
+  /** 重反思归因（depth='heavy' 或轻反思升级时有） */
+  attribution?: HeavyAttribution;
+  /** 轻反思检出异常 → 同事件升级触发重反思（轻→重升级链） */
+  escalated: boolean;
+  /** 反思代价核算（轻 lightCostUnits / 重 heavyCostUnits / 升级 = 轻 + 重） */
+  costUnits: number;
+}
+
+/** R4-A6 升级 2：分级路由统计（省代价对照口径） */
+export interface DepthGradingStats {
+  /** 轻反思次数 */
+  light: number;
+  /** 重反思次数（含升级触发的重反思） */
+  heavy: number;
+  /** 轻→重升级次数 */
+  escalations: number;
+  /** 实际发生代价 */
+  totalCostUnits: number;
+  /** 全重反思基线代价（不分级时的旧口径） */
+  allHeavyCostUnits: number;
+  /** 分级省下的代价 = allHeavy − total */
+  savedCostUnits: number;
+}
+
+/** 分级反思的节点输入（轻反思不需要；重反思全链归因消费） */
+export interface GradedReflectionNode {
+  id: string;
+  type: string;
+  quality: number;
+  success: boolean;
+  dependsOn: string[];
+}
+
 /** 默认配置 */
 export const DEFAULT_REFLECTION_CONFIG: ReflectionEngineConfig = {
   qualityThreshold: 0.7,
@@ -187,6 +327,37 @@ export class ReflectionEngine {
   }
 
   /**
+   * 81.0：挂载对抗论证裁决（幂等覆盖，挂载即生效——影子计算口径）。
+   *
+   * 辩论/多结论反思收束后的「结论 + 冲突对」编码为 ArgumentFramework
+   * （每结论一条论证、每条「X 推翻 Y 的前提」一条攻击边——边须对应真实
+   * 反驳记录，防攻击图投毒），groundedExtension 给无争议辩护链，
+   * acceptance 逐结论回答疑信/轻信接受：疑信接受才可写入共识账本，
+   * 连轻信都不可接受的结论携带致败边（拒绝第一次有了数学尸检报告）。
+   * 影子计算——不改变反思主链路（零漂移）。
+   */
+  attachArgumentation(): void {
+    this.argumentationEnabled = true;
+  }
+
+  /** 81.0：论证裁决旗标（未挂载零介入） */
+  private argumentationEnabled?: boolean;
+
+  /**
+   * 81.0：冲突裁决读数（未挂载 / 结论数超枚举护栏（>16）时 undefined）。
+   * @param conclusions 结论文本表（每结论一条论证）
+   * @param attacks 冲突对下标表（[i, j] = i 攻击 j）
+   * @param semantics 裁决语义（缺省 grounded——多项式、必存在、最保守）
+   */
+  argumentationVerdict(
+    conclusions: ReadonlyArray<string>,
+    attacks: ReadonlyArray<readonly [number, number]>,
+    semantics?: 'grounded' | 'complete' | 'preferred' | 'stable',
+  ): ConflictAdjudicationView | undefined {
+    return this.argumentationEnabled ? conflictAdjudication(conclusions, attacks, { semantics }) : undefined;
+  }
+
+  /**
    * 13.0：挂载风险受控阈值选择器（幂等）。
    *
    * 质变点：阈值自校准从「±0.02 步进启发式」（重试率全凭运气）升级为
@@ -201,6 +372,333 @@ export class ReflectionEngine {
       targetRisk: options?.targetRisk ?? 0.1,
       confidence: options?.confidence ?? 0.95,
       gridSteps: options?.gridSteps ?? 18,
+    };
+  }
+
+  // ───────────────────── 第三轮 A6 升级 3：重试策略 bandit 化 ─────────────────────
+
+  /**
+   * A6 升级 3：挂载重试 bandit（幂等覆盖，挂载即生效——咨询口径）。
+   *
+   * adviseRetry 的固定规则（质量差距 / 教训根因两类启发式）升级为
+   * **「重试同模型 vs 换模型」双臂 ε 递减 bandit，失败成本入账**：
+   * - 决策（retryBanditDecide）：ε 概率探索、1-ε 贪心选历史平均失败
+   *   成本更低的臂；ε = max(εmin, ε0·decay^n) 随总拉动数 n 指数递减
+   *   ——早期多试摸清两臂成本结构，后期锁定低成本臂
+   * - 结算（retryBanditSettle）：每次重试失败把失败成本（重试 token /
+   *   时延折算）入账对应臂，均值即该臂的期望重试代价
+   * - 对照固定规则：同模型在该任务类型上根本不行时，固定规则仍会在
+   *   「质量差距不够大 / 无能力教训」的中段带反复 retry-same 烧钱；
+   *   bandit 从入账成本里自己学出该换就换
+   *
+   * 确定性：探索用注入种子的 mulberry32（同 seed 同决策序列）。
+   * 未挂载零漂移（adviseRetry 固定规则原样保留，reflect 主链路不变）。
+   *
+   * @param options.epsilon0 初始探索率（缺省 0.3）
+   * @param options.epsilonMin 探索率下限（缺省 0.02——永不完全停止探索，防世界漂移）
+   * @param options.decay 每次拉动的探索率乘子（缺省 0.97）
+   * @param options.seed 探索随机源种子（缺省 42）
+   */
+  attachRetryBandit(options?: { epsilon0?: number; epsilonMin?: number; decay?: number; seed?: number }): void {
+    this.retryBandit = {
+      epsilon0: Math.min(1, Math.max(0, options?.epsilon0 ?? 0.3)),
+      epsilonMin: Math.min(1, Math.max(0, options?.epsilonMin ?? 0.02)),
+      decay: Math.min(1, Math.max(0.5, options?.decay ?? 0.97)),
+      rng: mulberry32Local(options?.seed ?? 42),
+      pulls: { 'retry-same': 0, 'retry-switch': 0 },
+      costSums: { 'retry-same': 0, 'retry-switch': 0 },
+      totalCost: 0,
+    };
+  }
+
+  /** A6 升级 3：重试 bandit 状态（未挂载零介入） */
+  private retryBandit?: {
+    epsilon0: number;
+    epsilonMin: number;
+    decay: number;
+    rng: () => number;
+    pulls: Record<RetryBanditArm, number>;
+    costSums: Record<RetryBanditArm, number>;
+    totalCost: number;
+  };
+
+  /** A6 升级 3：当前探索率 ε = max(εmin, ε0·decay^n)（n = 总拉动数） */
+  private retryBanditEpsilon(): number {
+    const b = this.retryBandit!;
+    const n = b.pulls['retry-same'] + b.pulls['retry-switch'];
+    return Math.max(b.epsilonMin, b.epsilon0 * Math.pow(b.decay, n));
+  }
+
+  /** A6 升级 3：贪心最优臂（平均失败成本更低者；两臂均无数据或平局时 retry-same——与固定规则缺省一致） */
+  private retryBanditGreedyArm(): RetryBanditArm {
+    const b = this.retryBandit!;
+    const samePulls = b.pulls['retry-same'];
+    const switchPulls = b.pulls['retry-switch'];
+    if (samePulls === 0 && switchPulls === 0) return 'retry-same';
+    if (switchPulls === 0) return 'retry-same'; // 另一臂未探索：先拉满信息（乐观初始化）
+    if (samePulls === 0) return 'retry-switch';
+    const avgSame = b.costSums['retry-same'] / samePulls;
+    const avgSwitch = b.costSums['retry-switch'] / switchPulls;
+    return avgSwitch < avgSame ? 'retry-switch' : 'retry-same';
+  }
+
+  /**
+   * A6 升级 3：重试决策（未挂载返回 undefined——编排层回退 adviseRetry 固定规则）。
+   *
+   * 决策序：冷启动（两臂均无数据）→ 先拉 retry-switch 补信息（retry-same
+   * 是固定规则的缺省臂，bandit 只需先看清另一臂）；单臂有数据 → 贪心臂；
+   * 两臂有数据 → ε 概率随机臂 / 1-ε 贪心臂。
+   */
+  retryBanditDecide(): RetryBanditDecision | undefined {
+    if (!this.retryBandit) return undefined;
+    const b = this.retryBandit;
+    const epsilon = this.retryBanditEpsilon();
+    const greedyArm = this.retryBanditGreedyArm();
+    let arm: RetryBanditArm;
+    let explored = false;
+    if (b.pulls['retry-same'] === 0 && b.pulls['retry-switch'] === 0) {
+      arm = 'retry-switch'; // 冷启动初始化拉（确定性，非随机）
+    } else if (b.rng() < epsilon) {
+      explored = true;
+      arm = greedyArm === 'retry-same' ? 'retry-switch' : 'retry-same';
+    } else {
+      arm = greedyArm;
+    }
+    const avgOf = (a: RetryBanditArm): number => (b.pulls[a] > 0 ? b.costSums[a] / b.pulls[a] : 0);
+    return {
+      arm,
+      epsilon: Number(epsilon.toFixed(6)),
+      explored,
+      pulls: { ...b.pulls },
+      avgCost: { 'retry-same': Number(avgOf('retry-same').toFixed(6)), 'retry-switch': Number(avgOf('retry-switch').toFixed(6)) },
+      greedyArm,
+    };
+  }
+
+  /**
+   * A6 升级 3：失败成本入账（重试执行后由编排层回填；未挂载空操作）。
+   * @param arm 本次实际执行的臂
+   * @param failureCost 本次失败成本（token / 时延折算，正数；成本越低越好）
+   */
+  retryBanditSettle(arm: RetryBanditArm, failureCost: number): void {
+    if (!this.retryBandit) return;
+    const b = this.retryBandit;
+    const cost = Number.isFinite(failureCost) && failureCost > 0 ? failureCost : 0;
+    b.pulls[arm] += 1;
+    b.costSums[arm] += cost;
+    b.totalCost += cost;
+  }
+
+  /** A6 升级 3：bandit 状态总览（未挂载 undefined） */
+  retryBanditStatus(): RetryBanditStatus | undefined {
+    if (!this.retryBandit) return undefined;
+    const b = this.retryBandit;
+    const avgOf = (a: RetryBanditArm): number => (b.pulls[a] > 0 ? b.costSums[a] / b.pulls[a] : 0);
+    return {
+      epsilon: Number(this.retryBanditEpsilon().toFixed(6)),
+      pulls: { ...b.pulls },
+      totalPulls: b.pulls['retry-same'] + b.pulls['retry-switch'],
+      avgCost: { 'retry-same': Number(avgOf('retry-same').toFixed(6)), 'retry-switch': Number(avgOf('retry-switch').toFixed(6)) },
+      totalCost: Number(b.totalCost.toFixed(6)),
+      greedyArm: this.retryBanditGreedyArm(),
+    };
+  }
+
+  // ───────────────────── 第四轮模块域升级 R4-A6：反思深度分级 ─────────────────────
+
+  /**
+   * R4-A6 升级 2：挂载反思深度分级（幂等覆盖，挂载即生效）。
+   *
+   * 反思从「每次失败全链归因」的一刀切升级为**按失败代价分级路由**：
+   * - 轻反思（失败代价 < costThreshold）：统计快检——失败质量在近窗历史上
+   *   做 z 检验（代价 1 单位，不逐节点归因）。小代价失败不值得重炮。
+   * - 重反思（代价 ≥ costThreshold）：全链归因——失败节点 + 上游依赖的
+   *   质量亏空按权重分摊责任（合计 1），并消费教训库给根因提示。
+   * - 轻→重升级：轻反思 z 检验检出**统计异常**（z ≤ escalationZ——该失败
+   *   显著偏离常态，不是噪声）时，同一事件就地升级触发重反思
+   *   （代价 = 轻 + 重——宁可多花，不放过系统性劣化）。
+   *
+   * 只读 qualityHistory（由 recordExecution 既有路径维护，零漂移）；
+   * 未挂载时 gradedReflect / depthStats 均缺席。
+   *
+   * @param options.costThreshold 重反思的失败代价门槛（缺省 100）
+   * @param options.escalationZ 轻→重升级的 z 阈值（缺省 −2）
+   * @param options.windowSize 快检窗口（缺省 10）
+   * @param options.lightCostUnits / heavyCostUnits 代价单位（缺省 1 / 8）
+   */
+  attachDepthGrading(options?: {
+    costThreshold?: number;
+    escalationZ?: number;
+    windowSize?: number;
+    lightCostUnits?: number;
+    heavyCostUnits?: number;
+  }): void {
+    this.depthGrading = {
+      costThreshold: options?.costThreshold ?? 100,
+      escalationZ: options?.escalationZ ?? -2,
+      windowSize: Math.max(3, options?.windowSize ?? 10),
+      lightCostUnits: Math.max(0.1, options?.lightCostUnits ?? 1),
+      heavyCostUnits: Math.max(1, options?.heavyCostUnits ?? 8),
+      counters: { light: 0, heavy: 0, escalations: 0, totalCostUnits: 0, incidents: 0 },
+    };
+  }
+
+  /** R4-A6 升级 2：分级路由状态（未挂载零介入） */
+  private depthGrading?: {
+    costThreshold: number;
+    escalationZ: number;
+    windowSize: number;
+    lightCostUnits: number;
+    heavyCostUnits: number;
+    counters: { light: number; heavy: number; escalations: number; totalCostUnits: number; incidents: number };
+  };
+
+  /**
+   * R4-A6 升级 2：分级反思（未挂载返回 undefined）。
+   *
+   * 只读不写——qualityHistory 由既有 recordExecution 维护（编排层在
+   * reflectOnOutcome 主链路已调用）；本方法纯路由 + 纯计算，同输入同输出。
+   *
+   * @param params.taskType 任务类型（快检基线按类型分组）
+   * @param params.quality 本次失败质量
+   * @param params.failureCost 失败代价（token / 时延折算——分级依据）
+   * @param params.nodes 计划节点（重反思全链归因素材；缺省仅失败节点自担）
+   */
+  gradedReflect(params: {
+    taskType: string;
+    quality: number;
+    failureCost: number;
+    nodes?: GradedReflectionNode[];
+  }): DepthGradedReflection | undefined {
+    const grading = this.depthGrading;
+    if (!grading) return undefined;
+
+    const heavy = params.failureCost >= grading.costThreshold;
+    const result: DepthGradedReflection = {
+      depth: heavy ? 'heavy' : 'light',
+      failureCost: params.failureCost,
+      threshold: grading.costThreshold,
+      escalated: false,
+      costUnits: heavy ? grading.heavyCostUnits : grading.lightCostUnits,
+    };
+
+    if (!heavy) {
+      // ── 轻反思：统计快检（z 检验——近窗基线上的异常探测） ──
+      const history = this.qualityHistory.get(params.taskType) ?? [];
+      const recent = history.slice(-grading.windowSize).map((h) => h.quality);
+      const n = recent.length;
+      const mean = n > 0 ? recent.reduce((s, v) => s + v, 0) / n : params.quality;
+      const variance = n > 1 ? recent.reduce((s, v) => s + (v - mean) ** 2, 0) / n : 0;
+      const std = Math.sqrt(variance);
+      const scale = Math.max(std, 0.05); // 零方差窗口仍有 5% 质量尺度区分度
+      const z = n >= 3 ? (params.quality - mean) / scale : 0; // 基线不足不判异常（诚实降级）
+      const anomaly = n >= 3 && z <= grading.escalationZ;
+      result.quickCheck = {
+        windowSamples: n,
+        recentMean: Number(mean.toFixed(6)),
+        stdDev: Number(std.toFixed(6)),
+        quality: params.quality,
+        zScore: Number(z.toFixed(6)),
+        anomaly,
+        verdict:
+          n < 3
+            ? `基线不足（${n} 样本 < 3）：不判异常，仅记录`
+            : anomaly
+              ? `z=${z.toFixed(2)} ≤ ${grading.escalationZ}：失败质量显著偏离近窗均值 ${mean.toFixed(2)}±${std.toFixed(2)}——升级重反思`
+              : `z=${z.toFixed(2)}：失败质量在近窗常态内（均值 ${mean.toFixed(2)}±${std.toFixed(2)}），轻反思结案`,
+      };
+      if (anomaly) {
+        // 轻→重升级链：小代价但统计异常——系统性劣化不让它溜走
+        result.escalated = true;
+        result.attribution = this.buildHeavyAttribution(params.taskType, params.nodes);
+        result.costUnits = grading.lightCostUnits + grading.heavyCostUnits;
+      }
+    } else {
+      // ── 重反思：全链归因（大代价失败直接深挖） ──
+      result.attribution = this.buildHeavyAttribution(params.taskType, params.nodes);
+    }
+
+    // 落账（路由统计——省代价对照口径）
+    const c = grading.counters;
+    c.incidents += 1;
+    if (heavy) c.heavy += 1;
+    else c.light += 1;
+    if (result.escalated) c.escalations += 1;
+    if (result.escalated) c.heavy += 1; // 升级触发的重反思同样计数
+    c.totalCostUnits += result.costUnits;
+    return result;
+  }
+
+  /**
+   * R4-A6 升级 2：重反思全链归因（私有——纯计算）。
+   *
+   * 责任分摊：失败节点自担「质量亏空 + 基础权重 1」；其上游依赖链中
+   * 质量低于当前阈值的节点按「亏空 × 0.5」折半分责（上游供给劣化是
+   * 传导性共犯，但主责在失败节点）——全部权重归一化为合计 1。
+   * 根因提示消费教训库：最近一条同任务类型教训的根因。
+   */
+  private buildHeavyAttribution(taskType: string, nodes?: GradedReflectionNode[]): HeavyAttribution {
+    const failed = (nodes ?? []).filter((n) => !n.success);
+    const fallbackFailed = failed.length === 0 ? [...(nodes ?? [])].sort((a, b) => a.quality - b.quality)[0] : undefined;
+    const failedNodes = failed.length > 0 ? failed : fallbackFailed ? [fallbackFailed] : [];
+
+    const nodeById = new Map((nodes ?? []).map((n) => [n.id, n] as const));
+    // 上游集合：失败节点经 dependsOn 反向可达的全部节点
+    const upstream = new Set<string>();
+    const queue = failedNodes.flatMap((n) => [...n.dependsOn]);
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      if (upstream.has(id)) continue;
+      upstream.add(id);
+      const node = nodeById.get(id);
+      if (node) queue.push(...node.dependsOn);
+    }
+
+    // 责任权重：失败节点 = 亏空 + 1（基础权重保证非零）；劣化上游 = 亏空 × 0.5
+    const weights: Array<{ node: GradedReflectionNode; weight: number; note: string }> = [];
+    for (const node of failedNodes) {
+      const deficit = Math.max(0, this.currentThreshold - node.quality);
+      weights.push({ node, weight: 1 + deficit, note: '失败节点（直接责任）' });
+    }
+    for (const id of upstream) {
+      const node = nodeById.get(id);
+      if (!node || node.success === false) continue;
+      const deficit = Math.max(0, this.currentThreshold - node.quality);
+      if (deficit > 0) weights.push({ node, weight: deficit * 0.5, note: '上游质量亏空传导（共犯责任 ×0.5）' });
+    }
+    const totalWeight = weights.reduce((s, w) => s + w.weight, 0) || 1;
+
+    const lessons = this.getLessons(taskType, 5);
+    const rootCauseHint: RootCauseCategory = lessons.length > 0 ? lessons[lessons.length - 1]!.rootCause : 'unknown';
+    return {
+      failedNodeId: failedNodes[0]?.id ?? 'unknown',
+      chain: weights
+        .sort((a, b) => b.weight - a.weight || (a.node.id < b.node.id ? -1 : 1))
+        .slice(0, 5)
+        .map((w) => ({
+          nodeId: w.node.id,
+          type: w.node.type,
+          contribution: Number((w.weight / totalWeight).toFixed(6)),
+          note: w.note,
+        })),
+      rootCauseHint,
+      consultedLessons: lessons.length,
+    };
+  }
+
+  /** R4-A6 升级 2：分级路由统计（省代价对照；未挂载 undefined） */
+  depthStats(): DepthGradingStats | undefined {
+    const grading = this.depthGrading;
+    if (!grading) return undefined;
+    const c = grading.counters;
+    const allHeavy = c.incidents * grading.heavyCostUnits;
+    return {
+      light: c.light,
+      heavy: c.heavy,
+      escalations: c.escalations,
+      totalCostUnits: Number(c.totalCostUnits.toFixed(6)),
+      allHeavyCostUnits: Number(allHeavy.toFixed(6)),
+      savedCostUnits: Number((allHeavy - c.totalCostUnits).toFixed(6)),
     };
   }
 
@@ -500,7 +998,13 @@ export class ReflectionEngine {
 
   // ─────────────────────────── 内部实现 ───────────────────────────
 
-  /** 重试建议：依据教训库与根因判断 */
+  /**
+   * 重试建议：依据教训库与根因判断（固定规则——未挂载 bandit 时的缺省口径）
+   *
+   * A6 升级 3：挂载 attachRetryBandit 后，编排层优先消费 retryBanditDecide
+   * 的成本学习决策；本固定规则保留为未挂载缺省与 bandit 的对照基线
+   * （零漂移：函数体一字未动）。
+   */
   private adviseRetry(taskType: string, quality: number, passed: boolean): ReflectionVerdict['retryAdvice'] {
     if (passed) return 'no-retry';
     // 差距过大（< 阈值的 60%）：原模型重试无意义，直接换模型
@@ -600,4 +1104,19 @@ export class ReflectionEngine {
     if (firstAvg - secondAvg > 0.05) return 'falling';
     return 'stable';
   }
+}
+
+/**
+ * A6 升级 3：bandit 探索的确定性随机源（文件内 mulberry32——同 seed 同
+ * 决策序列，验证脚本可逐位复现；与内核文件的做法一致，零宿主依赖）。
+ */
+function mulberry32Local(seed: number): () => number {
+  let a = Math.floor(seed) >>> 0;
+  return function (): number {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }

@@ -25,6 +25,15 @@
  * 能量流：买单成本 → belief-pool（流动性池）→ 结算赔付；
  * 池 shortfall 由国库有界补贴，盈余扫回国库。全程复式记账、守恒可审计。
  * 信念市场允许分数能量（连续价格机制的数学需要；账本不限制粒度）。
+ *
+ * 三轮升级（LMSR 价格=后验）：
+ * - 损失上界记账：makerExposure() 实时给出敞口 = max(q1,q2) − 净收与
+ *   经典上界 b·ln2 的对照（Hanson 最坏损失的运行时可审计版本）；
+ *   fund()/withdrawSurplus() 让注资/提现走账本并受上界硬约束——
+ *   提现绝不使储备跌破最坏兑付需要；
+ * - 价格一致性检验：checkPricing() 逐位验证 q 与价格互逆
+ *   （q1−q2 = b·logit(p)）、YES/NO 对称、价格=边际成本——
+ *   「LMSR 定价公式恢复后验」成为每笔可查的机器性质。
  */
 
 import { TREASURY, type AccountId, type EnergyLedger } from './ledger.js';
@@ -61,6 +70,11 @@ export interface BeliefAsset {
   /** 累计净流入成本（= 池内该资产储备） */
   volume: number;
   createdAt: number;
+  /** ── 三轮升级：做市商损失上界记账 ── */
+  /** 显式注资累计（央行/流动性提供者向该资产池注入的储备；缺省 0） */
+  fundedTotal?: number;
+  /** 显式提现累计（已提取的盈余；缺省 0） */
+  withdrawnTotal?: number;
 }
 
 /** 感知用脱敏视图（含当前隐含概率） */
@@ -114,6 +128,44 @@ export interface CancelReport {
   refunds: Array<{ agentId: string; amount: number }>;
   /** 池余额不足等原因退款失败的持仓（审计可查：谁的钱没退成、应退多少） */
   failedRefunds?: Array<{ agentId: string; requested: number }>;
+}
+
+/**
+ * 做市商敞口视图（三轮升级：注资与提现的损失上界记账）。
+ *
+ * 经典结果（Hanson 2003）：LMSR 做市商最坏损失 ≤ b·ln2——
+ * 成本函数 C(q) = b·ln(e^{q1/b}+e^{q2/b}) 恒满足
+ *   max(q1,q2) ≤ C(q) ≤ max(q1,q2) + b·ln2，
+ * 交易者从 (0,0) 起累计净付 C(q)−b·ln2，兑付只需 max(q1,q2)，
+ * 故敞口 = max(q1,q2) − 净收 ≤ b·ln2（与交易路径无关，含卖回）。
+ */
+export interface MakerExposureView {
+  assetId: string;
+  liquidityB: number;
+  /** 最坏兑付 = max(流通 YES, 流通 NO)（每份 1 能量） */
+  worstCasePayout: number;
+  /** 交易者累计净付（volume）+ 显式注资 − 已提现 */
+  reserve: number;
+  /** 敞口 = 最坏兑付 − 储备（可为负 = 盈余） */
+  exposure: number;
+  /** 理论损失上界 = b·ln2（显式注资不改变上界，只提供缓冲） */
+  lossBound: number;
+  /** 敞口 ≤ 上界（经典不变量；1e-6 浮点余量） */
+  withinBound: boolean;
+}
+
+/** 价格一致性检验视图（q 与价格互逆 + 价格=边际成本） */
+export interface PricingConsistencyView {
+  assetId: string;
+  /** 当前隐含 YES 概率 */
+  price: number;
+  /** |q1 − q2 − b·logit(price)|：份额差与价格的互逆误差 */
+  inverseLogitError: number;
+  /** |impliedProb(q2,q1) − (1 − price)|：YES/NO 对称性误差 */
+  symmetryError: number;
+  /** |∂C/∂q1 − price|：价格 = YES 份额边际成本（LMSR 定义性质） */
+  marginalCostError: number;
+  consistent: boolean;
 }
 
 // ── LMSR 数学核心（数值稳定实现） ──
@@ -188,6 +240,8 @@ export class BeliefMarket {
       noShares: 0,
       status: 'open',
       volume: 0,
+      fundedTotal: 0,
+      withdrawnTotal: 0,
       createdAt: Date.now(),
     };
     this.assets.set(asset.id, asset);
@@ -382,6 +436,86 @@ export class BeliefMarket {
   /** 池余额（审计用；全部结算/取消后应回到 0） */
   poolBalance(): number {
     return this.ledger.balance(BELIEF_POOL);
+  }
+
+  // ─────────────── 三轮升级：损失上界记账 + 价格一致性检验 ───────────────
+
+  /** 流动性池直接注资（该资产的最坏兑付储备缓冲；能量 from → belief-pool） */
+  fund(assetId: string, amount: number, from: AccountId = TREASURY): { ok: boolean; error?: string; funded?: number } {
+    const asset = this.assets.get(assetId);
+    if (!asset) return { ok: false, error: 'unknown-asset' };
+    if (asset.status !== 'open') return { ok: false, error: 'not-open' };
+    if (!(amount > 0) || !Number.isFinite(amount)) return { ok: false, error: 'non-positive-amount' };
+    const receipt = this.ledger.transfer(from, BELIEF_POOL, amount, 'belief-fund', assetId);
+    if (!receipt.ok) return { ok: false, error: receipt.error };
+    asset.fundedTotal = (asset.fundedTotal ?? 0) + amount;
+    return { ok: true, funded: amount };
+  }
+
+  /**
+   * 提现盈余（仅可提取「超出最坏兑付需要」的部分——损失上界记账的
+   * 硬约束：提现后该资产仍能独立覆盖 max(YES,NO) 的全额兑付，
+   * 绝不把敞口社会化给共享池或国库）。无盈余 → no-surplus 拒绝。
+   */
+  withdrawSurplus(assetId: string, to: AccountId = TREASURY): { ok: boolean; error?: string; withdrawn?: number } {
+    const asset = this.assets.get(assetId);
+    if (!asset) return { ok: false, error: 'unknown-asset' };
+    if (asset.status !== 'open') return { ok: false, error: 'not-open' };
+    const surplus = (asset.volume ?? 0) + (asset.fundedTotal ?? 0) - (asset.withdrawnTotal ?? 0) - Math.max(asset.yesShares, asset.noShares);
+    if (surplus <= 1e-9) return { ok: false, error: 'no-surplus', withdrawn: 0 };
+    const clamped = Math.min(surplus, this.ledger.balance(BELIEF_POOL));
+    if (clamped <= 1e-9) return { ok: false, error: 'pool-empty', withdrawn: 0 };
+    const receipt = this.ledger.transfer(BELIEF_POOL, to, clamped, 'belief-withdraw', assetId);
+    if (!receipt.ok) return { ok: false, error: receipt.error, withdrawn: 0 };
+    asset.withdrawnTotal = (asset.withdrawnTotal ?? 0) + clamped;
+    return { ok: true, withdrawn: clamped };
+  }
+
+  /** 做市商敞口视图（损失上界 b·ln2 的实时记账与检验） */
+  makerExposure(assetId: string): MakerExposureView | undefined {
+    const a = this.assets.get(assetId);
+    if (!a) return undefined;
+    const worstCasePayout = Math.max(a.yesShares, a.noShares);
+    const reserve = a.volume + (a.fundedTotal ?? 0) - (a.withdrawnTotal ?? 0);
+    const exposure = worstCasePayout - reserve;
+    const lossBound = a.liquidityB * Math.LN2;
+    return {
+      assetId,
+      liquidityB: a.liquidityB,
+      worstCasePayout,
+      reserve,
+      exposure,
+      lossBound,
+      withinBound: exposure <= lossBound + 1e-6,
+    };
+  }
+
+  /**
+   * 价格一致性检验：LMSR 三条定义性质在当前 (q1,q2,b) 下同时成立——
+   * ① 互逆：q1 − q2 = b·logit(p)（从价格恢复份额差，逐位往返）；
+   * ② 对称：impliedProb(q2,q1) = 1 − p（YES/NO 份额互换即概率互补）；
+   * ③ 边际成本：∂C/∂q1 = p（价格即买 1 份 YES 的瞬时成本）。
+   */
+  checkPricing(assetId: string): PricingConsistencyView | undefined {
+    const a = this.assets.get(assetId);
+    if (!a) return undefined;
+    const b = a.liquidityB;
+    const p = impliedProbYes(a.yesShares, a.noShares, b);
+    const logit = Math.log(p / (1 - p));
+    const inverseLogitError = Math.abs(a.yesShares - a.noShares - b * logit);
+    const pSwapped = impliedProbYes(a.noShares, a.yesShares, b);
+    const symmetryError = Math.abs(pSwapped - (1 - p));
+    // 独立代码路径重算边际成本（softmax 口径而非 sigmoid 口径）
+    const marginal = Math.exp(a.yesShares / b - logSumExp(a.yesShares / b, a.noShares / b));
+    const marginalCostError = Math.abs(marginal - p);
+    return {
+      assetId,
+      price: p,
+      inverseLogitError,
+      symmetryError,
+      marginalCostError,
+      consistent: p > 0 && p < 1 && inverseLogitError < 1e-9 && symmetryError < 1e-9 && marginalCostError < 1e-9,
+    };
   }
 
   snapshot(): { open: number; settled: number; cancelled: number; volume: number; poolBalance: number } {

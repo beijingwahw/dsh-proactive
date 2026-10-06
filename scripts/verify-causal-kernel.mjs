@@ -318,7 +318,7 @@ section('F 元认知：调参 = 做实验 → 因果旋钮排序');
   }
   const knobs = meta.rankTuningKnobs('successRate');
   ok(knobs.length > 0 && knobs[0].from.startsWith('knob:'), `因果旋钮排序就位（第一名 ${knobs[0]?.from}，${knobs[0]?.interventionalSamples} 次实验）`);
-  ok(insights.length >= 0, '既有洞察产出不受影响');
+  ok(Array.isArray(insights), '既有洞察产出不受影响（observe 仍返回洞察数组）');
 }
 
 // ═══════════════════ G 假设驱动好奇心 ═══════════════════

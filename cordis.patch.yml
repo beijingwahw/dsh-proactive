@@ -219,6 +219,38 @@
         autonomy:
           enabled: true
           heartbeatMs: 30000
+          # 创世纪 G4：新臂入场探索与推荐反垄断（缺省关闭，零漂移）。
+          # sampleFloor：每模型×任务类型积累 N 样本前保持 UCB 探索加成；
+          # overrideRate：放弃历史统计推荐交动态选型的概率（防在位者垄断）
+          exploration:
+            enabled: false
+            # sampleFloor: 30
+            # budget: 1000000
+            # bonus: 0.25
+            # overrideRate: 0.3
+          # 创世纪 G4：快路径复用历史模型指派（缺省 true = 旧行为；
+          # false = 只复用计划结构，模型执行期重选）
+          fastPath:
+            reuseModels: true
+          # E 路线：双系统可塑性（缺省关闭零漂移）。启用后任务结算（成败 +
+          # 逐节点真值 + token 消耗 + taskContext）驱动 τ1 三内核在线学习
+          # （遗忘门控 + 链式审计 + 落盘）与 τ2 结构固化（版本化规则档案，
+          # 上下文前提，保持集验证），学习画像以有界乘数反哺调度评分。
+          # 须同时 symbiosis.enabled = true。
+          symbiosis:
+            enabled: false
+            plasticity:
+              enabled: false
+              # persistPath: .scheduler/plasticity.json    # 学习状态落盘（不设则内存态）
+              # rulesPath: .scheduler/plasticity-rules.json # τ2 规则档案落盘
+              # gateWindow: 50                              # 每 N 事件一轮遗忘门控
+              # probeSize: 50                               # 每轮冻结探针数
+              # consolidateEvery: 200                       # 每 N 结算事件尝试固化
+              # 创世纪 G3：探针操作（缺省关闭）——流动性检测 + 预算限定
+              # 的真实微任务注入（饿死/陈旧臂）
+              # probes:
+              #   enabled: true
+              #   maxPerHour: 6
           # 12.0 任意时刻证据：进化适应度置信序列下界 + e-BH FDR 淘汰 +
           # 元认知 KPI 保证层（退化判定偷看免疫）。缺省关闭（零漂移）
           anytimeEvidence:

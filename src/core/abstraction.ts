@@ -38,6 +38,33 @@
  * 与 6/7/8.0 的关系：6.0 定价行动、7.0 定价计划、8.0 定价思考，
  * 本内核让三者**跨域泛化**——经验不再是一次性的。
  * 抽象心智 = 元认知心智 × 举一反三。
+ *
+ * ── R5 第五轮世界性进化（四轴）──
+ *
+ * A1【数学进化】抽象层的率失真最优粒度（rateDistortionFrontier）：
+ *    把 N 条骨架级结构边的后验均值视作信源，K 级抽象（把 N 条边量化
+ *    为 K 个等价类）为码本。加权 MSE 口径下最优标量量化 = 按均值排序
+ *    的连续段划分（Lloyd 最优性条件的 1-D 特例），全局最优由 DP 求得：
+ *      D(K) = min_{划分} Σ_g Σ_{i∈g} wᵢ(p̂ᵢ − c_g)²，c_g = 组内加权均值
+ *    率取分组指派熵 R(K) = H(组质量)。产出完整 R-D 前沿（K = 1..上限）
+ *    与肘点粒度（边际畸变下降 < ε 即停）——「抽象到多细」第一次有了
+ *    信息论定价而非拍脑袋分层。
+ *
+ * A2【性能进化】①分层先验 L1 的等价类索引：hierarchicalPrior /
+ *    inheritedSuccessor 不再全表扫描 skeletonEdges，改走
+ *    (skeleton, action) 倒排索引（插入序保持 → 遍历顺序与旧全表扫描
+ *    的过滤结果完全同序 → 结果逐位相等，verify 脚本 ≥200 种子以脚本侧
+ *    全表扫描独立复算对照 + 扫描计数审计字段 priorScanAudit 证明）。
+ *    ②行为等价类的并查集化（behaviorEquivalenceClasses）：同 MAP 后继
+ *    骨架 + 均值差 ≤ tol 的传递闭包等价类，按后继桶内排序 + 相邻 union
+ *    的并查集 O(n log n + nα) 求解，与 O(n²) 逐对闭包的暴力口径一致
+ *    （脚本侧 BFS 闭包对照 ≥200 种子）。
+ *
+ * A4【性质进化】商结构一致性：projectToSkeleton 是幂等投影
+ *    （project∘project = project，≥200 种子逐位断言）；quotientSystem
+ *    给出骨架商转移系统（池化后验 + 模态后继骨架），其状态集恰为投影
+ *    的像，边端点封闭于状态集——「抽象两次 = 抽象一次」的商代数性质
+ *    首次可机检。
  */
 
 // ─────────────────────────── 数据结构 ───────────────────────────
@@ -84,6 +111,69 @@ export interface AbstractionStats {
   interpretation: string;
 }
 
+// ─────────────── R5：率失真 / 行为等价类 / 商结构 数据结构 ───────────────
+
+/** R-D 前沿单点：K 级抽象的畸变与率 */
+export interface RateDistortionPoint {
+  /** 抽象级数 K */
+  levels: number;
+  /** 归一化加权 MSE（每条边的期望畸变） */
+  distortion: number;
+  /** 分组指派熵（bit/边） */
+  rateBits: number;
+}
+
+/** R5·A1 率失真最优粒度报告 */
+export interface RateDistortionReport {
+  points: RateDistortionPoint[];
+  /** 肘点粒度（边际畸变下降 ≤ relativeDrop·D 的首个 K） */
+  optimalLevels: number;
+  elbow: { levels: number; marginalDrop: number };
+  /** D(K) 关于 K 单调不增 */
+  monotone: boolean;
+  /** 信源边数（未去重） */
+  sourceEdges: number;
+  /** 去重后的信源符号数 */
+  distinctMeans: number;
+}
+
+/** R5·A2 行为等价类报告 */
+export interface EquivalenceClassReport {
+  tolerance: number;
+  classes: Array<{
+    size: number;
+    /** 类内后验均值极差（≤ tolerance 的传递闭包口径） */
+    meanRange: number;
+    totalEvidence: number;
+    /** 成员键 `${domain}#${skeleton}|${action}` */
+    members: string[];
+  }>;
+  /** 并查集 union 次数（性能审计） */
+  unions: number;
+  totalEdges: number;
+}
+
+/** R5·A4 商转移系统边 */
+export interface QuotientEdge {
+  /** `#${skeleton}` 投影口径 */
+  from: string;
+  action: string;
+  to: string;
+  /** 池化后验均值 (1+Σ成功)/(2+Σ证据) */
+  pSuccess: number;
+  evidence: number;
+  /** 该 (骨架, 行动) 池化自几个域（跨域复验度） */
+  domains: number;
+}
+
+/** R5·A4 骨架商转移系统 */
+export interface QuotientSystem {
+  /** 状态集 = projectToSkeleton 的像 */
+  states: string[];
+  edges: QuotientEdge[];
+}
+
+
 // ─────────────────────────── 配置 ───────────────────────────
 
 export interface AbstractionConfig {
@@ -124,6 +214,11 @@ function skKey(domain: string, skeleton: string, action: string): string {
   return `${domain}\u0000${skeleton}\u0000${action}`;
 }
 
+/** R5：倒排索引键 (skeleton, action) */
+function idxKey(skeleton: string, action: string): string {
+  return `${skeleton}\u0000${action}`;
+}
+
 /** 域×行动键（域边际层） */
 function domKey(domain: string, action: string): string {
   return `${domain}\u0000${action}`;
@@ -148,6 +243,16 @@ export class AbstractionEngine {
   private config: AbstractionConfig;
   /** 骨架级证据（域, 骨架, 行动）——L1 目标 + 画像 + 自身排除基数 */
   private skeletonEdges = new Map<string, EdgeCounts>();
+  /**
+   * R5：L1 等价类索引 (skeleton, action) → 同构边列表（插入序）。
+   * hierarchicalPrior / inheritedSuccessor 的倒排索引——取代全表扫描；
+   * 列表元素与 skeletonEdges 的插入序一致 → 累加顺序与旧口径逐位相同。
+   */
+  private skeletonIndex = new Map<string, Array<{ domain: string; edge: EdgeCounts }>>();
+  /** R5：索引扫描审计（等价性 + 性能证明的读出） */
+  private lastScannedEdges = 0;
+  private totalPriorQueries = 0;
+  private totalScannedEdges = 0;
   /** 域×行动边际（L2） */
   private domainAction = new Map<string, { successes: number; failures: number }>();
   /** 全局骨架×行动（L3） */
@@ -180,6 +285,11 @@ export class AbstractionEngine {
     if (!edge) {
       edge = { successes: 0, failures: 0, successors: new Map() };
       this.skeletonEdges.set(key, edge);
+      // R5：倒排索引登记（插入序 = skeletonEdges 的插入序）
+      const ik = idxKey(skeleton, action);
+      const list = this.skeletonIndex.get(ik);
+      if (list) list.push({ domain, edge });
+      else this.skeletonIndex.set(ik, [{ domain, edge }]);
     }
     const dk = domKey(domain, action);
     const dm = this.domainAction.get(dk) ?? { successes: 0, failures: 0 };
@@ -221,18 +331,24 @@ export class AbstractionEngine {
     const ownS = own?.successes ?? 0;
     const ownF = own?.failures ?? 0;
 
+    // R5 审计：本次查询扫描的边数（倒排索引口径；旧口径 = 全表大小）
+    this.totalPriorQueries += 1;
+    this.lastScannedEdges = this.skeletonIndex.get(idxKey(skeleton, action))?.length ?? 0;
+    this.totalScannedEdges += this.lastScannedEdges;
+
     // L1 类比层：结构相似域在 (同骨架, 同行动) 上的后验，sim 加权
+    // R5：倒排索引直达同 (骨架, 行动) 等价类（插入序遍历 → 与旧全表
+    // 扫描的过滤序列完全同序，累加结果逐位相等）
     const candidates: Array<{ domain: string; sim: number; post: number; obs: number }> = [];
-    for (const [key, edge] of this.skeletonEdges) {
-      const [d, sk, a] = key.split('\u0000');
-      if (d === domain || sk !== skeleton || a !== action) continue;
-      const sim = this.structuralSimilarity(domain, d!, skeleton, action);
+    for (const { domain: d, edge } of this.skeletonIndex.get(idxKey(skeleton, action)) ?? []) {
+      if (d === domain) continue;
+      const sim = this.structuralSimilarity(domain, d, skeleton, action);
       if (sim < this.config.minSimilarity) continue;
       const obs = edge.successes + edge.failures;
       if (obs < 1) continue;
       // 平滑后验（Beta(1,1) 口径）× 相似度权重
       candidates.push({
-        domain: d!,
+        domain: d,
         sim,
         post: (1 + edge.successes) / (2 + obs),
         obs,
@@ -305,10 +421,10 @@ export class AbstractionEngine {
   inheritedSuccessor(state: string, action: string): string | undefined {
     const { domain, skeleton } = decompose(state);
     let best: { successor: string; score: number } | undefined;
-    for (const [key, edge] of this.skeletonEdges) {
-      const [d, sk, a] = key.split('\u0000');
-      if (d === domain || sk !== skeleton || a !== action) continue;
-      const sim = this.structuralSimilarity(domain, d!, skeleton, action);
+    // R5：倒排索引遍历（插入序与旧全表扫描过滤序列同序——平票裁决不变）
+    for (const { domain: d, edge } of this.skeletonIndex.get(idxKey(skeleton, action)) ?? []) {
+      if (d === domain) continue;
+      const sim = this.structuralSimilarity(domain, d, skeleton, action);
       if (sim < this.config.minSimilarity) continue;
       // 该类比域的 MAP 后继（sim 加权票数）
       for (const [succ, count] of edge.successors) {
@@ -431,6 +547,340 @@ export class AbstractionEngine {
     };
   }
 
+  // ─────────────────────────── R5：率失真最优粒度 / 行为等价类 / 商结构 ───────────────────────────
+
+  /**
+   * R5 审计读出：骨架级结构边的只读清单（脚本侧独立复算分层先验 /
+   * 等价类 / 商结构的原料——等价性证明的对照数据源）。
+   */
+  structuralEdgeList(): Array<{
+    domain: string;
+    skeleton: string;
+    action: string;
+    successes: number;
+    failures: number;
+    /** MAP 后继状态（无后继证据时 undefined） */
+    mapSuccessor: string | undefined;
+  }> {
+    const out: Array<{
+      domain: string;
+      skeleton: string;
+      action: string;
+      successes: number;
+      failures: number;
+      mapSuccessor: string | undefined;
+    }> = [];
+    for (const [key, edge] of this.skeletonEdges) {
+      const [domain, skeleton, action] = key.split('\u0000');
+      let mapSuccessor: string | undefined;
+      let bestCount = 0;
+      for (const [succ, count] of edge.successors) {
+        if (count > bestCount) {
+          bestCount = count;
+          mapSuccessor = succ;
+        }
+      }
+      out.push({ domain: domain!, skeleton: skeleton!, action: action!, successes: edge.successes, failures: edge.failures, mapSuccessor });
+    }
+    return out;
+  }
+
+  /** R5 审计读出：倒排索引扫描统计（新口径扫描数 vs 旧口径全表大小的证据） */
+  priorScanAudit(): { lastScannedEdges: number; totalPriorQueries: number; totalScannedEdges: number; totalEdges: number } {
+    return {
+      lastScannedEdges: this.lastScannedEdges,
+      totalPriorQueries: this.totalPriorQueries,
+      totalScannedEdges: this.totalScannedEdges,
+      totalEdges: this.skeletonEdges.size,
+    };
+  }
+
+  /**
+   * R5·A1 率失真最优粒度：K 级抽象的完整 R-D 前沿 + 肘点粒度。
+   *
+   * 信源 = 全部骨架级结构边的后验均值 p̂ᵢ = (1+sᵢ)/(2+nᵢ)，权重
+   * wᵢ = 2+nᵢ（后验集中度）。加权 MSE 下 K 级最优标量量化 = 排序后的
+   * 连续段划分（1-D Lloyd 条件），DP 全局最优：
+   *   dp[j][k] = min_{i<j} dp[i][k−1] + SSE(i..j)
+   * 组内 SSE 由前缀和 O(1) 给出：SSE = Σw·p̂² − (Σw·p̂)²/Σw。
+   * 率 R(K) = 分组指派熵 H(组质量)（bit/边）。D(K) 关于 K 单调不增
+   * （划分 refinements 性质）；肘点 = 边际下降首次 ≤ relativeDrop 的 K。
+   */
+  rateDistortionFrontier(opts?: {
+    maxLevels?: number;
+    /** 肘点判据：D(K−1)−D(K) ≤ relativeDrop·D(K−1) 的首个 K */
+    relativeDrop?: number;
+  }): RateDistortionReport {
+    const maxLevels = Math.max(1, Math.min(opts?.maxLevels ?? 16, 64));
+    const relativeDrop = Math.min(1, Math.max(0, opts?.relativeDrop ?? 0.05));
+    // 信源：精确去重（相同均值合并权重——量化结果不变，DP 规模收缩）
+    const items: Array<{ mean: number; weight: number }> = [];
+    const byMean = new Map<string, { mean: number; weight: number }>();
+    for (const [, edge] of this.skeletonEdges) {
+      const n = edge.successes + edge.failures;
+      const mean = (1 + edge.successes) / (2 + n);
+      const weight = 2 + n;
+      const key = mean.toFixed(12);
+      const slot = byMean.get(key);
+      if (slot) slot.weight += weight;
+      else byMean.set(key, { mean, weight });
+    }
+    for (const slot of byMean.values()) items.push(slot);
+    if (items.length === 0) {
+      return { points: [], optimalLevels: 0, elbow: { levels: 0, marginalDrop: 0 }, monotone: true, sourceEdges: 0, distinctMeans: 0 };
+    }
+    items.sort((a, b) => a.mean - b.mean);
+    const n = items.length;
+    const K = Math.min(maxLevels, n);
+    // 前缀和
+    const W = new Array<number>(n + 1).fill(0);
+    const S = new Array<number>(n + 1).fill(0);
+    const Q = new Array<number>(n + 1).fill(0);
+    for (let i = 0; i < n; i += 1) {
+      const it = items[i]!;
+      W[i + 1] = W[i]! + it.weight;
+      S[i + 1] = S[i]! + it.weight * it.mean;
+      Q[i + 1] = Q[i]! + it.weight * it.mean * it.mean;
+    }
+    const sse = (i: number, j: number): number => {
+      // 段 [i, j)（0 起，左闭右开）的加权 SSE
+      const w = W[j]! - W[i]!;
+      const s = S[j]! - S[i]!;
+      const q = Q[j]! - Q[i]!;
+      return Math.max(0, q - (s * s) / w);
+    };
+    // dp[k][j]：前 j 项分 k 组的最小总畸变（滚动数组）
+    const INF = Number.POSITIVE_INFINITY;
+    let dp = new Array<number>(n + 1).fill(INF);
+    dp[0] = 0;
+    const distortions: number[] = [];
+    const rates: number[] = [];
+    const partitions: number[][] = [];
+    for (let k = 1; k <= K; k += 1) {
+      const next = new Array<number>(n + 1).fill(INF);
+      const arg = new Array<number>(n + 1).fill(-1);
+      next[0] = 0;
+      for (let j = 1; j <= n; j += 1) {
+        let best = INF;
+        let bestI = -1;
+        for (let i = k - 1; i < j; i += 1) {
+          const prev = dp[i]!;
+          if (prev === INF) continue;
+          const v = prev + sse(i, j);
+          if (v < best) {
+            best = v;
+            bestI = i;
+          }
+        }
+        next[j] = best;
+        arg[j] = bestI;
+      }
+      dp = next;
+      // 回溯分组（组界）
+      const bounds: number[] = [];
+      let cur = n;
+      for (let kk = k; kk >= 1; kk -= 1) {
+        bounds.unshift(cur);
+        cur = arg[cur] ?? 0;
+      }
+      bounds.unshift(0);
+      partitions.push(bounds);
+      const totalW = W[n]!;
+      distortions.push(round(dp[n]! / totalW)); // 归一化加权 MSE
+      // 指派熵率 H(组质量)
+      let h = 0;
+      for (let g = 1; g < bounds.length; g += 1) {
+        const wg = W[bounds[g]!]! - W[bounds[g - 1]!]!;
+        const p = wg / totalW;
+        if (p > 0) h -= p * Math.log2(p);
+      }
+      rates.push(round(h));
+    }
+    const points: RateDistortionPoint[] = distortions.map((d, idx) => ({
+      levels: idx + 1,
+      distortion: d,
+      rateBits: rates[idx]!,
+    }));
+    // 单调性（划分加细 ⟹ 畸变不增——DP 最优值的必要性质）
+    let monotone = true;
+    for (let i = 1; i < distortions.length; i += 1) {
+      if (distortions[i]! > distortions[i - 1]! + 1e-12) monotone = false;
+    }
+    // 肘点：边际下降首次 ≤ relativeDrop·D(K−1)
+    let elbowLevels = 1;
+    let elbowDrop = 0;
+    for (let i = 1; i < distortions.length; i += 1) {
+      const prev = distortions[i - 1]!;
+      const drop = prev - distortions[i]!;
+      if (drop <= relativeDrop * prev) {
+        elbowLevels = i; // i 组已够（第 i+1 级的边际收益过低）
+        elbowDrop = round(drop);
+        break;
+      }
+      elbowLevels = i + 1;
+    }
+    return {
+      points,
+      optimalLevels: elbowLevels,
+      elbow: { levels: elbowLevels, marginalDrop: elbowDrop },
+      monotone,
+      sourceEdges: this.skeletonEdges.size,
+      distinctMeans: n,
+    };
+  }
+
+  /**
+   * R5·A2 行为等价类（并查集）：
+   * 同 MAP 后继骨架 且 后验均值差 ≤ tolerance 的传递闭包等价类。
+   *
+   * 实现：先按后继骨架分桶（关系的前置条件），桶内按均值排序后相邻
+   * 差 ≤ tol 即 union——区间关系的传递闭包 = 排序扫描的相邻并集，
+   * 并查集路径压缩近 O(nα)；与 O(n²) 逐对建图 + BFS 闭包的暴力口径
+   * 等价（verify 脚本 ≥200 种子对照）。
+   */
+  behaviorEquivalenceClasses(tolerance = 0.1): EquivalenceClassReport {
+    if (!Number.isFinite(tolerance) || tolerance < 0) {
+      throw new Error(`behaviorEquivalenceClasses: tolerance 须为 ≥0 有限数（收到 ${tolerance}）`);
+    }
+    const edges = this.structuralEdgeList().map((e) => ({
+      key: `${e.domain}#${e.skeleton}|${e.action}`,
+      domain: e.domain,
+      skeleton: e.skeleton,
+      action: e.action,
+      mean: (1 + e.successes) / (2 + e.successes + e.failures),
+      evidence: e.successes + e.failures,
+      successorSkeleton: e.mapSuccessor !== undefined ? decompose(e.mapSuccessor).skeleton : '',
+    }));
+    if (edges.length === 0) {
+      return { tolerance, classes: [], unions: 0, totalEdges: 0 };
+    }
+    // 后继骨架分桶
+    const buckets = new Map<string, typeof edges>();
+    for (const e of edges) {
+      const list = buckets.get(e.successorSkeleton);
+      if (list) list.push(e);
+      else buckets.set(e.successorSkeleton, [e]);
+    }
+    // 并查集
+    const parent = new Map<string, string>();
+    const find = (x: string): string => {
+      let root = x;
+      while (parent.get(root) !== root) root = parent.get(root)!;
+      // 路径压缩
+      let cur = x;
+      while (parent.get(cur) !== root) {
+        const next = parent.get(cur)!;
+        parent.set(cur, root);
+        cur = next;
+      }
+      return root;
+    };
+    for (const e of edges) parent.set(e.key, e.key);
+    let unions = 0;
+    for (const [, list] of buckets) {
+      list.sort((a, b) => a.mean - b.mean || (a.key < b.key ? -1 : 1));
+      for (let i = 1; i < list.length; i += 1) {
+        if (Math.abs(list[i]!.mean - list[i - 1]!.mean) <= tolerance + 1e-15) {
+          const ra = find(list[i - 1]!.key);
+          const rb = find(list[i]!.key);
+          if (ra !== rb) {
+            // 按字典序合并根（确定性）
+            const [keep, drop] = ra < rb ? [ra, rb] : [rb, ra];
+            parent.set(drop, keep);
+            unions += 1;
+          }
+        }
+      }
+    }
+    // 汇类
+    const classMap = new Map<string, Array<(typeof edges)[number]>>();
+    for (const e of edges) {
+      const root = find(e.key);
+      const list = classMap.get(root);
+      if (list) list.push(e);
+      else classMap.set(root, [e]);
+    }
+    const classes = [...classMap.values()].map((members) => {
+      const means = members.map((m) => m.mean);
+      return {
+        size: members.length,
+        meanRange: round(Math.max(...means) - Math.min(...means)),
+        totalEvidence: members.reduce((s, m) => s + m.evidence, 0),
+        members: members.map((m) => m.key).sort(),
+      };
+    });
+    classes.sort((a, b) => b.size - a.size || (a.members[0]! < b.members[0]! ? -1 : 1));
+    return { tolerance, classes, unions, totalEdges: edges.length };
+  }
+
+  /**
+   * R5·A4 商结构：骨架商转移系统（quotient system）。
+   *
+   * 把全部域投影到骨架（projectToSkeleton），按 (骨架, 行动) 池化：
+   *   p̂ = (1+Σ成功)/(2+Σ证据)，to = 模态后继骨架（平票取首遇——
+   *   插入序确定），无后继证据时 to = from。
+   * 状态集 = 投影的像；边端点封闭于状态集（商结构一致性）。
+   */
+  quotientSystem(): QuotientSystem {
+    const edges = this.structuralEdgeList();
+    const pooled = new Map<string, { skeleton: string; action: string; successes: number; failures: number; succCounts: Map<string, number> }>();
+    for (const e of edges) {
+      const key = `${e.skeleton}\u0000${e.action}`;
+      let slot = pooled.get(key);
+      if (!slot) {
+        slot = { skeleton: e.skeleton, action: e.action, successes: 0, failures: 0, succCounts: new Map() };
+        pooled.set(key, slot);
+      }
+      slot.successes += e.successes;
+      slot.failures += e.failures;
+      if (e.mapSuccessor !== undefined) {
+        const sk = decompose(e.mapSuccessor).skeleton;
+        slot.succCounts.set(sk, (slot.succCounts.get(sk) ?? 0) + 1);
+      }
+    }
+    const states = new Set<string>();
+    for (const e of edges) {
+      states.add(projectToSkeleton(`${e.domain}#${e.skeleton}`));
+      if (e.mapSuccessor !== undefined && decompose(e.mapSuccessor).hasSkeleton) {
+        states.add(projectToSkeleton(e.mapSuccessor));
+      }
+    }
+    const quotientEdges: QuotientEdge[] = [];
+    for (const slot of pooled.values()) {
+      let to = slot.skeleton;
+      let best = 0;
+      for (const [sk, count] of slot.succCounts) {
+        if (count > best) {
+          best = count;
+          to = sk;
+        }
+      }
+      states.add(projectToSkeleton(`#${slot.skeleton}`));
+      states.add(projectToSkeleton(`#${to}`));
+      quotientEdges.push({
+        from: projectToSkeleton(`#${slot.skeleton}`),
+        action: slot.action,
+        to: projectToSkeleton(`#${to}`),
+        pSuccess: round((1 + slot.successes) / (2 + slot.successes + slot.failures)),
+        evidence: slot.successes + slot.failures,
+        domains: 0,
+      });
+    }
+    // 域计数（池化证据来自几个域——跨域复验度）
+    const domainCount = new Map<string, Set<string>>();
+    for (const e of edges) {
+      const key = `${e.skeleton}\u0000${e.action}`;
+      const set = domainCount.get(key) ?? new Set<string>();
+      set.add(e.domain);
+      domainCount.set(key, set);
+    }
+    for (const edge of quotientEdges) {
+      const skeleton = edge.from.slice(1); // from = `#${skeleton}`
+      edge.domains = domainCount.get(`${skeleton}\u0000${edge.action}`)?.size ?? 0;
+    }
+    return { states: [...states].sort(), edges: quotientEdges.sort((a, b) => (a.from + a.action < b.from + b.action ? -1 : 1)) };
+  }
+
   // ─────────────────────────── 序列化 ───────────────────────────
 
   serialize(): {
@@ -464,13 +914,23 @@ export class AbstractionEngine {
 
   deserialize(data: ReturnType<AbstractionEngine['serialize']>): void {
     this.skeletonEdges.clear();
+    this.skeletonIndex.clear();
+    this.lastScannedEdges = 0;
+    this.totalPriorQueries = 0;
+    this.totalScannedEdges = 0;
     this.domainAction.clear();
     this.globalSkeleton.clear();
     this.profiles.clear();
     this.skillLadder.clear();
     this.abstractSkills = [];
     for (const e of data.skeletonEdges) {
-      this.skeletonEdges.set(skKey(e.domain, e.skeleton, e.action), { successes: e.successes, failures: e.failures, successors: new Map(e.successors) });
+      const edge: EdgeCounts = { successes: e.successes, failures: e.failures, successors: new Map(e.successors) };
+      this.skeletonEdges.set(skKey(e.domain, e.skeleton, e.action), edge);
+      // R5：倒排索引随反序列化重建（插入序保持）
+      const ik = idxKey(e.skeleton, e.action);
+      const list = this.skeletonIndex.get(ik);
+      if (list) list.push({ domain: e.domain, edge });
+      else this.skeletonIndex.set(ik, [{ domain: e.domain, edge }]);
       const profile = this.profiles.get(e.domain) ?? new Set<string>();
       profile.add(`${e.skeleton}|${e.action}`);
       this.profiles.set(e.domain, profile);
@@ -505,6 +965,18 @@ export function decompose(state: string): { domain: string; skeleton: string; ha
   const idx = state.indexOf('#');
   if (idx < 0) return { domain: state, skeleton: '', hasSkeleton: false };
   return { domain: state.slice(0, idx), skeleton: state.slice(idx + 1), hasSkeleton: true };
+}
+
+/**
+ * R5·A4 骨架投影（幂等）：`domain#skeleton → '#skeleton'`，无 '#' 的
+ * 单段状态 → '#'。保关系、换对象——抽象的代数定义即此投影。
+ * 幂等性：projectToSkeleton(projectToSkeleton(x)) === projectToSkeleton(x)
+ * 对一切 x 成立（'#s' 的 domain 为空串、骨架不变 → 再投影原样返回）。
+ */
+export function projectToSkeleton(state: string): string {
+  const idx = state.indexOf('#');
+  if (idx < 0) return '#';
+  return `#${state.slice(idx + 1)}`;
 }
 
 function round(x: number): number {

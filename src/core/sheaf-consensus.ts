@@ -50,6 +50,18 @@
  * 系统的惊喜与系统内部的自相惊喜同构；与共生经济的关系：LMSR
  * 市场价聚合单资产标量，本内核聚合**带一致性结构的向量信念**——
  * 市场与层论是聚合的两个正交维度（价格 vs 结构）。
+ *
+ * R5 第五轮进化（20.0 → 20.5）:
+ * - 全局截面存在性判定（轴 1 数学）: sectionSpaceDimension 给出
+ *   H⁰ = dim ker δ_F（完美一致指派的自由度数——层上同调的计算机
+ *   读数：连通标量等值层 H⁰=1、莫比乌斯扭曲层 H⁰=0）；globalSection
+ *   判定「锚定观测下完美共识截面是否存在」并显式构造——harmonize
+ *   障碍裁决的代数原形（约束系统相容性直接判定）；
+ * - 带权限制映射（轴 1/3）: 边权重 w_e（缺省 1 逐位兼容）以 w_e²
+ *   计入 L_F 与分歧能量——噪声声明源降权的软限制（鲁棒化）；
+ * - 迭代精化（轴 3 数值稳健性）: 正规方程求解加一步残差修正，
+ *   刚度 1e8 的病态路径舍入误差压回机器精度阶（接受条件：残差
+ *   严格变小，否则回退原解——永不变差）。
  */
 
 // ─────────────────────────── 层的构造语言 ───────────────────────────
@@ -80,6 +92,13 @@ export interface SheafEdgeSpec {
   sharedA?: number[];
   /** 速记：b 侧参与共享的坐标下标（与 mapB 互斥） */
   sharedB?: number[];
+  /**
+   * 约束权重（R5 进化；缺省 1 = 原硬等式口径）。w_e 缩放该边对层
+   * 拉普拉斯与分歧能量的贡献（L_F 中以 w_e² 计）——带权最小二乘口径
+   * 的**软限制**：噪声大 / 可信度低的声明源降权（噪声鲁棒化），
+   * 权重 0 = 事实删除该约束。缺省 1 时与升级前逐位一致。
+   */
+  weight?: number;
 }
 
 /** 观测锚点：某顶点的实测信念 + 置信权重 α（大 = 硬约束） */
@@ -141,6 +160,7 @@ export class CellularSheaf {
     b: string;
     mapA: number[][];
     mapB: number[][];
+    weight: number;
   }> = [];
 
   /** 添加顶点（幂等：重复 id 覆盖维度声明，边失效自检） */
@@ -165,7 +185,8 @@ export class CellularSheaf {
       mapB = selectionMatrix(sharedB, dimB);
     }
     if (mapA.length !== mapB.length) throw new Error('限制映射的共享维度不一致（mapA/mapB 行数应相等）');
-    this.edges.push({ a: spec.a, b: spec.b, mapA, mapB });
+    const weight = Math.max(0, spec.weight ?? 1);
+    this.edges.push({ a: spec.a, b: spec.b, mapA, mapB, weight });
     return this;
   }
 
@@ -197,14 +218,17 @@ export class CellularSheaf {
   /**
    * 层拉普拉斯 L_F（D×D 块矩阵；D = Σ 各顶点维度）。
    *
-   * L[v][v] = Σ_{e∋v} Fᵀ_{v≺e}F_{v≺e}；L[v][w] = −Fᵀ_{v≺e}F_{w≺e}
-   * （F 为 d_e×d 的限制映射；FᵀF 与 FᵀG 对共享维度 i 单重求和）
+   * L[v][v] = Σ_{e∋v} w_e²·Fᵀ_{v≺e}F_{v≺e}；L[v][w] = −w_e²·FᵀF
+   * （F 为 d_e×d 的限制映射；FᵀF 与 FᵀG 对共享维度 i 单重求和；
+   * w_e = 边权重，缺省 1——与升级前的硬等式口径逐位一致）
    */
   buildLaplacian(): number[][] {
     const D = this.totalDim();
     const offset = this.layout();
     const L = Array.from({ length: D }, () => new Array<number>(D).fill(0));
     for (const edge of this.edges) {
+      const w2 = edge.weight * edge.weight;
+      if (w2 === 0) continue;
       const oa = offset.get(edge.a)!;
       const ob = offset.get(edge.b)!;
       const de = edge.mapA.length;
@@ -212,19 +236,196 @@ export class CellularSheaf {
       const db = edge.mapB[0]?.length ?? 0;
       for (let i = 0; i < de; i += 1) {
         for (let p = 0; p < da; p += 1) {
-          for (let q = 0; q < da; q += 1) L[oa + p]![oa + q]! += edge.mapA[i]![p]! * edge.mapA[i]![q]!;
+          for (let q = 0; q < da; q += 1) L[oa + p]![oa + q]! += w2 * edge.mapA[i]![p]! * edge.mapA[i]![q]!;
           for (let q = 0; q < db; q += 1) {
-            const cross = -edge.mapA[i]![p]! * edge.mapB[i]![q]!;
+            const cross = -w2 * edge.mapA[i]![p]! * edge.mapB[i]![q]!;
             L[oa + p]![ob + q]! += cross;
             L[ob + q]![oa + p]! += cross;
           }
         }
         for (let p = 0; p < db; p += 1) {
-          for (let q = 0; q < db; q += 1) L[ob + p]![ob + q]! += edge.mapB[i]![p]! * edge.mapB[i]![q]!;
+          for (let q = 0; q < db; q += 1) L[ob + p]![ob + q]! += w2 * edge.mapB[i]![p]! * edge.mapB[i]![q]!;
         }
       }
     }
     return L;
+  }
+
+  /**
+   * 指派对全部边约束的加权残差（max_e,i ‖w_e·(F_a x_a − F_b x_b)‖∞；
+   * 截面存在性判定的数值口径）。
+   */
+  private constraintResidual(x: readonly number[]): number {
+    const offset = this.layout();
+    let worst = 0;
+    for (const edge of this.edges) {
+      if (edge.weight === 0) continue;
+      const oa = offset.get(edge.a)!;
+      const ob = offset.get(edge.b)!;
+      for (let i = 0; i < edge.mapA.length; i += 1) {
+        const pa = edge.mapA[i]!.reduce((s, m, p) => s + m * x[oa + p]!, 0);
+        const pb = edge.mapB[i]!.reduce((s, m, q) => s + m * x[ob + q]!, 0);
+        worst = Math.max(worst, Math.abs(edge.weight * (pa - pb)));
+      }
+    }
+    return worst;
+  }
+
+  /**
+   * 全局截面空间维数 H⁰ = dim ker δ_F = dim ker L_F（R5 数学进化）。
+   *
+   * Hansen–Ghrist: L_F = δ_F†δ_F 且 ker δ_F = ker L_F——零空间维数即
+   * 层的上同调 H⁰：「完美一致指派有多少个自由度」。
+   *   连通标量等值层: H⁰ = 1（全体一致 = 一维常数指派——平均共识的
+   *   解空间就是它）；
+   *   莫比乌斯扭曲层（环上绕行一次乘 −1）: H⁰ = 0——除零指派外
+   *   **不存在任何**完美一致——结构自身携带矛盾，无需任何观测；
+   *   c 个连通分量: H⁰ = Σ 各分量 H⁰（截面按分量独立拼接）。
+   * 数值口径: 高斯消元计秩（阈值相对矩阵最大元 1e-10），秩 = 主元数。
+   */
+  sectionSpaceDimension(): number {
+    const D = this.totalDim();
+    if (D === 0) return 0;
+    return D - rankOfMatrix(this.buildLaplacian());
+  }
+
+  /**
+   * 全局截面存在性判定与显式构造（R5 数学进化）。
+   *
+   * - 无锚点: exists ⟺ H⁰ ≥ 1（结构自身是否有非零完美一致指派）；
+   *   存在时返回一个生成元（归一到 ‖x‖∞ = 1）；
+   * - 带锚点: 锚定坐标固定为观测值，判定线性约束系统是否**可解**——
+   *   可解 ⟺ 存在既满足全部边约束、又精确复现观测的完美共识截面
+   *   （harmonize 的障碍裁决的代数原形：那里用刚度近似的失配容差，
+   *   这里用约束系统的相容性直接判定 + 显式解）。
+   *
+   * 残差口径: max 边约束残差（截面存在时应为 0 的浮点近似）；
+   * 不存在时 section = null、residual 报告不相容的程度量级。
+   */
+  globalSection(anchors?: readonly SheafAnchorSpec[]): {
+    sectionDimension: number;
+    exists: boolean;
+    section: Record<string, number[]> | null;
+    maxConstraintResidual: number;
+    interpretation: string;
+  } {
+    const D = this.totalDim();
+    const offset = this.layout();
+    const sectionDimension = this.sectionSpaceDimension();
+    if (anchors === undefined || anchors.length === 0) {
+      if (sectionDimension < 1) {
+        return {
+          sectionDimension,
+          exists: false,
+          section: null,
+          maxConstraintResidual: 0,
+          interpretation: `H⁰ = ${sectionDimension}：除零指派外不存在完美一致（结构自带矛盾——莫比乌斯式扭曲或超定约束）`,
+        };
+      }
+      const generator = nullSpaceVector(this.buildLaplacian());
+      if (generator === null) {
+        return {
+          sectionDimension,
+          exists: false,
+          section: null,
+          maxConstraintResidual: 0,
+          interpretation: `H⁰ = ${sectionDimension} 但数值零空间搜索未找到生成元（阈值口径下的边界情形）`,
+        };
+      }
+      const residual = this.constraintResidual(generator);
+      const section: Record<string, number[]> = {};
+      for (const id of this.vertexIds) {
+        const start = offset.get(id)!;
+        section[id] = Array.from({ length: this.vertexDims.get(id)! }, (_, i) => round(generator[start + i]!));
+      }
+      return {
+        sectionDimension,
+        exists: true,
+        section,
+        maxConstraintResidual: round(residual),
+        interpretation: `H⁰ = ${sectionDimension}：完美一致指派有 ${sectionDimension} 个自由度（展示归一生成元，边约束残差 ${residual.toExponential(2)}）`,
+      };
+    }
+    // 带锚点：固定锚定坐标，剩余坐标的边约束线性系统 C·x_free = d
+    const alpha = new Uint8Array(D); // 是否锚定
+    const fixed = new Float64Array(D);
+    for (const anchor of anchors) {
+      const dim = this.vertexDims.get(anchor.id);
+      const start = offset.get(anchor.id);
+      if (dim === undefined || start === undefined) continue;
+      for (let i = 0; i < dim && i < anchor.values.length; i += 1) {
+        alpha[start + i] = 1;
+        fixed[start + i] = anchor.values[i]!;
+      }
+    }
+    const freeIdx: number[] = [];
+    for (let i = 0; i < D; i += 1) if (!alpha[i]) freeIdx.push(i);
+    const scale = Math.max(
+      1,
+      ...this.edges.flatMap((e) => [...e.mapA.flat(), ...e.mapB.flat()].map(Math.abs)),
+      ...Array.from(fixed).map(Math.abs),
+    );
+    const rows: number[][] = [];
+    const rhs: number[] = [];
+    const offset2 = this.layout();
+    for (const edge of this.edges) {
+      if (edge.weight === 0) continue;
+      const oa = offset2.get(edge.a)!;
+      const ob = offset2.get(edge.b)!;
+      for (let i = 0; i < edge.mapA.length; i += 1) {
+        // 约束 Σ_p A_p·x_ap − Σ_q B_q·x_bq = 0；固定项移到右边:
+        // C_free·x_free = −ΣA_fixed + ΣB_fixed（rhs = −constant）
+        const row = new Array<number>(freeIdx.length).fill(0);
+        let constant = 0;
+        for (let p = 0; p < edge.mapA[i]!.length; p += 1) {
+          const gi = edge.mapA[i]![p]!;
+          if (alpha[oa + p]) constant += gi * fixed[oa + p]!;
+          else row[freeIdx.indexOf(oa + p)]! += gi;
+        }
+        for (let q = 0; q < edge.mapB[i]!.length; q += 1) {
+          const gi = edge.mapB[i]![q]!;
+          if (alpha[ob + q]) constant -= gi * fixed[ob + q]!;
+          else row[freeIdx.indexOf(ob + q)]! -= gi;
+        }
+        rows.push(row);
+        rhs.push(-constant);
+      }
+    }
+    const xFree = solveConsistentSystem(rows, rhs);
+    if (xFree === null) {
+      return {
+        sectionDimension,
+        exists: false,
+        section: null,
+        maxConstraintResidual: Infinity,
+        interpretation: `锚定约束不相容：不存在同时满足边约束与观测的截面（${anchors.length} 个锚点与结构矛盾——harmonize 的结构性障碍代数原形）`,
+      };
+    }
+    const full = new Array<number>(D).fill(0);
+    for (let i = 0; i < D; i += 1) full[i] = alpha[i] ? fixed[i]! : xFree[freeIdx.indexOf(i)] ?? 0;
+    const residual = this.constraintResidual(full);
+    const tol = 1e-6 * scale;
+    if (residual > tol) {
+      return {
+        sectionDimension,
+        exists: false,
+        section: null,
+        maxConstraintResidual: round(residual),
+        interpretation: `最小二乘解残差 ${residual.toExponential(2)} > 容差 ${tol.toExponential(2)}：锚定约束数值上不相容`,
+      };
+    }
+    const section: Record<string, number[]> = {};
+    for (const id of this.vertexIds) {
+      const start = offset.get(id)!;
+      section[id] = Array.from({ length: this.vertexDims.get(id)! }, (_, i) => round(full[start + i]!));
+    }
+    return {
+      sectionDimension,
+      exists: true,
+      section,
+      maxConstraintResidual: round(residual),
+      interpretation: `完美共识截面存在（H⁰ = ${sectionDimension}，锚点被精确复现，边约束残差 ${residual.toExponential(2)}）`,
+    };
   }
 
   /**
@@ -269,16 +470,16 @@ export class CellularSheaf {
     let anchorWeightSum = 0;
     for (let i = 0; i < D; i += 1) anchorWeightSum += alpha[i]!;
     const rhs = Array.from({ length: D }, (_, i) => alpha[i]! * observed[i]!);
-    // 软调解解：(L + A)x = Ab
+    // 软调解解：(L + A)x = Ab（迭代精化一次——残差修正，轴 3 数值稳健性）
     const softMatrix = L.map((row, i) => [...row]);
     for (let i = 0; i < D; i += 1) softMatrix[i]![i]! += alpha[i]!;
-    const xSoft = solveLinearSystem(softMatrix, rhs);
+    const xSoft = solveWithRefinement(softMatrix, rhs);
     // 完美共识解：(A + M·L)x = Ab（刚度 M 压入全局截面流形）
     const maxAbs = Math.max(1, ...L.flat().map(Math.abs));
     const stiffness = 1e8 * maxAbs;
     const hardMatrix = L.map((row, i) => row.map((v) => v * stiffness));
     for (let i = 0; i < D; i += 1) hardMatrix[i]![i]! += alpha[i]! + 1e-9;
-    const xHard = solveLinearSystem(hardMatrix, rhs);
+    const xHard = solveWithRefinement(hardMatrix, rhs);
     // 障碍裁决：完美共识流形上的加权失配
     let hardMisfit = 0;
     for (let i = 0; i < D; i += 1) {
@@ -288,15 +489,17 @@ export class CellularSheaf {
     const misfitTolerance = options?.misfitTolerance ?? 0.0025;
     const obstruction: SheafConsensusReport['obstruction'] = misfit > misfitTolerance ? 'structural-conflict' : 'none';
     const solution = obstruction === 'none' ? xHard : xSoft;
-    // 能量分解（按最终指派口径）
+    // 能量分解（按最终指派口径；带权边按 w_e² 计）
     let disagreementEnergy = 0;
     for (const edge of this.edges) {
+      const w = edge.weight;
+      if (w === 0) continue;
       const oa = offset.get(edge.a)!;
       const ob = offset.get(edge.b)!;
       for (let i = 0; i < edge.mapA.length; i += 1) {
         const pa = edge.mapA[i]!.reduce((s, m, p) => s + m * solution[oa + p]!, 0);
         const pb = edge.mapB[i]!.reduce((s, m, p) => s + m * solution[ob + p]!, 0);
-        disagreementEnergy += (pa - pb) ** 2;
+        disagreementEnergy += (w * (pa - pb)) ** 2;
       }
     }
     // 共识回填 + 翻供距离
@@ -414,6 +617,176 @@ function solveLinearSystem(A: number[][], b: number[]): number[] {
     if (!Number.isFinite(x[i])) x[i] = 0;
   }
   return x;
+}
+
+// ─────────────────────────── R5 数值内核（计秩 / 零空间 / 相容解 / 精化） ───────────────────────────
+
+/** 矩阵最大元（阈值定标用） */
+function maxAbsEntry(A: readonly (readonly number[])[]): number {
+  let m = 0;
+  for (const row of A) for (const v of row) m = Math.max(m, Math.abs(v));
+  return m;
+}
+
+/** 高斯消元计秩（部分主元；阈值 = 1e-10 × 矩阵最大元，相对口径） */
+function rankOfMatrix(A: readonly (readonly number[])[]): number {
+  const n = A.length;
+  if (n === 0) return 0;
+  const M = A.map((row) => [...row]);
+  const tol = 1e-10 * Math.max(1, maxAbsEntry(A));
+  let rank = 0;
+  let row = 0;
+  for (let col = 0; col < n && row < n; col += 1) {
+    let pivot = row;
+    for (let r = row + 1; r < n; r += 1) {
+      if (Math.abs(M[r]![col]!) > Math.abs(M[pivot]![col]!)) pivot = r;
+    }
+    if (Math.abs(M[pivot]![col]!) <= tol) continue;
+    [M[row], M[pivot]] = [M[pivot]!, M[row]!];
+    for (let r = row + 1; r < n; r += 1) {
+      const factor = M[r]![col]! / M[row]![col]!;
+      if (factor === 0) continue;
+      for (let c = col; c < n; c += 1) M[r]![c]! -= factor * M[row]![c]!;
+    }
+    row += 1;
+    rank += 1;
+  }
+  return rank;
+}
+
+/**
+ * 对称 PSD 方阵的一个零空间生成元（消元找自由列，回代构造；
+ * 零空间平凡时返回 null）。生成元归一到 ‖x‖∞ = 1。
+ */
+function nullSpaceVector(A: number[][]): number[] | null {
+  const n = A.length;
+  if (n === 0) return null;
+  const tol = 1e-10 * Math.max(1, maxAbsEntry(A));
+  // RREF 风格消元，记录每行主元列
+  const M = A.map((row) => [...row]);
+  const pivotColOf: number[] = [];
+  let row = 0;
+  for (let col = 0; col < n && row < n; col += 1) {
+    let pivot = row;
+    for (let r = row + 1; r < n; r += 1) {
+      if (Math.abs(M[r]![col]!) > Math.abs(M[pivot]![col]!)) pivot = r;
+    }
+    if (Math.abs(M[pivot]![col]!) <= tol) continue;
+    [M[row], M[pivot]] = [M[pivot]!, M[row]!];
+    for (let r = 0; r < n; r += 1) {
+      if (r === row) continue;
+      const factor = M[r]![col]! / M[row]![col]!;
+      if (factor === 0) continue;
+      for (let c = col; c < n; c += 1) M[r]![c]! -= factor * M[row]![c]!;
+    }
+    pivotColOf[row] = col;
+    row += 1;
+  }
+  const pivotCols = new Set(pivotColOf);
+  const freeCols: number[] = [];
+  for (let c = 0; c < n; c += 1) if (!pivotCols.has(c)) freeCols.push(c);
+  if (freeCols.length === 0) return null;
+  // 取第一个自由列 = 1、其余自由列 = 0，回代主元行
+  const x = new Array<number>(n).fill(0);
+  x[freeCols[0]!] = 1;
+  for (let r = pivotColOf.length - 1; r >= 0; r -= 1) {
+    const pc = pivotColOf[r]!;
+    let sum = 0;
+    for (let c = 0; c < n; c += 1) {
+      if (c !== pc && M[r]![c]! !== 0) sum += M[r]![c]! * x[c]!;
+    }
+    x[pc] = M[r]![pc]! !== 0 ? -sum / M[r]![pc]! : 0;
+  }
+  const inf = Math.max(...x.map(Math.abs));
+  if (!(inf > 0)) return null;
+  return x.map((v) => v / inf);
+}
+
+/**
+ * 线性系统 C·x = d 的相容解（等式约束存在性判定）。
+ * 不相容（rank C < rank [C|d]）→ null；相容 → 一个特解（自由变量取 0）。
+ */
+function solveConsistentSystem(C: number[][], d: number[]): number[] | null {
+  const rows = C.length;
+  const cols = C.length > 0 ? C[0]!.length : 0;
+  if (cols === 0) return []; // 无自由变量：相容性由行全零且 d≈0 保证（下面统一检查）
+  const scale = Math.max(1, maxAbsEntry(C), ...d.map(Math.abs));
+  const tol = 1e-9 * scale;
+  const M = C.map((row, i) => [...row, d[i]!]);
+  let row = 0;
+  const pivotColOf: number[] = [];
+  for (let col = 0; col < cols && row < rows; col += 1) {
+    let pivot = row;
+    for (let r = row + 1; r < rows; r += 1) {
+      if (Math.abs(M[r]![col]!) > Math.abs(M[pivot]![col]!)) pivot = r;
+    }
+    if (Math.abs(M[pivot]![col]!) <= tol) continue;
+    [M[row], M[pivot]] = [M[pivot]!, M[row]!];
+    for (let r = 0; r < rows; r += 1) {
+      if (r === row) continue;
+      const factor = M[r]![col]! / M[row]![col]!;
+      if (factor === 0) continue;
+      for (let c = col; c <= cols; c += 1) M[r]![c]! -= factor * M[row]![c]!;
+    }
+    pivotColOf[row] = col;
+    row += 1;
+  }
+  // 相容性：无主元行的增广列须 ≈ 0
+  for (let r = row; r < rows; r += 1) {
+    if (Math.abs(M[r]![cols]!) > tol) return null;
+  }
+  const x = new Array<number>(cols).fill(0);
+  for (let r = pivotColOf.length - 1; r >= 0; r -= 1) {
+    const pc = pivotColOf[r]!;
+    let sum = M[r]![cols]!;
+    for (let c = 0; c < cols; c += 1) {
+      if (c !== pc) sum -= M[r]![c]! * x[c]!;
+    }
+    x[pc] = M[r]![pc]! !== 0 ? sum / M[r]![pc]! : 0;
+    if (!Number.isFinite(x[pc])) x[pc] = 0;
+  }
+  return x;
+}
+
+/**
+ * 带一步迭代精化的线性求解（轴 3 数值稳健性）。
+ *
+ * x₀ = solve(A, b)；r = b − A·x₀；d = solve(A, r)；x₁ = x₀ + d——
+ * 经典残差修正：对刚度 1e8 量级的病态系统（harmonize 的完美共识
+ * 路径），浮点消元的舍入误差被压回机器精度阶。守护：x₁ 有限且
+ * ‖r₁‖ ≤ ‖r₀‖ 才接受，否则返回 x₀（永不变差）。
+ */
+function solveWithRefinement(A: number[][], b: number[]): number[] {
+  const x0 = solveLinearSystem(A, b);
+  const r0 = residualVector(A, b, x0);
+  if (!r0.every(Number.isFinite) || r0.every((v) => v === 0)) return x0;
+  const d = solveLinearSystem(A, r0);
+  const x1 = x0.map((v, i) => v + d[i]!);
+  if (!x1.every(Number.isFinite)) return x0;
+  return residualInf(A, b, x1) <= residualInf(A, b, x0) ? x1 : x0;
+}
+
+/** 残差向量 b − A·x 与其 ‖·‖∞ */
+function residualVector(A: number[][], b: number[], x: number[]): number[] {
+  const r = new Array<number>(A.length).fill(0);
+  for (let i = 0; i < A.length; i += 1) {
+    let sum = b[i]!;
+    for (let j = 0; j < A[i]!.length; j += 1) sum -= A[i]![j]! * x[j]!;
+    r[i] = Number.isFinite(sum) ? sum : 0;
+  }
+  return r;
+}
+
+/** ‖b − A·x‖∞ */
+function residualInf(A: number[][], b: number[], x: number[]): number {
+  let worst = 0;
+  for (let i = 0; i < A.length; i += 1) {
+    let sum = b[i]!;
+    for (let j = 0; j < A[i]!.length; j += 1) sum -= A[i]![j]! * x[j]!;
+    if (!Number.isFinite(sum)) return Infinity;
+    worst = Math.max(worst, Math.abs(sum));
+  }
+  return worst;
 }
 
 /** 幂迭代最大特征值（L_F 对称 PSD ⇒ λ_max = 谱半径） */

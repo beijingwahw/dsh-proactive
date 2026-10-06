@@ -16,6 +16,17 @@
  *   要多久」。验证锚点: 两站串联 M/M/1 的边际独立性（模拟对照乘积
  *   形式）、端到端逗留 = 各站之和。
  *
+ * R5-A10 世界性进化（随机过程第六轮·轴 1 数学）:
+ *   A. M/G/1 Pollaczek–Khinchine 变换公式——任意服务分布的**精确**
+ *      Wq = λE[S²]/(2(1−ρ))（Kingman 在 c=1 时的精确化；C_s²=1 退化
+ *      M/M/1、C_s²=0 恰为其半——双解析锚点）；
+ *   B. 非抢占多类优先级 M/G/1（Cobham 1954）+ Kleinrock 守恒律
+ *      Σρ_k Wq_k = ρW0/(1−ρ)（裂项恒等，对任意工守恒序不变）+
+ *      cμ 规则（Smith 成对交换）最优性——「谁先服务」从 FIFO 猜想
+ *      升维为带成本率的最优排序定理。
+ *   验证锚点: 守恒量在全部 K! 排列下逐位不变、cμ 序成本 ≤ 一切排列
+ *   （≥200 种子化穷举）、P-K 双退化锚点、逐类 Little 定律 Lq=λWq。
+ *
  * 零漂移: 未挂载时心跳与调度行为与升级前逐位一致。
  */
 
@@ -83,9 +94,11 @@ export function tandemNetwork(stations: ReadonlyArray<QueueStation>): NetworkRep
   };
 }
 
-/** 网络可稳定的最小服务员配置（逐站反解 ⌈λ/μ⌉ + 1，与 25.0 反解同口径） */
+/** 网络可稳定的最小服务员配置（逐站反解 ⌊λ/μ⌋ + 1 = 最小 c 使 ρ = λ/(cμ) < 1，与 25.0 反解同口径） */
 export function minimalStableServers(stations: Omit<QueueStation, 'servers'>[]): number[] {
-  return stations.map((s) => Math.ceil(s.lambdaPerMs / Math.max(1e-12, s.muPerMs) - 1e-9) || 1);
+  // 稳定要求严格 c > λ/μ：整数比 λ/μ = 2 时 c=2 的 ρ=1 不稳定，须给 3。
+  // +1e-9 吸收浮点商的上溢噪声（0.6/0.2 = 2.999…9 仍按整数比 3 处理）。
+  return stations.map((s) => Math.floor(s.lambdaPerMs / Math.max(1e-12, s.muPerMs) + 1e-9) + 1);
 }
 
 /**
@@ -110,6 +123,183 @@ export function jacksonIndependenceAudit(
     dy += (ys[i] - my) * (ys[i] - my);
   }
   return { correlation: dx > 0 && dy > 0 ? num / Math.sqrt(dx * dy) : 0, samples: n };
+}
+
+// ─────────────────── R5-A10 数学进化 A：M/G/1 Pollaczek–Khinchine 精解 ───────────────────
+
+export interface Mg1Metrics {
+  /** 利用率 ρ = λ·E[S] = λ/μ */
+  rho: number;
+  stable: boolean;
+  /** 平均排队等待 Wq = λE[S²]/(2(1−ρ))（对**任意**服务分布精确） */
+  avgWait: number;
+  /** 平均队长 Lq = λ·Wq */
+  avgQueueLength: number;
+  /** 平均逗留 W = Wq + E[S] */
+  avgSojourn: number;
+  basis: 'pollaczek-khinchine' | 'unstable' | 'invalid';
+}
+
+/**
+ * M/G/1 Pollaczek–Khinchine 变换公式（1930）——一般服务分布的精确平均等待：
+ *
+ *   Wq = λ·E[S²] / (2(1−ρ))，  E[S²] = (1+C_s²)/μ²
+ *
+ * 与 25.0 的关系：Kingman 是 M/G/c 的重负载近似，M/G/1 下本式**精确**。
+ * 两个解析退化锚点：
+ *   C_s²=1（指数服务）→ Wq = λ/(μ²(1−ρ)) = ρ/(μ−λ)，即 M/M/1 精确解；
+ *   C_s²=0（确定性服务）→ Wq 恰为 M/M/1 的一半（无服务抖动可等）。
+ */
+export function pollaczekKhinchine(lambda: number, mu: number, scv = 1): Mg1Metrics {
+  if (!(lambda > 0) || !(mu > 0) || !(scv >= 0)) {
+    return { rho: 0, stable: false, avgWait: 0, avgQueueLength: 0, avgSojourn: 0, basis: 'invalid' };
+  }
+  const rho = lambda / mu;
+  if (rho >= 1) {
+    return { rho, stable: false, avgWait: Infinity, avgQueueLength: Infinity, avgSojourn: Infinity, basis: 'unstable' };
+  }
+  const secondMoment = (1 + scv) / (mu * mu);
+  const avgWait = (lambda * secondMoment) / (2 * (1 - rho));
+  return {
+    rho,
+    stable: true,
+    avgWait,
+    avgQueueLength: lambda * avgWait,
+    avgSojourn: avgWait + 1 / mu,
+    basis: 'pollaczek-khinchine',
+  };
+}
+
+// ─────────────────── R5-A10 数学进化 B：非抢占多类优先级队列（cμ 规则） ───────────────────
+
+/** 一个优先级类：泊松到达 λ、服务率 μ、服务 SCV、单位时间持有成本率 c（缺省 1） */
+export interface PriorityClass {
+  name: string;
+  /** 到达率（每单位时间） */
+  lambda: number;
+  /** 平均服务率（1/E[S]） */
+  mu: number;
+  /** 服务时间平方变异系数（指数服务 = 1） */
+  scv?: number;
+  /** 每任务每单位时间的持有成本率（cμ 规则的权重） */
+  costRate?: number;
+}
+
+export interface PriorityClassMetrics {
+  name: string;
+  rho: number;
+  /** 该类平均等待 Wq_k = W0/((1−σ_{k−1})(1−σ_k))（Cobham 1954，非抢占精确） */
+  avgWait: number;
+  avgSojourn: number;
+  avgQueueLength: number;
+}
+
+export interface PriorityQueueReport {
+  /** 按**传入顺序**（索引 0 = 最高优先级）给出的各类指标 */
+  classes: PriorityClassMetrics[];
+  stable: boolean;
+  /** 均值剩余工作 W0 = Σλ_k E[S_k²]/2（顺序无关量） */
+  residualWork: number;
+  /** Kleinrock 守恒量 Σρ_k·Wq_k（实测求和） */
+  conservationSum: number;
+  /** 守恒量解析值 ρ·W0/(1−ρ)——对一切工守恒非抢占序**恒等** */
+  conservationTheoretical: number;
+  /** cμ 规则最优顺序（c_k·μ_k 降序）——最小化 Σc_k λ_k Wq_k 的类名序列 */
+  cmuOrder: string[];
+  /** 当前顺序下的加权等待成本 Σ c_k λ_k Wq_k */
+  weightedWaitCost: number;
+  /** cμ 顺序下的加权等待成本（定理保证 ≤ 任何其他顺序） */
+  cmuWeightedWaitCost: number;
+}
+
+/**
+ * 非抢占多类 M/G/1 优先级队列（Kleinrock 卷一 §3.5 口径）：
+ *
+ *   W0 = Σ_k λ_k E[S_k²]/2（平均剩余服务工作量）
+ *   Wq_k = W0 / ((1−σ_{k−1})(1−σ_k))，σ_k = Σ_{j≤k} ρ_j
+ *
+ *   Kleinrock 守恒律: Σ_k ρ_k Wq_k = ρW0/(1−ρ) 对一切工守恒非抢占纪律
+ *   **不变**（优先级只重新分配等待，不消灭等待）——σ_k−σ_{k−1}=ρ_k 的
+ *   裂项求和逐位成立：
+ *     Σ ρ_k/((1−σ_{k−1})(1−σ_k)) = Σ [1/(1−σ_k) − 1/(1−σ_{k−1})] = ρ/(1−ρ)
+ *
+ *   cμ 规则（Smith 型成对交换论证）: 按 c_k·μ_k 降序服务最小化
+ *   Σ c_k λ_k Wq_k——相邻对 (k,k+1) 交换的成本差 ∝ (c_{k+1}μ_{k+1} − c_kμ_k)
+ *   × 正因子，故最优序即 cμ 降序（确定性调度的 WSPT 定理在排队稳态的镜像）。
+ */
+export function priorityQueueWaits(classes: ReadonlyArray<PriorityClass>): PriorityQueueReport {
+  const K = classes.length;
+  if (K === 0 || classes.some((c) => !(c.lambda > 0) || !(c.mu > 0) || !((c.scv ?? 1) >= 0))) {
+    return {
+      classes: [], stable: false, residualWork: 0, conservationSum: 0, conservationTheoretical: 0,
+      cmuOrder: [], weightedWaitCost: NaN, cmuWeightedWaitCost: NaN,
+    };
+  }
+  const rhos = classes.map((c) => c.lambda / c.mu);
+  const rho = rhos.reduce((s, r) => s + r, 0);
+  const stable = rho < 1;
+  const w0 = classes.reduce((s, c) => s + (c.lambda * (1 + (c.scv ?? 1))) / (c.mu * c.mu) / 2, 0);
+  if (!stable) {
+    const metrics: PriorityClassMetrics[] = classes.map((c, i) => ({
+      name: c.name, rho: rhos[i], avgWait: Infinity, avgSojourn: Infinity, avgQueueLength: Infinity,
+    }));
+    return {
+      classes: metrics, stable: false, residualWork: w0, conservationSum: Infinity,
+      conservationTheoretical: Infinity, cmuOrder: cmuPriorityOrder(classes),
+      weightedWaitCost: Infinity, cmuWeightedWaitCost: Infinity,
+    };
+  }
+  const metrics: PriorityClassMetrics[] = [];
+  let sigmaPrev = 0; // σ_{k−1}
+  let conservationSum = 0;
+  let weightedCost = 0;
+  for (let k = 0; k < K; k += 1) {
+    const sigma = sigmaPrev + rhos[k];
+    const wq = w0 / ((1 - sigmaPrev) * (1 - sigma));
+    metrics.push({
+      name: classes[k].name,
+      rho: rhos[k],
+      avgWait: wq,
+      avgSojourn: wq + 1 / classes[k].mu,
+      avgQueueLength: classes[k].lambda * wq,
+    });
+    conservationSum += rhos[k] * wq;
+    weightedCost += (classes[k].costRate ?? 1) * classes[k].lambda * wq;
+    sigmaPrev = sigma;
+  }
+  const cmuOrder = cmuPriorityOrder(classes);
+  // cμ 序下的成本（同公式按重排顺序重算——按下标排序取类，重名类不歧义）
+  const orderIdx = classes
+    .map((c, i) => ({ key: (c.costRate ?? 1) * c.mu, i }))
+    .sort((a, b) => b.key - a.key || a.i - b.i)
+    .map((e) => e.i);
+  let sigma2 = 0;
+  let cmuCost = 0;
+  for (const idx of orderIdx) {
+    const c = classes[idx]!;
+    const sigma = sigma2 + c.lambda / c.mu;
+    const wq = w0 / ((1 - sigma2) * (1 - sigma));
+    cmuCost += (c.costRate ?? 1) * c.lambda * wq;
+    sigma2 = sigma;
+  }
+  return {
+    classes: metrics,
+    stable: true,
+    residualWork: w0,
+    conservationSum,
+    conservationTheoretical: (rho * w0) / (1 - rho),
+    cmuOrder,
+    weightedWaitCost: weightedCost,
+    cmuWeightedWaitCost: cmuCost,
+  };
+}
+
+/** cμ 规则排序：按 c_k·μ_k 降序（最小化线性持有成本的成对交换最优序） */
+export function cmuPriorityOrder(classes: ReadonlyArray<PriorityClass>): string[] {
+  return [...classes]
+    .map((c, i) => ({ name: c.name, key: (c.costRate ?? 1) * c.mu, i }))
+    .sort((a, b) => (b.key - a.key) || (a.i - b.i))
+    .map((e) => e.name);
 }
 
 // ─────────────────── 41.0 心跳接线口径（瓶颈站洞察的语义桥） ───────────────────

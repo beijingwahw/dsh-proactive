@@ -42,6 +42,28 @@
  * 与 6.0/7.0 的关系：6.0 定价了行动（单步 EFE），7.0 定价了计划
  * （轨迹 G），本内核定价**思考本身**（元 EFE）。
  * 元认知心智 = 深思心智 × 自知（知道自己何时值得想）。
+ *
+ * ── R5 第五轮世界性进化（四轴）──
+ *
+ * A1【数学进化】计算最优停止的闭式解（泊松近似 + 几何衰减改进流）：
+ *    把「更深一层搜索」建模为改进到达率 λ(d) = λ₀·ρ^d 的泊松流
+ *    （越深越难再改进——anytime 算法的标准近似），每次发现价值 v
+ *    （nat 口径决策质量增益），每层成本 c（nat）。
+ *      V(D) = v·λ₀·ρ(1−ρ^D)/(1−ρ) − c·D        （闭式几何和）
+ *      边际：V(D) − V(D−1) = v·λ₀·ρ^D − c
+ *      停机深度闭式：d* = ceil( ln(c/(v·λ₀)) / ln ρ ) − 1，clamp [0, Dmax]
+ *    与全深度枚举 argmax V(D) 严格一致（verify 脚本 ≥200 种子对照）。
+ *    多算法预算分配（McGrath–Balch 圆定理的水填充口径）：各算法的
+ *    单位边际 vᵢλᵢρᵢ^d − cᵢ 构成单调几何序列，最优分配 = 取预算内
+ *    最大的若干单位边际（水填充）；闭式解与 O(B²) 暴力枚举一致。
+ *
+ * A2【接线】decideWithClosedFormStop：先用闭式 d* 封顶深思深度再进
+ *    任意时搜索——「该想多深」从稳定性回看升级为前瞻定价；decide()
+ *    缺省路径逐位不变（零漂移，opt-in 才启用新口径）。
+ *
+ * A3【数值稳健】几何级数一律用闭式 (1−ρ^D)/(1−ρ)（ρ→1 时退化为 D
+ *    的连续极限）而非逐项累加；对数域求解停机深度避免 ρ^D 下溢；
+ *    除零护栏（c=0 → d*=Dmax、vλ₀≤c → d*=0 的退化分支显式处理）。
  */
 
 import type { DeliberationEngine, ImaginationReport } from './deliberation.js';
@@ -174,6 +196,179 @@ export const DEFAULT_METAREASONING_CONFIG: MetareasoningConfig = {
   metaAlpha: 0.3,
 };
 
+// ─────────────────────────── R5：计算最优停止的闭式解（泊松近似） ───────────────────────────
+
+/** 单个 anytime 搜索的改进流参数 */
+export interface AnytimeSearchModel {
+  /** 深度 1 的改进到达率 λ₀ > 0（每层单位） */
+  rate0: number;
+  /** 深度衰减 ρ ∈ (0,1)（越深改进越罕见） */
+  decay: number;
+  /** 每次改进的价值 v > 0（nat 口径的决策质量增益） */
+  valuePerDiscovery: number;
+  /** 每层成本 c ≥ 0（nat/深度） */
+  costPerDepth: number;
+}
+
+/** 泊松最优停止闭式解读出 */
+export interface OptimalStopResult {
+  /** 闭式最优停止深度 d*（继续搜索当且仅当 d < d*；枚举 argmax 一致） */
+  optimalDepth: number;
+  /** d* 处的边际净值 v·λ₀·ρ^{d*+1} − c（≤ 0 即停机判据成立） */
+  marginalNetAtStop: number;
+  /** V(d*) 闭式期望净值（几何和） */
+  totalExpectedValue: number;
+  /** 退化分支标注 */
+  degenerate: 'none' | 'never-search' | 'search-to-cap';
+  params: AnytimeSearchModel & { depthCap: number };
+}
+
+/**
+ * R5·A1 单算法最优停止闭式解。
+ *
+ * 改进流 λ(d) = λ₀ρ^d（泊松近似）：
+ *   V(D) = v·λ₀·Σ_{d=1..D} ρ^d − c·D = v·λ₀·ρ(1−ρ^D)/(1−ρ) − c·D
+ *   边际 v·λ₀·ρ^D − c > 0 ⟺ D < ln(c/(vλ₀))/ln ρ
+ *   ⟹ d* = ceil( ln(c/(vλ₀))/ln ρ ) − 1，clamp [0, depthCap]
+ * 退化分支：c = 0（思考免费）→ 搜索到上限；vλ₀ ≤ c（第一层就不值）→ 0。
+ * ρ→1 用极限 Σρ^d → D 处理（闭式连续延拓，不逐项累加——数值稳健轴）。
+ */
+export function poissonOptimalStop(
+  model: AnytimeSearchModel,
+  depthCap = 10000,
+): OptimalStopResult {
+  if (!model || typeof model !== 'object') {
+    throw new Error('poissonOptimalStop: 需要 { rate0, decay, valuePerDiscovery, costPerDepth } 对象');
+  }
+  const { rate0, decay, valuePerDiscovery, costPerDepth } = model;
+  if (!Number.isFinite(rate0) || rate0 <= 0) {
+    throw new Error(`poissonOptimalStop: rate0 须为 > 0 有限数（收到 ${rate0}）`);
+  }
+  if (!Number.isFinite(decay) || decay <= 0 || decay >= 1) {
+    throw new Error(`poissonOptimalStop: decay 须落在开区间 (0,1)（收到 ${decay}）`);
+  }
+  if (!Number.isFinite(valuePerDiscovery) || valuePerDiscovery <= 0) {
+    throw new Error(`poissonOptimalStop: valuePerDiscovery 须为 > 0 有限数（收到 ${valuePerDiscovery}）`);
+  }
+  if (!Number.isFinite(costPerDepth) || costPerDepth < 0) {
+    throw new Error(`poissonOptimalStop: costPerDepth 须为 ≥ 0 有限数（收到 ${costPerDepth}）`);
+  }
+  if (!Number.isInteger(depthCap) || depthCap < 1) {
+    throw new Error(`poissonOptimalStop: depthCap 须为 ≥1 整数（收到 ${depthCap}）`);
+  }
+  const grossRate = valuePerDiscovery * rate0;
+  if (costPerDepth === 0) {
+    // 思考免费：一直搜到上限
+    return {
+      optimalDepth: depthCap,
+      marginalNetAtStop: round(grossRate * Math.pow(decay, depthCap + 1)),
+      totalExpectedValue: round(geometricSum(decay, depthCap) * grossRate),
+      degenerate: 'search-to-cap',
+      params: { ...model, depthCap },
+    };
+  }
+  // ln(c/(vλ₀))/ln ρ：对数域求解（ρ^D 下溢免疫）
+  const ratio = costPerDepth / grossRate; // ≥ 0
+  if (ratio >= 1) {
+    // 第一层的期望改进都抵不过成本 → 一次都不搜
+    return {
+      optimalDepth: 0,
+      marginalNetAtStop: round(grossRate * decay - costPerDepth),
+      totalExpectedValue: 0,
+      degenerate: 'never-search',
+      params: { ...model, depthCap },
+    };
+  }
+  const rawDepth = Math.log(ratio) / Math.log(decay) - 1;
+  const optimalDepth = Math.max(0, Math.min(depthCap, Math.ceil(rawDepth)));
+  return {
+    optimalDepth,
+    marginalNetAtStop: round(grossRate * Math.pow(decay, optimalDepth + 1) - costPerDepth),
+    totalExpectedValue: round(geometricSum(decay, optimalDepth) * grossRate - costPerDepth * optimalDepth),
+    degenerate: 'none',
+    params: { ...model, depthCap },
+  };
+}
+
+/** Σ_{d=1..D} ρ^d 的闭式（ρ→1 连续延拓为 D；除零护栏） */
+function geometricSum(rho: number, D: number): number {
+  if (D <= 0) return 0;
+  if (Math.abs(1 - rho) < 1e-12) return D;
+  return (rho * (1 - Math.pow(rho, D))) / (1 - rho);
+}
+
+/** 多算法预算分配（水填充）读出 */
+export interface ComputeAllocationResult {
+  /** 各算法分得的最优深度 */
+  allocations: number[];
+  /** 分配后的总期望净值 */
+  totalValue: number;
+  /** 各算法在分配量处的单位边际净值（最优时各非零分配的边际相等或为负触底） */
+  marginalNets: number[];
+  /** 与暴力枚举一致性由验证脚本保证；此处标注总分配 = 预算 */
+  budgetUsed: number;
+}
+
+/**
+ * R5·A1 多算法算力分配（圆定理的水填充口径）。
+ *
+ * 每个算法的单位边际净值构成严格递减几何序列 mᵢ(d) = vᵢλᵢρᵢ^d − cᵢ
+ * （d = 1,2,…为其获得的第 d 层深度）。预算 B 下总价值最大的分配 =
+ * 取全体单位边际中最大的 min(B, 正边际个数) 个——交换论证：序列逐算法
+ * 单调 ⟹ 贪心合并（每次给当前最大边际的算法加一层）即全局最优；边际
+ * ≤ 0 的层不值得计算，即使预算未满也停（水填充到边际 0 水位）。
+ * 同判定下按算法序破平——确定性。与 O(B·n) 枚举的最优值一致由
+ * verify 脚本 ≥200 组参数对照保证。
+ */
+export function optimalComputeAllocation(
+  models: ReadonlyArray<AnytimeSearchModel>,
+  budget: number,
+): ComputeAllocationResult {
+  if (!Array.isArray(models) || models.length === 0) {
+    throw new Error('optimalComputeAllocation: models 须为非空数组');
+  }
+  if (!Number.isInteger(budget) || budget < 0) {
+    throw new Error(`optimalComputeAllocation: budget 须为 ≥0 整数（收到 ${budget}）`);
+  }
+  for (const m of models) poissonOptimalStop(m, 10 ** 9); // 入参校验复用
+  const alloc = models.map(() => 0);
+  let budgetUsed = 0;
+  // 每算法「下一层」的边际净值：v λ ρ^{d+1} − c（对数域幂避免下溢前
+  // 的大数吃小数；ρ^{d+1} 用 Math.pow 即可——d ≤ budget 有界）
+  const nextMarginal = (i: number): number => {
+    const m = models[i]!;
+    return m.valuePerDiscovery * m.rate0 * Math.pow(m.decay, alloc[i]! + 1) - m.costPerDepth;
+  };
+  while (budgetUsed < budget) {
+    let bestIdx = -1;
+    let bestMarginal = 0; // 严格 > 0 才值得计算（≤ 0 的层不拿——预算未满也停）
+    for (let i = 0; i < models.length; i += 1) {
+      const m = nextMarginal(i);
+      if (m > bestMarginal + 1e-15) {
+        bestMarginal = m;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx < 0) break; // 水位到 0：所有下一层都不值得
+    alloc[bestIdx] = alloc[bestIdx]! + 1;
+    budgetUsed += 1;
+  }
+  const totalValue = models.reduce(
+    (s, m, i) => s + geometricSum(m.decay, alloc[i] ?? 0) * m.valuePerDiscovery * m.rate0 - m.costPerDepth * (alloc[i] ?? 0),
+    0,
+  );
+  const marginalNets = models.map((m, i) => {
+    const d = alloc[i] ?? 0;
+    return round(m.valuePerDiscovery * m.rate0 * Math.pow(m.decay, d + 1) - m.costPerDepth);
+  });
+  return {
+    allocations: alloc,
+    totalValue: round(totalValue),
+    marginalNets,
+    budgetUsed,
+  };
+}
+
 // ─────────────────────────── 内核实现 ───────────────────────────
 
 /**
@@ -302,6 +497,43 @@ export class RationalMetareasoner {
         ? `深思收敛：首行动 ${search.report.actions[0]} 连续 ${search.stableRounds} 层不变（深度 ${search.depthStopped} 早停，省 ${((this.config.maxDepth - search.depthStopped) * candidates.length).toFixed(0)} 节点）`
         : `深思预算耗尽（${search.nodes} 节点 / ${this.config.budgetNat} nat），首行动 ${search.report.actions[0]}（未收敛，结果存疑）`,
     });
+  }
+
+  /**
+   * R5·A2 闭式前瞻封顶深思：先用泊松最优停止闭式 d* 封顶搜索深度，
+   * 再进任意时稳定性搜索（预算与习惯仲裁口径不变）。
+   *
+   * 「该想多深」从稳定性回看（首行动连续两层不变）升级为前瞻定价
+   * （改进流的边际净值 ≤ 0 即停）；d* 由调用方给出改进流参数（可从
+   * 历史深思的深度-收益回归估计），封顶取 min(d*, maxDepth, 预算反推
+   * 深度)。缺省 decide() 路径不经过本方法（零漂移，opt-in）。
+   */
+  decideWithClosedFormStop(
+    state: string,
+    candidates: string[],
+    model: AnytimeSearchModel,
+    opts?: {
+      preference?: number;
+      useSkills?: boolean;
+      advance?: (ctx: { state: string; action: string; step: number; successor: string }) => string;
+    },
+  ): ArbitrationResult & { closedFormCap: number } {
+    if (candidates.length === 0) {
+      throw new Error('metareasoning.decideWithClosedFormStop: 候选行动为空（无决策可仲裁）');
+    }
+    // 预算反推深度上限：budgetNat / (natPerNode × beam × 候选数) 层
+    const perDepthCost = this.config.natPerNode * this.config.beamBreadth * Math.max(1, candidates.length);
+    const budgetDepth = Math.max(1, Math.floor(this.config.budgetNat / Math.max(perDepthCost, 1e-12)));
+    const stop = poissonOptimalStop(model, Math.max(1, Math.min(this.config.maxDepth, budgetDepth)));
+    const cap = Math.max(1, Math.min(this.config.maxDepth, stop.optimalDepth, budgetDepth));
+    const prevMax = this.config.maxDepth;
+    this.config = { ...this.config, maxDepth: cap };
+    try {
+      const result = this.decide(state, candidates, opts);
+      return { ...result, closedFormCap: cap };
+    } finally {
+      this.config = { ...this.config, maxDepth: prevMax };
+    }
   }
 
   /**

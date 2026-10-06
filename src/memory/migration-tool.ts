@@ -23,6 +23,13 @@
  * - 导入按 id 建冲突键，四种策略仲裁；merge 复用记忆库自身的
  *   证据合并语义（支撑累加 + 证据继承），newer-wins 按 distilledAt/lastAppliedAt 仲裁
  * - dryRun 同步预演语义/程序记忆的冲突与新增量
+ *
+ * 第三轮升级：dry-run 差异报告 + 迁移往返一致性校验
+ * - diff()：本地库 vs 迁移包的 增/删/改/不变 四态计数（removed = 本地多出的键
+ *   ——源库已删而本地残留的清单；changed 用规范化序列化判定，键序无关），
+ *   dryRun 返回值直接携带 diff（旧字段原样保留）
+ * - verifyRoundTrip()：source →（export → import）→ target 后五类记录逐条
+ *   规范化比对，lossless + mismatches 明细——迁移「不丢东西」的机械判据
  */
 
 import crypto from 'node:crypto';
@@ -115,6 +122,56 @@ export interface ExportOptions {
   includeGlobalStats?: boolean;
   tenantFilter?: string[];
   instanceName?: string;
+}
+
+/**
+ * 差异四态计数（第三轮升级：dry-run 差异报告的原子口径）
+ * - added：包有本地无（导入将新增）
+ * - removed：本地有包无（导入后本地将多出——提示源库可能已删）
+ * - changed：同键两侧内容深度不等（将按策略仲裁）
+ * - unchanged：同键内容深度相等（任何策略下都无操作必要）
+ */
+export interface DiffSummary {
+  added: number;
+  removed: number;
+  changed: number;
+  unchanged: number;
+}
+
+/** 迁移差异报告（增/删/改计数 + 每类抽样键，dry-run 的人类可读底账） */
+export interface MigrationDiffReport {
+  patterns: DiffSummary;
+  modelProfiles: DiffSummary;
+  feedback: DiffSummary;
+  semantic: DiffSummary;
+  procedural: DiffSummary;
+  /** 五类合计 */
+  total: DiffSummary;
+  /** 每类抽 3 个键（审计定位用，非全量清单） */
+  samples: {
+    added: string[];
+    removed: string[];
+    changed: string[];
+  };
+}
+
+/**
+ * 往返一致性报告（第三轮升级：导出 → 导入后源/目标逐条比对）
+ *
+ * 迁移「不丢东西」的机械判据：五类记录的键集合完全一致 + 每条记录
+ * 的规范化序列化（canonical stringify，键序无关）完全相等。
+ * lossless=false 时 mismatches 逐条列出差异（键缺失 / 内容漂移）。
+ */
+export interface RoundTripReport {
+  lossless: boolean;
+  checked: {
+    patterns: number;
+    modelProfiles: number;
+    feedback: number;
+    semantic: number;
+    procedural: number;
+  };
+  mismatches: string[];
 }
 
 /** 迁移包格式版本 */
@@ -223,12 +280,16 @@ export class MigrationTool {
       // 1. 校验和验证（防篡改 / 防损坏）
       this.verifyChecksum(pkg);
 
-      // 2. 导入任务模式
+      // 2. 导入任务模式（本地键索引一次构建、写入后同步维护——upsertPattern
+      //    按指纹存储传入对象本身，Map 镜像与全量 find 结果逐位一致；
+      //    原实现每条 remote 全量扫描 + 全数组拷贝，O(n·m) 且分配抖动）
+      const localPatternById = new Map(memory.getAllTaskPatterns().map((p) => [p.fingerprint, p]));
       for (const remote of pkg.data.taskPatterns ?? []) {
         try {
-          const local = memory.getAllTaskPatterns().find((p) => p.fingerprint === remote.fingerprint);
+          const local = localPatternById.get(remote.fingerprint);
           if (!local) {
             memory.upsertPattern(remote);
+            localPatternById.set(remote.fingerprint, remote);
             report.imported.patterns += 1;
             continue;
           }
@@ -246,6 +307,7 @@ export class MigrationTool {
             report.skipped += 1;
           } else {
             memory.upsertPattern(winner);
+            localPatternById.set(winner.fingerprint, winner);
             report.imported.patterns += 1;
           }
         } catch (err) {
@@ -283,11 +345,14 @@ export class MigrationTool {
       }
 
       // 4. 导入语义记忆（4.0 补全：按 id 冲突键；merge 复用记忆库证据合并语义）
+      //    第四轮：新条目直插绕过冲突门槛（bypassConflictGate）——迁移是传输
+      //    不是裁决：包内条目（含仲裁降级的历史观点）在上游已裁决，导入侧
+      //    再走 1.5 倍门槛会把历史观点当「矛盾新证据」丢弃，破坏无损迁移。
       for (const remote of pkg.data.semanticMemories ?? []) {
         try {
           const local = memory.getAllSemanticMemories().find((m) => m.id === remote.id);
           if (!local) {
-            memory.upsertSemanticMemory(remote);
+            memory.upsertSemanticMemory(remote, { bypassConflictGate: true });
             report.imported.semantic += 1;
             continue;
           }
@@ -311,12 +376,12 @@ export class MigrationTool {
         }
       }
 
-      // 5. 导入程序记忆（4.0 补全：按 id 冲突键；merge 复用记忆库证据合并语义）
+      // 5. 导入程序记忆（4.0 补全：按 id 冲突键；第四轮 bypassConflictGate 同上）
       for (const remote of pkg.data.proceduralMemories ?? []) {
         try {
           const local = memory.getAllProceduralMemories().find((p) => p.id === remote.id);
           if (!local) {
-            memory.upsertProceduralMemory(remote);
+            memory.upsertProceduralMemory(remote, { bypassConflictGate: true });
             report.imported.procedural += 1;
             continue;
           }
@@ -385,7 +450,7 @@ export class MigrationTool {
    * @param memory 目标记忆库
    * @param pkg 迁移包
    */
-  dryRun(memory: LongTermMemory, pkg: MigrationPackage): { conflicts: MigrationConflict[]; summary: Record<string, number> } {
+  dryRun(memory: LongTermMemory, pkg: MigrationPackage): { conflicts: MigrationConflict[]; summary: Record<string, number>; diff: MigrationDiffReport } {
     this.verifyChecksum(pkg);
     const conflicts: MigrationConflict[] = [];
     let newPatterns = 0;
@@ -395,13 +460,13 @@ export class MigrationTool {
     let newProcedural = 0;
     let duplicates = 0;
 
-    const localPatterns = memory.getAllTaskPatterns();
+    const localPatterns = new Map(memory.getAllTaskPatterns().map((p) => [p.fingerprint, p]));
     const localFeedbackIds = new Set(memory.getAllDecisionFeedback().map((f) => f.id));
-    const localSemanticIds = new Set(memory.getAllSemanticMemories().map((m) => m.id));
-    const localProceduralIds = new Set(memory.getAllProceduralMemories().map((p) => p.id));
+    const localSemanticById = new Map(memory.getAllSemanticMemories().map((m) => [m.id, m]));
+    const localProceduralById = new Map(memory.getAllProceduralMemories().map((p) => [p.id, p]));
 
     for (const remote of pkg.data.taskPatterns ?? []) {
-      const local = localPatterns.find((p) => p.fingerprint === remote.fingerprint);
+      const local = localPatterns.get(remote.fingerprint);
       if (local) {
         conflicts.push({ type: 'pattern', key: remote.fingerprint, localVersion: local, remoteVersion: remote });
       } else {
@@ -424,15 +489,17 @@ export class MigrationTool {
       }
     }
     for (const remote of pkg.data.semanticMemories ?? []) {
-      if (localSemanticIds.has(remote.id)) {
-        conflicts.push({ type: 'semantic', key: remote.id, localVersion: memory.getAllSemanticMemories().find((m) => m.id === remote.id)!, remoteVersion: remote });
+      const local = localSemanticById.get(remote.id);
+      if (local) {
+        conflicts.push({ type: 'semantic', key: remote.id, localVersion: local, remoteVersion: remote });
       } else {
         newSemantic += 1;
       }
     }
     for (const remote of pkg.data.proceduralMemories ?? []) {
-      if (localProceduralIds.has(remote.id)) {
-        conflicts.push({ type: 'procedural', key: remote.id, localVersion: memory.getAllProceduralMemories().find((p) => p.id === remote.id)!, remoteVersion: remote });
+      const local = localProceduralById.get(remote.id);
+      if (local) {
+        conflicts.push({ type: 'procedural', key: remote.id, localVersion: local, remoteVersion: remote });
       } else {
         newProcedural += 1;
       }
@@ -455,7 +522,145 @@ export class MigrationTool {
           (pkg.data.semanticMemories?.length ?? 0) +
           (pkg.data.proceduralMemories?.length ?? 0),
       },
+      // 第三轮升级：dry-run 直接携带增/删/改差异报告（与逐条冲突明细互补的计数口径）
+      diff: this.diff(memory, pkg),
     };
+  }
+
+  /**
+   * 差异报告（第三轮升级）：本地库 vs 迁移包的增/删/改/不变计数。
+   *
+   * 与 dryRun 的冲突检测互补：冲突只看「同键」，diff 还看「本地多出的键」
+   * （removed——源库已删而本地残留）与「内容深度等价」（unchanged——任何
+   * 策略下都无需操作，可从迁移热点中排除）。「改」的判定用规范化序列化
+   * （键序无关），键同内容异即 changed。
+   */
+  diff(memory: LongTermMemory, pkg: MigrationPackage): MigrationDiffReport {
+    const samples = { added: [] as string[], removed: [] as string[], changed: [] as string[] };
+    const note = (kind: 'added' | 'removed' | 'changed', label: string, key: string): void => {
+      // 五类各留最多 3 个样本键（每类 9 封顶即整体安全上限）
+      if (samples[kind].filter((s) => s.startsWith(`${label}[`)).length < 3) samples[kind].push(`${label}[${key}]`);
+    };
+    const diffSection = <T extends object>(label: string, localEntries: T[], remoteEntries: T[], keyOf: (item: T) => string): DiffSummary => {
+      const summary: DiffSummary = { added: 0, removed: 0, changed: 0, unchanged: 0 };
+      const localByKey = new Map(localEntries.map((e) => [keyOf(e), e]));
+      const remoteByKey = new Map(remoteEntries.map((e) => [keyOf(e), e]));
+      for (const [key, remote] of remoteByKey) {
+        const local = localByKey.get(key);
+        if (!local) {
+          summary.added += 1;
+          note('added', label, key);
+        } else if (this.canonicalStringify(local) !== this.canonicalStringify(remote)) {
+          summary.changed += 1;
+          note('changed', label, key);
+        } else {
+          summary.unchanged += 1;
+        }
+      }
+      for (const key of localByKey.keys()) {
+        if (!remoteByKey.has(key)) {
+          summary.removed += 1;
+          note('removed', label, key);
+        }
+      }
+      return summary;
+    };
+
+    const patterns = diffSection('pattern', memory.getAllTaskPatterns(), pkg.data.taskPatterns ?? [], (p) => p.fingerprint);
+    const modelProfiles = diffSection('model-profile', memory.getAllModelProfiles(), pkg.data.modelProfiles ?? [], (p) => p.id);
+    const feedback = diffSection('feedback', memory.getAllDecisionFeedback(), pkg.data.decisionFeedback ?? [], (f) => f.id);
+    const semantic = diffSection('semantic', memory.getAllSemanticMemories(), pkg.data.semanticMemories ?? [], (m) => m.id);
+    const procedural = diffSection('procedural', memory.getAllProceduralMemories(), pkg.data.proceduralMemories ?? [], (p) => p.id);
+    const sum = (sections: DiffSummary[]): DiffSummary => ({
+      added: sections.reduce((s, x) => s + x.added, 0),
+      removed: sections.reduce((s, x) => s + x.removed, 0),
+      changed: sections.reduce((s, x) => s + x.changed, 0),
+      unchanged: sections.reduce((s, x) => s + x.unchanged, 0),
+    });
+
+    return {
+      patterns,
+      modelProfiles,
+      feedback,
+      semantic,
+      procedural,
+      total: sum([patterns, modelProfiles, feedback, semantic, procedural]),
+      samples,
+    };
+  }
+
+  /**
+   * 迁移往返一致性校验（第三轮升级）：source →（export → import）→ target 后，
+   * 机械证明「没丢东西、没改东西」——五类记录键集合一致 + 每条规范化序列化相等。
+   *
+   * 典型用法（无损口径）：export 用 includeGlobalStats: false（globalStats 的
+   * 导入是合并累加语义，往返必然翻倍，不参与无损判定）。
+   *
+   * @param source 源记忆库（导出方）
+   * @param target 目标记忆库（导入方）
+   * @param options.compareGlobalStats 额外比对 globalStats（默认 false，见上）
+   */
+  verifyRoundTrip(
+    source: LongTermMemory,
+    target: LongTermMemory,
+    options?: { compareGlobalStats?: boolean },
+  ): RoundTripReport {
+    const mismatches: string[] = [];
+    const compare = (
+      label: string,
+      localList: Array<{ key: string; canonical: string }>,
+      remoteList: Array<{ key: string; canonical: string }>,
+    ): number => {
+      const localMap = new Map(localList.map((e) => [e.key, e.canonical]));
+      const remoteMap = new Map(remoteList.map((e) => [e.key, e.canonical]));
+      for (const [key, canonical] of localMap) {
+        if (!remoteMap.has(key)) mismatches.push(`${label}[${key}]: 目标库缺失`);
+        else if (remoteMap.get(key) !== canonical) mismatches.push(`${label}[${key}]: 内容漂移`);
+      }
+      for (const key of remoteMap.keys()) {
+        if (!localMap.has(key)) mismatches.push(`${label}[${key}]: 目标库多出`);
+      }
+      return localList.length;
+    };
+
+    const asPairs = <T extends object>(items: T[], key: (item: T) => string): Array<{ key: string; canonical: string }> =>
+      items.map((item) => ({ key: key(item), canonical: this.canonicalStringify(item) }));
+
+    const checked = {
+      patterns: compare(
+        'pattern',
+        asPairs(source.getAllTaskPatterns(), (p) => p.fingerprint),
+        asPairs(target.getAllTaskPatterns(), (p) => p.fingerprint),
+      ),
+      modelProfiles: compare(
+        'model-profile',
+        asPairs(source.getAllModelProfiles(), (p) => p.id),
+        asPairs(target.getAllModelProfiles(), (p) => p.id),
+      ),
+      feedback: compare(
+        'feedback',
+        asPairs(source.getAllDecisionFeedback(), (f) => f.id),
+        asPairs(target.getAllDecisionFeedback(), (f) => f.id),
+      ),
+      semantic: compare(
+        'semantic',
+        asPairs(source.getAllSemanticMemories(), (m) => m.id),
+        asPairs(target.getAllSemanticMemories(), (m) => m.id),
+      ),
+      procedural: compare(
+        'procedural',
+        asPairs(source.getAllProceduralMemories(), (p) => p.id),
+        asPairs(target.getAllProceduralMemories(), (p) => p.id),
+      ),
+    };
+
+    if (options?.compareGlobalStats) {
+      const a = this.canonicalStringify(source.getGlobalStats());
+      const b = this.canonicalStringify(target.getGlobalStats());
+      if (a !== b) mismatches.push('globalStats: 内容漂移');
+    }
+
+    return { lossless: mismatches.length === 0, checked, mismatches };
   }
 
   /**
@@ -522,7 +727,9 @@ export class MigrationTool {
       throw new MemoryError('迁移包结构非法：缺少 data 或 checksum');
     }
     const expected = this.computeChecksum(pkg.data);
-    if (!crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(pkg.checksum, 'hex'))) {
+    // timingSafeEqual 对不等长缓冲直接抛 RangeError：先做长度检查，
+    // 保证任何形态的不匹配都落到 MemoryError 契约（而非裸 RangeError）
+    if (expected.length !== pkg.checksum.length || !crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(pkg.checksum, 'hex'))) {
       throw new MemoryError('迁移包校验和不匹配：数据可能已损坏或被篡改');
     }
   }
@@ -573,6 +780,9 @@ export class MigrationTool {
       frequency: local.frequency + remote.frequency,
       firstSeenAt: Math.min(local.firstSeenAt, remote.firstSeenAt),
       lastSeenAt: Math.max(local.lastSeenAt, remote.lastSeenAt),
+      // 衰减基准随合并保留（缺省口径 = lastSeenAt）：原实现丢弃该字段会让
+      // 下次遗忘曲线从合并后的 lastSeenAt 重新起算，已衰减过的置信度被二次衰减
+      lastDecayAt: Math.max(local.lastDecayAt ?? local.lastSeenAt, remote.lastDecayAt ?? remote.lastSeenAt),
       successfulPlans,
       failureRecords,
       // 置信度取加权平均（按频率加权）
@@ -629,6 +839,14 @@ export class MigrationTool {
               ? (l.totalQualityScore + r.totalQualityScore) / (l.successCount + r.successCount)
               : 0,
           lastCalledAt: Math.max(l.lastCalledAt, r.lastCalledAt),
+          // 2.0 证据字段随合并保留（缺失侧按裸计数折算）：原实现重建对象时
+          // 丢弃加权证据与 EMA——迁移后画像被降级为 legacy 口径（0.5 折价），
+          // 证据量静默减半、漂移检测样本不足
+          weightedSuccesses: (l.weightedSuccesses ?? l.successCount) + (r.weightedSuccesses ?? r.successCount),
+          weightedFailures:
+            (l.weightedFailures ?? l.totalCalls - l.successCount) + (r.weightedFailures ?? r.totalCalls - r.successCount),
+          lastDecayedAt: Math.max(l.lastDecayedAt ?? 0, r.lastDecayedAt ?? 0),
+          emaQuality: l.emaQuality ?? r.emaQuality,
         };
       } else {
         taskHistory[type] = { ...(l ?? r)! };

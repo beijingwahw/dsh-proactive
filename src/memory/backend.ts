@@ -17,6 +17,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import { MemoryError } from '../errors.js';
@@ -40,6 +41,11 @@ export interface MemoryBackend {
   fullTextSearch?(query: string, limit?: number): MemorySearchHit[];
   /** 向量检索（sqlite-vec 不可用时的稀疏向量回退，仅 SQLite 后端提供） */
   vectorSearch?(query: string, limit?: number): MemorySearchHit[];
+  /**
+   * 条目级完整性校验（第三轮升级）：逐条重算校验和比对。
+   * 报告而不静默——损坏条目列出表名与主键，不抛错（load 才抛）。
+   */
+  verifyIntegrity?(): BackendIntegrityReport;
   // ── 数据库维护 API（仅 SQLite 后端提供） ──
   integrityCheck?(): string;
   stats?(): {
@@ -62,6 +68,16 @@ export interface MemoryBackend {
   vacuum?(): void;
   backup?(destPath: string): string;
   rawQuery?(sql: string, params?: Array<string | number | null>): Array<Record<string, unknown>>;
+}
+
+/** 条目级完整性报告（verifyIntegrity 产物；corrupted 为空即无损） */
+export interface BackendIntegrityReport {
+  ok: boolean;
+  /** 校验过的条目数（不含无校验和的旧条目） */
+  checked: number;
+  /** 尚无校验和的旧条目数（首次 save 后补齐） */
+  unchecked: number;
+  corrupted: Array<{ table: string; key: string }>;
 }
 
 /** 空记忆库工厂 */
@@ -144,6 +160,13 @@ export function sqliteAvailable(): boolean {
 interface DataRow {
   data: string;
 }
+/** loadTableChecked 的行类型别名（避免逐个 import 记忆实体类型） */
+type TaskPatternRow = MemoryStore['taskPatterns'][number];
+type ModelProfileRow = MemoryStore['modelProfiles'][number];
+type FeedbackRow = MemoryStore['decisionFeedback'][number];
+type StrategyRow = MemoryStore['distilledStrategies'][number];
+type SemanticRow = MemoryStore['semanticMemories'][number];
+type ProceduralRow = MemoryStore['proceduralMemories'][number];
 interface MetaRow {
   key: string;
   value: string;
@@ -207,7 +230,12 @@ export interface MemorySearchHit {
   score: number;
 }
 
-/** 当前 SQLite schema 版本（v2 = 关系化列 + 索引；v1 = 纯 blob 表） */
+/**
+ * 当前 SQLite schema 版本（v2 = 关系化列 + 索引；v1 = 纯 blob 表）。
+ * 条目级校验和列（第三轮升级）按第二阶段加表先例以「幂等加列」方式
+ * 演进——构造期 ensureChecksumColumns 检测缺列即 ALTER + 回填，
+ * 不 bump 大版本号（schema_version 语义 = 关系化 schema 大版本）。
+ */
 const SCHEMA_VERSION = 2;
 
 /**
@@ -216,6 +244,21 @@ const SCHEMA_VERSION = 2;
  */
 const MIGRATIONS: Array<{ to: number; up: (backend: SqliteMemoryBackend) => void }> = [
   { to: 2, up: (backend) => (backend as unknown as { migrateV1toV2(): void }).migrateV1toV2() },
+];
+
+/** 条目 JSON 的校验和（SHA-256 前 16 hex——检测静默损坏，非密码学防伪） */
+function entryChecksum(dataJson: string): string {
+  return crypto.createHash('sha256').update(dataJson, 'utf-8').digest('hex').slice(0, 16);
+}
+
+/** 参与 checksum 校验的表（表名 → 主键列名） */
+const CHECKED_TABLES: Array<{ table: string; pk: string }> = [
+  { table: 'task_patterns', pk: 'fingerprint' },
+  { table: 'model_profiles', pk: 'id' },
+  { table: 'decision_feedback', pk: 'id' },
+  { table: 'distilled_strategies', pk: 'id' },
+  { table: 'semantic_memories', pk: 'id' },
+  { table: 'procedural_memories', pk: 'id' },
 ];
 
 /**
@@ -273,13 +316,15 @@ export class SqliteMemoryBackend implements MemoryBackend {
         frequency INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL,
         last_decay_at INTEGER,
-        data TEXT NOT NULL
+        data TEXT NOT NULL,
+        data_checksum TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_task_patterns_type_conf ON task_patterns (task_type, confidence);
       CREATE TABLE IF NOT EXISTS model_profiles (
         id TEXT PRIMARY KEY,
         best_task_type TEXT,
-        data TEXT NOT NULL
+        data TEXT NOT NULL,
+        data_checksum TEXT
       );
       CREATE TABLE IF NOT EXISTS decision_feedback (
         id TEXT PRIMARY KEY,
@@ -287,7 +332,8 @@ export class SqliteMemoryBackend implements MemoryBackend {
         signal_type TEXT NOT NULL,
         decision TEXT NOT NULL,
         outcome TEXT NOT NULL,
-        data TEXT NOT NULL
+        data TEXT NOT NULL,
+        data_checksum TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_decision_feedback_signal_ts ON decision_feedback (signal_type, ts);
       CREATE TABLE IF NOT EXISTS distilled_strategies (
@@ -296,7 +342,8 @@ export class SqliteMemoryBackend implements MemoryBackend {
         confidence REAL NOT NULL,
         support_count INTEGER NOT NULL,
         last_applied_at INTEGER,
-        data TEXT NOT NULL
+        data TEXT NOT NULL,
+        data_checksum TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_distilled_strategies_type_conf ON distilled_strategies (task_type, confidence);
       -- 第二阶段三层记忆扩展：语义记忆 + 程序记忆（CREATE IF NOT EXISTS 幂等加表，旧库自动建表）
@@ -307,7 +354,8 @@ export class SqliteMemoryBackend implements MemoryBackend {
         support_count INTEGER NOT NULL,
         last_applied_at INTEGER,
         last_decay_at INTEGER,
-        data TEXT NOT NULL
+        data TEXT NOT NULL,
+        data_checksum TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_semantic_memories_domain_conf ON semantic_memories (domain, confidence);
       CREATE TABLE IF NOT EXISTS procedural_memories (
@@ -318,7 +366,8 @@ export class SqliteMemoryBackend implements MemoryBackend {
         support_count INTEGER NOT NULL,
         last_applied_at INTEGER,
         last_decay_at INTEGER,
-        data TEXT NOT NULL
+        data TEXT NOT NULL,
+        data_checksum TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_procedural_memories_kind_conf ON procedural_memories (kind, confidence);
       CREATE TABLE IF NOT EXISTS memory_vectors (ref_id TEXT PRIMARY KEY, kind TEXT NOT NULL, vector TEXT NOT NULL);
@@ -326,6 +375,8 @@ export class SqliteMemoryBackend implements MemoryBackend {
     // FTS5 混合检索增强：trigram 表（子串级中文匹配）+ 分词表（jieba 式 token 级匹配）
     this.ftsAvailable = this.createFtsTables();
     this.migrateIfNeeded();
+    // 第三轮升级：条目级校验和列幂等就位（旧库打开即补列回填，不 bump schema 大版本）
+    this.ensureChecksumColumns();
   }
 
   /** sqlite-vec 接缝：宿主预装扩展时启用，失败静默回退稀疏向量 */
@@ -452,6 +503,106 @@ export class SqliteMemoryBackend implements MemoryBackend {
     `);
   }
 
+  /**
+   * 条目级校验和列（第三轮升级，幂等加列）：为六张数据表补 data_checksum
+   * 列，既有行立即从 data 回填校验和（无损升级——旧行内容此刻可信，此后
+   * 任何静默篡改/位翻转都会在读时被检出）。新库建表已直接含该列；
+   * 旧库每次打开检测缺列即补（与第二阶段幂等加表同一演进风格，不 bump 版本）。
+   */
+  private ensureChecksumColumns(): void {
+    for (const { table } of CHECKED_TABLES) {
+      if (!this.hasColumn(table, 'data_checksum')) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN data_checksum TEXT;`);
+      }
+      this.db.exec(`UPDATE ${table} SET data_checksum = '' WHERE data_checksum IS NULL;`);
+      // 逐行回填：SQLite 无逐行函数，拉回 JS 侧计算再写（一次性开销）
+      const rows = this.db.prepare(`SELECT rowid AS rid, data FROM ${table} WHERE data_checksum = ''`).all() as unknown as Array<{ rid: number; data: string }>;
+      const update = this.db.prepare(`UPDATE ${table} SET data_checksum = ? WHERE rowid = ?`);
+      for (const row of rows) {
+        update.run(entryChecksum(row.data), row.rid);
+      }
+    }
+  }
+
+  /**
+   * 读时损坏检测（第三轮升级）：逐行重算校验和比对。
+   * @returns 校验过的行；corrupted 非空时调用方应拒绝服务并报告
+   */
+  private loadTableChecked<T>(table: string, orderBy?: string): T[] {
+    const rows = this.stmt(`SELECT data, data_checksum FROM ${table}${orderBy ? ` ORDER BY ${orderBy}` : ''}`).all() as unknown as Array<{ data: string; data_checksum?: string | null }>;
+    const out: T[] = [];
+    const corrupted: Array<{ table: string; key: string }> = [];
+    for (let i = 0; i < rows.length; i += 1) {
+      const row = rows[i]!;
+      const expected = row.data_checksum;
+      if (expected) {
+        if (entryChecksum(row.data) !== expected) {
+          corrupted.push({ table, key: this.keyOfRow(table, row.data, i) });
+          continue;
+        }
+      }
+      try {
+        out.push(JSON.parse(row.data) as T);
+      } catch {
+        corrupted.push({ table, key: this.keyOfRow(table, row.data, i) });
+      }
+    }
+    if (corrupted.length > 0) this.reportCorruption(corrupted);
+    return out;
+  }
+
+  /** 从损坏行 data 提取主键（提取失败退化为行序号） */
+  private keyOfRow(table: string, data: string, index: number): string {
+    const pk = CHECKED_TABLES.find((t) => t.table === table)?.pk ?? 'id';
+    try {
+      const value = (JSON.parse(data) as Record<string, unknown>)[pk === 'fingerprint' ? 'fingerprint' : 'id'];
+      return typeof value === 'string' ? value : `row#${index}`;
+    } catch {
+      return `row#${index}`;
+    }
+  }
+
+  /** 损坏报告：checkpoint 后备份库文件再抛（报告不静默，现场可查） */
+  private reportCorruption(corrupted: Array<{ table: string; key: string }>): never {
+    let backup = '(备份失败)';
+    try {
+      this.checkpoint();
+      const dest = `${this.dbPath}.corrupt.${Date.now()}`;
+      fs.copyFileSync(this.dbPath, dest);
+      backup = dest;
+    } catch {
+      /* 备份失败不掩盖原始损坏事实 */
+    }
+    const detail = corrupted
+      .slice(0, 5)
+      .map((c) => `${c.table}[${c.key}]`)
+      .join(', ');
+    throw new MemoryError(
+      `记忆库检测到 ${corrupted.length} 条损坏条目（校验和不匹配）：${detail}${corrupted.length > 5 ? ' …' : ''}；已备份至 ${backup}`,
+      { corruptedCount: corrupted.length, corrupted, backup },
+    );
+  }
+
+  /** 条目级完整性校验（只读，报告不抛错；load 才抛） */
+  verifyIntegrity(): BackendIntegrityReport {
+    let checked = 0;
+    let unchecked = 0;
+    const corrupted: Array<{ table: string; key: string }> = [];
+    for (const { table } of CHECKED_TABLES) {
+      const rows = this.stmt(`SELECT data, data_checksum FROM ${table}`).all() as unknown as Array<{ data: string; data_checksum?: string | null }>;
+      for (let i = 0; i < rows.length; i += 1) {
+        const row = rows[i]!;
+        if (!row.data_checksum) {
+          unchecked += 1;
+          continue;
+        }
+        checked += 1;
+        if (entryChecksum(row.data) !== row.data_checksum) corrupted.push({ table, key: this.keyOfRow(table, row.data, i) });
+      }
+    }
+    return { ok: corrupted.length === 0, checked, unchecked, corrupted };
+  }
+
   private getMeta(key: string): string | null {
     const row = this.stmt('SELECT value FROM meta WHERE key = ?').get(key) as unknown as MetaRow | undefined;
     return row ? row.value : null;
@@ -469,13 +620,14 @@ export class SqliteMemoryBackend implements MemoryBackend {
     if (lastUpdatedAt) store.lastUpdatedAt = Number(lastUpdatedAt);
     const stats = this.getMeta('globalStats');
     if (stats) store.globalStats = { ...store.globalStats, ...JSON.parse(stats) };
-    store.taskPatterns = (this.stmt('SELECT data FROM task_patterns').all() as unknown as DataRow[]).map((r) => JSON.parse(r.data));
-    store.modelProfiles = (this.stmt('SELECT data FROM model_profiles').all() as unknown as DataRow[]).map((r) => JSON.parse(r.data));
-    store.decisionFeedback = (this.stmt('SELECT data FROM decision_feedback ORDER BY ts').all() as unknown as DataRow[]).map((r) => JSON.parse(r.data));
-    store.distilledStrategies = (this.stmt('SELECT data FROM distilled_strategies').all() as unknown as DataRow[]).map((r) => JSON.parse(r.data));
+    // 第三轮升级：读时逐条校验和检测（v3 起每行携带；损坏 → 备份并报告，不静默）
+    store.taskPatterns = this.loadTableChecked<TaskPatternRow>('task_patterns');
+    store.modelProfiles = this.loadTableChecked<ModelProfileRow>('model_profiles');
+    store.decisionFeedback = this.loadTableChecked<FeedbackRow>('decision_feedback', 'ts');
+    store.distilledStrategies = this.loadTableChecked<StrategyRow>('distilled_strategies');
     // 第二阶段三层记忆扩展：语义记忆 + 程序记忆
-    store.semanticMemories = (this.stmt('SELECT data FROM semantic_memories').all() as unknown as DataRow[]).map((r) => JSON.parse(r.data));
-    store.proceduralMemories = (this.stmt('SELECT data FROM procedural_memories').all() as unknown as DataRow[]).map((r) => JSON.parse(r.data));
+    store.semanticMemories = this.loadTableChecked<SemanticRow>('semantic_memories');
+    store.proceduralMemories = this.loadTableChecked<ProceduralRow>('procedural_memories');
     return store;
   }
 
@@ -484,85 +636,95 @@ export class SqliteMemoryBackend implements MemoryBackend {
     this.db.exec('BEGIN');
     try {
       const upPattern = this.stmt(`
-        INSERT INTO task_patterns (fingerprint, task_type, confidence, frequency, last_seen_at, last_decay_at, data)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO task_patterns (fingerprint, task_type, confidence, frequency, last_seen_at, last_decay_at, data, data_checksum)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(fingerprint) DO UPDATE SET
           task_type = excluded.task_type, confidence = excluded.confidence, frequency = excluded.frequency,
-          last_seen_at = excluded.last_seen_at, last_decay_at = excluded.last_decay_at, data = excluded.data
+          last_seen_at = excluded.last_seen_at, last_decay_at = excluded.last_decay_at, data = excluded.data,
+          data_checksum = excluded.data_checksum
       `);
       const seenPatterns = new Set<string>();
       for (const p of store.taskPatterns) {
         seenPatterns.add(p.fingerprint);
         // taskType 取自指纹首段（与 similarity() 的还原约定一致）
         const taskType = p.fingerprint.split('::')[0] ?? '';
-        upPattern.run(p.fingerprint, taskType, p.confidence, p.frequency, p.lastSeenAt, p.lastDecayAt ?? null, JSON.stringify(p));
+        const dataJson = JSON.stringify(p);
+        upPattern.run(p.fingerprint, taskType, p.confidence, p.frequency, p.lastSeenAt, p.lastDecayAt ?? null, dataJson, entryChecksum(dataJson));
       }
       this.stmt('DELETE FROM task_patterns WHERE fingerprint NOT IN (SELECT value FROM json_each(?))').run(JSON.stringify([...seenPatterns]));
 
       const upProfile = this.stmt(`
-        INSERT INTO model_profiles (id, best_task_type, data) VALUES (?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET best_task_type = excluded.best_task_type, data = excluded.data
+        INSERT INTO model_profiles (id, best_task_type, data, data_checksum) VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET best_task_type = excluded.best_task_type, data = excluded.data,
+          data_checksum = excluded.data_checksum
       `);
       const seenProfiles = new Set<string>();
       for (const m of store.modelProfiles) {
         seenProfiles.add(m.id);
-        upProfile.run(m.id, m.bestTaskType ?? null, JSON.stringify(m));
+        const dataJson = JSON.stringify(m);
+        upProfile.run(m.id, m.bestTaskType ?? null, dataJson, entryChecksum(dataJson));
       }
       this.stmt('DELETE FROM model_profiles WHERE id NOT IN (SELECT value FROM json_each(?))').run(JSON.stringify([...seenProfiles]));
 
       const upFeedback = this.stmt(`
-        INSERT INTO decision_feedback (id, ts, signal_type, decision, outcome, data) VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO decision_feedback (id, ts, signal_type, decision, outcome, data, data_checksum) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, signal_type = excluded.signal_type,
-          decision = excluded.decision, outcome = excluded.outcome, data = excluded.data
+          decision = excluded.decision, outcome = excluded.outcome, data = excluded.data,
+          data_checksum = excluded.data_checksum
       `);
       const seenFeedback = new Set<string>();
       for (const f of store.decisionFeedback) {
         seenFeedback.add(f.id);
-        upFeedback.run(f.id, f.timestamp, f.signalType, f.decision, f.outcome, JSON.stringify(f));
+        const dataJson = JSON.stringify(f);
+        upFeedback.run(f.id, f.timestamp, f.signalType, f.decision, f.outcome, dataJson, entryChecksum(dataJson));
       }
       this.stmt('DELETE FROM decision_feedback WHERE id NOT IN (SELECT value FROM json_each(?))').run(JSON.stringify([...seenFeedback]));
 
       const upStrategy = this.stmt(`
-        INSERT INTO distilled_strategies (id, task_type, confidence, support_count, last_applied_at, data)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO distilled_strategies (id, task_type, confidence, support_count, last_applied_at, data, data_checksum)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET task_type = excluded.task_type, confidence = excluded.confidence,
-          support_count = excluded.support_count, last_applied_at = excluded.last_applied_at, data = excluded.data
+          support_count = excluded.support_count, last_applied_at = excluded.last_applied_at, data = excluded.data,
+          data_checksum = excluded.data_checksum
       `);
       const seenStrategies = new Set<string>();
       for (const s of store.distilledStrategies) {
         seenStrategies.add(s.id);
-        upStrategy.run(s.id, s.taskType, s.confidence, s.supportCount, s.lastAppliedAt ?? null, JSON.stringify(s));
+        const dataJson = JSON.stringify(s);
+        upStrategy.run(s.id, s.taskType, s.confidence, s.supportCount, s.lastAppliedAt ?? null, dataJson, entryChecksum(dataJson));
       }
       this.stmt('DELETE FROM distilled_strategies WHERE id NOT IN (SELECT value FROM json_each(?))').run(JSON.stringify([...seenStrategies]));
 
       // 第二阶段三层记忆扩展：语义记忆 + 程序记忆 UPSERT
       const upSemantic = this.stmt(`
-        INSERT INTO semantic_memories (id, domain, confidence, support_count, last_applied_at, last_decay_at, data)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO semantic_memories (id, domain, confidence, support_count, last_applied_at, last_decay_at, data, data_checksum)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET domain = excluded.domain, confidence = excluded.confidence,
           support_count = excluded.support_count, last_applied_at = excluded.last_applied_at,
-          last_decay_at = excluded.last_decay_at, data = excluded.data
+          last_decay_at = excluded.last_decay_at, data = excluded.data, data_checksum = excluded.data_checksum
       `);
       const seenSemantic = new Set<string>();
       for (const m of store.semanticMemories) {
         seenSemantic.add(m.id);
-        upSemantic.run(m.id, m.domain, m.confidence, m.supportCount, m.lastAppliedAt ?? null, m.lastDecayAt ?? null, JSON.stringify(m));
+        const dataJson = JSON.stringify(m);
+        upSemantic.run(m.id, m.domain, m.confidence, m.supportCount, m.lastAppliedAt ?? null, m.lastDecayAt ?? null, dataJson, entryChecksum(dataJson));
       }
       this.stmt('DELETE FROM semantic_memories WHERE id NOT IN (SELECT value FROM json_each(?))').run(JSON.stringify([...seenSemantic]));
 
       const upProcedural = this.stmt(`
-        INSERT INTO procedural_memories (id, kind, task_type, confidence, support_count, last_applied_at, last_decay_at, data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO procedural_memories (id, kind, task_type, confidence, support_count, last_applied_at, last_decay_at, data, data_checksum)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, task_type = excluded.task_type, confidence = excluded.confidence,
           support_count = excluded.support_count, last_applied_at = excluded.last_applied_at,
-          last_decay_at = excluded.last_decay_at, data = excluded.data
+          last_decay_at = excluded.last_decay_at, data = excluded.data, data_checksum = excluded.data_checksum
       `);
       const seenProcedural = new Set<string>();
       for (const p of store.proceduralMemories) {
         seenProcedural.add(p.id);
+        const dataJson = JSON.stringify(p);
         // task_type 取首个适用类型（无则空串），仅用于索引；完整 taskTypes 在 data 列
         const primaryTaskType = p.taskTypes[0] ?? '';
-        upProcedural.run(p.id, p.kind, primaryTaskType, p.confidence, p.supportCount, p.lastAppliedAt ?? null, p.lastDecayAt ?? null, JSON.stringify(p));
+        upProcedural.run(p.id, p.kind, primaryTaskType, p.confidence, p.supportCount, p.lastAppliedAt ?? null, p.lastDecayAt ?? null, dataJson, entryChecksum(dataJson));
       }
       this.stmt('DELETE FROM procedural_memories WHERE id NOT IN (SELECT value FROM json_each(?))').run(JSON.stringify([...seenProcedural]));
 
@@ -760,7 +922,36 @@ export class JsonMemoryBackend implements MemoryBackend {
     }
   }
 
+  /** JSON 后端读时损坏检测：不存在 → 未检出；解析/结构非法 → 定位到文件级 */
+  verifyIntegrity(): BackendIntegrityReport {
+    if (!fs.existsSync(this.persistPath)) return { ok: true, checked: 0, unchecked: 0, corrupted: [] };
+    try {
+      if (this.cryptoEngine) {
+        const { data } = this.cryptoEngine.readEncrypted(this.persistPath);
+        sanitizeMemoryStore(data);
+      } else {
+        sanitizeMemoryStore(JSON.parse(fs.readFileSync(this.persistPath, 'utf-8')));
+      }
+      return { ok: true, checked: 1, unchecked: 0, corrupted: [] };
+    } catch (err) {
+      return {
+        ok: false,
+        checked: 1,
+        unchecked: 0,
+        corrupted: [{ table: '<json-file>', key: `${this.persistPath}: ${err instanceof Error ? err.message : String(err)}` }],
+      };
+    }
+  }
+
+  /**
+   * 原子写（临时区 + 切换 + 失败回滚）：
+   * 1. 写入临时文件 `<path>.tmp.<pid>`（临时区——主文件此时尚未被动过）
+   * 2. rename 切换（同文件系统原子操作）
+   * 3. 任一步失败 → 回滚：清理残留 tmp、主文件字节保持原样、抛 MemoryError
+   *    （加密路径走 writeEncrypted 自身的原子性，失败语义同上）
+   */
   save(store: MemoryStore): void {
+    const tmp = `${this.persistPath}.tmp.${process.pid}`;
     try {
       if (this.cryptoEngine) {
         const result = this.cryptoEngine.writeEncrypted(this.persistPath, store);
@@ -771,12 +962,17 @@ export class JsonMemoryBackend implements MemoryBackend {
       }
       const dir = path.dirname(this.persistPath);
       fs.mkdirSync(dir, { recursive: true });
-      const tmp = `${this.persistPath}.tmp.${process.pid}`;
       fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf-8');
       fs.renameSync(tmp, this.persistPath);
     } catch (err) {
+      // 回滚：残留临时区清掉，主文件从未被切换——字节保持原样
+      try {
+        if (fs.existsSync(tmp)) fs.rmSync(tmp, { force: true });
+      } catch {
+        /* 清理尽力而为，不掩盖写入失败本体 */
+      }
       if (err instanceof MemoryError) throw err;
-      throw new MemoryError('记忆库持久化失败', {
+      throw new MemoryError('记忆库持久化失败（已回滚：主文件未动）', {
         persistPath: this.persistPath,
         cause: err instanceof Error ? err.message : String(err),
       });

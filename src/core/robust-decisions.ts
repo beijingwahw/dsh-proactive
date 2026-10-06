@@ -91,7 +91,9 @@ export function cvarCoherenceAudit(samples: ReadonlyArray<number>, alpha: number
   // 索引配对耦合（z_i = x_i + y_i）——边缘为 x、y 的合法联合分布
   const xs = samples.filter((_, i) => i % 2 === 0);
   const ys = samples.filter((_, i) => i % 2 === 1);
-  const zs = xs.map((x, i) => x + ys[i]);
+  // 索引配对耦合（z_i = x_i + y_i）——奇数样本时末位不配对（NaN 会静默
+  // 毁掉次可加性判定），只取两边共有的前缀长度
+  const zs = xs.slice(0, ys.length).map((x, i) => x + ys[i]);
   const subadd = (cvar(xs, alpha) ?? 0) + (cvar(ys, alpha) ?? 0) - (cvar(zs, alpha) ?? 0);
   return {
     monotone: (cvar(samples.map((x) => x + 1), alpha) ?? 0) >= base - 1e-9,
@@ -182,4 +184,147 @@ export function robustTimeout(samples: ReadonlyArray<number>, config?: RobustTim
   const tail = cvar(samples, alpha);
   if (tail === undefined || !Number.isFinite(tail) || tail <= 0) return undefined;
   return Math.min(capMs, Math.max(floorMs, tail * margin));
+}
+
+// ══════════════════════ R5 进化（第五轮·世界性进化） ══════════════════════
+//
+// 轴 1（数学）: CVaR 场景逼近的有限样本界（样本复杂度）。
+//   经验 CVaR 是**乐观有偏**的: RU min-form CVaR_emp = min_t φ_t(样本) 与
+//   min/max 可交换方向给出 E[CVaR_emp] ≤ min_t E[φ_t] = CVaR_true——
+//   经验尾部平均系统性低估真实尾部。补偿多少? 三个引理给出精确价格:
+//     (i)  有偏方向: E[CVaR_emp] ≤ CVaR_true（上式，Jensen 方向）;
+//     (ii) 有界差分: CVaR_emp 对单个样本替换是 B/((1−α)n)-Lipschitz
+//          （尾部平均总权重为 1，摊在 ≤ 1/(1−α) 个样本上，单样本替换至多
+//          改变 B·(1/((1−α)n))，B = 支撑直径）;
+//     (iii) McDiarmid: P(CVaR_true − CVaR_emp > ε) ≤ exp(−2ε²(1−α)²n/B²)。
+//   ⟹ 以置信 1−δ: CVaR_true ≤ CVaR_emp + (B/(1−α))·√(ln(1/δ)/(2n))。
+//   反解得样本复杂度: n ≥ B²·ln(1/δ)/(2ε²(1−α)²) ——「要 ε 精度的尾部，
+//   样本按 1/ε² 计费，且尾部越深（α→1）越贵（1/(1−α)² 因子）」。
+//   调度语义: 超时预算从「拿经验 CVaR 当真」升级为「CVaR + 有限样本罚」——
+//   新模型样本少 30 条时预算自动加厚，样本攒够后罚项消失（确定性公式）。
+//
+// 轴 2（性能）: cvarProfile —— 一次排序 + 前缀和，多档 α 的 CVaR 全部
+//   O(log n)（二分尾部切点），替代 k 次 O(n log n) 独立排序。等价性:
+//   与 cvar() 解析式同式（仅求和顺序不同，容差 1e-9 内一致）。
+//
+// 轴 4（性质）: CVaR_α 关于 α 单调不降（尾部均值随置信加深只增不减）、
+//   尾支配 CVaR_α ≥ VaR_α（尾部均值 ≥ 尾部分位）、关于分布混合凸
+//  （次可加 + 正齐次的直接推论——凸性的正确口径在分布上; α ↦ CVaR_α
+//   在分位数拐点处只保证单调与 Lipschitz，不保证 α 凸）。
+// ══════════════════════════════════════════════════════════
+
+/** CVaR 场景逼近配置（有限样本界口径） */
+export interface CvarScenarioConfig {
+  /** 置信水平 1−δ ∈ (0,1)（缺省 0.95——界以 95% 概率成立） */
+  confidence?: number;
+  /** 支撑上界 b（损失的最高可能值） */
+  supportUpper: number;
+  /** 支撑下界（缺省 0——延迟/成本口径的最低值） */
+  supportLower?: number;
+}
+
+/**
+ * CVaR 场景逼近的 ε 罚（McDiarmid 有界差分界）:
+ *   ε(n, α, δ, B) = (B/(1−α))·√(ln(1/δ)/(2n))
+ * 含义: n 个样本的经验 CVaR 低于真实 CVaR 超过 ε 的概率 ≤ δ。
+ */
+export function cvarSampleComplexity(
+  sampleCount: number,
+  alpha: number,
+  confidence: number,
+  supportDiameter: number,
+): number {
+  if (!Number.isInteger(sampleCount) || sampleCount < 1) {
+    throw new Error(`cvarSampleComplexity: sampleCount=${String(sampleCount)} 必须为 ≥1 整数`);
+  }
+  const beta = Math.min(1, Math.max(1e-9, 1 - alpha));
+  if (!(confidence > 0) || !(confidence < 1)) {
+    throw new Error(`cvarSampleComplexity: confidence=${String(confidence)} 必须在 (0,1) 内`);
+  }
+  if (!(supportDiameter >= 0) || !Number.isFinite(supportDiameter)) {
+    throw new Error(`cvarSampleComplexity: supportDiameter=${String(supportDiameter)} 必须为有限非负数`);
+  }
+  return (supportDiameter / beta) * Math.sqrt(Math.log(1 / (1 - confidence)) / (2 * sampleCount));
+}
+
+/**
+ * 样本复杂度反解: 要 |CVaR_true − CVaR_emp| ≤ ε 以置信 1−δ 成立，
+ * 至少需要 n = ⌈B²·ln(1/δ)/(2ε²(1−α)²)⌉ 个样本（上界紧到常数因子）。
+ */
+export function cvarRequiredSamples(
+  alpha: number,
+  epsilon: number,
+  confidence: number,
+  supportDiameter: number,
+): number {
+  const beta = Math.min(1, Math.max(1e-9, 1 - alpha));
+  if (!(epsilon > 0) || !Number.isFinite(epsilon)) {
+    throw new Error(`cvarRequiredSamples: epsilon=${String(epsilon)} 必须为 >0 有限数`);
+  }
+  if (!(confidence > 0) || !(confidence < 1)) {
+    throw new Error(`cvarRequiredSamples: confidence=${String(confidence)} 必须在 (0,1) 内`);
+  }
+  if (!(supportDiameter >= 0) || !Number.isFinite(supportDiameter)) {
+    throw new Error(`cvarRequiredSamples: supportDiameter=${String(supportDiameter)} 必须为有限非负数`);
+  }
+  return Math.ceil((supportDiameter * supportDiameter * Math.log(1 / (1 - confidence))) / (2 * epsilon * epsilon * beta * beta));
+}
+
+/**
+ * CVaR 场景逼近上界（高置信真实 CVaR 上界）:
+ *   bound = CVaR_emp + ε(n, α, δ, B) ≥ CVaR_true（概率 ≥ 1−δ）。
+ * 超时定价的诚实口径——样本越少罚项越厚，与「拍脑袋 margin」不同，
+ * 罚项有定理背书且随 n 以 1/√n 收缩。空样本 → undefined。
+ */
+export function cvarScenarioBound(
+  samples: ReadonlyArray<number>,
+  alpha: number,
+  config: CvarScenarioConfig,
+): { bound: number; empiricalCvar: number; epsilon: number; sampleCount: number } | undefined {
+  if (samples.length === 0) return undefined;
+  const confidence = config.confidence ?? 0.95;
+  const supportLower = config.supportLower ?? 0;
+  if (!(config.supportUpper > supportLower)) {
+    throw new Error(`cvarScenarioBound: 需 supportUpper(${String(config.supportUpper)}) > supportLower(${String(supportLower)})`);
+  }
+  for (let i = 0; i < samples.length; i += 1) {
+    if (!Number.isFinite(samples[i])) {
+      throw new Error(`cvarScenarioBound: samples[${i}]=${String(samples[i])} 必须为有限数`);
+    }
+  }
+  const empirical = cvar(samples, alpha);
+  if (empirical === undefined) return undefined;
+  const epsilon = cvarSampleComplexity(samples.length, alpha, confidence, config.supportUpper - supportLower);
+  return { bound: empirical + epsilon, empiricalCvar: empirical, epsilon, sampleCount: samples.length };
+}
+
+/**
+ * 多档 α 的 CVaR 剖面（性能进化）: 一次升序排序 + 前缀和，
+ * 每档 α 二分定位尾部切点 O(log n)，总计 O(n log n + k·log n)——
+ * 替代 k 次独立 cvar() 的 O(k·n log n)。与 cvar() 解析式同式，
+ * 仅求和顺序不同（前缀和 = 升序前缀，cvar = 降序累加），浮点尾数差异
+ * 在 1e-9 相对容差内（验证脚本逐档对账）。
+ */
+export function cvarProfile(samples: ReadonlyArray<number>, alphas: ReadonlyArray<number>): number[] | undefined {
+  if (samples.length === 0) return undefined;
+  const n = samples.length;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const prefix = new Array<number>(n + 1).fill(0);
+  for (let i = 0; i < n; i += 1) prefix[i + 1] = prefix[i] + sorted[i];
+  const out = new Array<number>(alphas.length);
+  for (let k = 0; k < alphas.length; k += 1) {
+    const alpha = alphas[k];
+    if (!Number.isFinite(alpha)) {
+      throw new Error(`cvarProfile: alphas[${k}]=${String(alpha)} 必须为有限数`);
+    }
+    const beta = Math.min(1, Math.max(1e-9, 1 - alpha));
+    const m = beta * n;
+    const full = Math.min(n, Math.floor(m + 1e-12));
+    const frac = m - full;
+    // 最坏 full 个 = 升序末 full 个（前缀和区间），第 full+1 个取分数权重
+    let acc = prefix[n] - prefix[n - full];
+    if (frac > 1e-12 && full < n) acc += frac * sorted[n - 1 - full];
+    out[k] = acc / m;
+  }
+  return out;
 }

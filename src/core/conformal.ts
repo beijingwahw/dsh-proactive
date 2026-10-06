@@ -34,6 +34,24 @@
  * 阈值」永不越界——二者合成预测-决策全链路的分布无关保证。
  * 与 3-11.0 的关系：世界模型的 MAE 校准（经验性的）继续服务趋势
  * 置信度；保形区间作为并行旁路叠加（不替换既有字段语义）。
+ *
+ * R5 第五轮进化（内核世界性进化·统计推断组）：
+ * - 数学：Mondrian 条件保形（分组覆盖保证）——把校准分数按组
+ *   （模型档位 / 任务类型 / 租户层）切开，各组独立取 ⌈(n_g+1)(1−α)⌉
+ *   次序统计量：Mondrian 定理（Vovk et al.; Xu & Ramdas 2021 的
+ *   Mondrian-ish 框架）保证**条件于组标签**的覆盖 P(覆盖 | 组=g) ≥ 1−α
+ *   ——边际覆盖不再被组间失衡稀释（旧池化区间对小组系统性失准）。
+ *   组样本不足时诚实回退合并池（source='pooled'，条件保证标记降级，
+ *   边际保证仍成立）。
+ * - 数学：conformalPValue —— 校准分数的保形 p-值
+ *   p = (1 + #{s_i ≥ s}) / (n+1)：可交换性下超均匀
+ *   （P(p ≤ t) ≤ t，Vovk），把保形残差接入任意时刻 p-值语言。
+ * - 性能：selectRiskControlledThreshold 由 O(2·G·n) 双遍扫描改为
+ *   **一次排序 + 二分定位**（O(n log n + G·log n)）：经验风险
+ *   mean = #{s<λ}/n 由升序样本上的 lower-bound 二分 O(log n) 取得，
+ *   0/1 指示样本方差以闭式 (k(1−mean)² + (n−k)·mean²)/(n−1) 代数
+ *   等价替换两遍累加——与旧实现解析等价（指示变量方差恒等式，
+ *   浮点级差 ≤ 1e-12），网格遍历顺序与「取最大合格 λ」语义逐位保持。
  */
 
 import { fixedSampleUpperBound, round } from './anytime-evidence.js';
@@ -53,6 +71,153 @@ export function conformalQuantile(scores: number[], alpha: number): number | und
   if (rank > n) return undefined;
   const sorted = [...scores].sort((a, b) => a - b);
   return sorted[rank - 1];
+}
+
+// ───────────────────── R5：Mondrian 条件保形（分组覆盖保证） ─────────────────────
+
+/** Mondrian 保形分位数读取视图 */
+export interface MondrianQuantileResult {
+  /** 组条件保形半径（source='none' 时 undefined） */
+  qhat?: number;
+  /** 口径：组自身样本（条件保证）/ 合并池（仅边际保证）/ 无 */
+  source: 'group' | 'pooled' | 'none';
+  /** 该口径下的校准样本量 */
+  calibrationN: number;
+  /** 查询的组标签 */
+  group: string;
+  /** 名义误覆盖率 α */
+  alpha: number;
+}
+
+/**
+ * Mondrian 保形分位数（组条件覆盖保证）。
+ *
+ * Mondrian 框架：把样本空间按组标签剖分，每组独立做分裂保形
+ * （每组 α_g = α）。Mondrian 定理保证每个组的**条件**覆盖
+ *   P(新样本被覆盖 | 组 = g) ≥ 1 − α_g
+ * ——只要组内分数与新样本在组内可交换。组样本撑不起该置信度
+ * （秩 > n_g）时回退合并池：合并池内可交换性给出**边际**覆盖
+ * ≥ 1−α，但组间分布异质时条件保证不再精确成立——source 如实
+ * 标记 'pooled'（诚实降级，不假装条件有效）。
+ */
+export function mondrianQuantile(
+  scoresByGroup: ReadonlyMap<string, readonly number[]>,
+  group: string,
+  alpha: number,
+): MondrianQuantileResult {
+  const groupScores = scoresByGroup.get(group);
+  if (groupScores && groupScores.length > 0) {
+    const q = conformalQuantile([...groupScores], alpha);
+    if (q !== undefined) {
+      return { qhat: q, source: 'group', calibrationN: groupScores.length, group, alpha };
+    }
+  }
+  const pooled: number[] = [];
+  for (const scores of scoresByGroup.values()) pooled.push(...scores);
+  const qPooled = pooled.length > 0 ? conformalQuantile(pooled, alpha) : undefined;
+  if (qPooled === undefined) {
+    return { source: 'none', calibrationN: pooled.length, group, alpha };
+  }
+  return { qhat: qPooled, source: 'pooled', calibrationN: pooled.length, group, alpha };
+}
+
+/** Mondrian 保形区间（finite=false 时诚实发散；pooled 标记条件口径降级） */
+export interface MondrianInterval extends ConformalInterval {
+  /** 查询的组标签 */
+  group: string;
+  /** true = 组条件保证（source='group'）；false = 合并池回退（仅边际保证） */
+  conditional: boolean;
+}
+
+/**
+ * Mondrian 保形区间引擎：按组维护校准集（每组 FIFO maxCalibration），
+ * interval(group, ŷ) 返回组条件保形区间。
+ *
+ * 数据流与 ConformalIntervalEngine 同构：calibrate(group, residual)
+ * 入组校准集；interval 时先查组口径、不足回退合并池。保证：
+ * source='group' 的区间在组内精确覆盖 ≥ 1−α（条件于组标签）。
+ */
+export class MondrianConformalEngine {
+  private readonly config: ConformalIntervalConfig;
+  private readonly calibrationByGroup = new Map<string, number[]>();
+
+  constructor(config?: Partial<ConformalIntervalConfig>) {
+    this.config = { ...DEFAULT_CONFORMAL_CONFIG, ...config };
+  }
+
+  /** 名义误覆盖率 */
+  get alpha(): number {
+    return this.config.alpha;
+  }
+
+  /** 已登记的组标签 */
+  groups(): string[] {
+    return [...this.calibrationByGroup.keys()];
+  }
+
+  /** 组校准样本量（无组返回 0；缺省 group 逐组，传 undefined 返回总量） */
+  calibrationSize(group?: string): number {
+    if (group !== undefined) return this.calibrationByGroup.get(group)?.length ?? 0;
+    let total = 0;
+    for (const scores of this.calibrationByGroup.values()) total += scores.length;
+    return total;
+  }
+
+  /** 入组校准样本（残差 = |真值 − 点预测|；每组 FIFO 上限） */
+  calibrate(group: string, residual: number): void {
+    let scores = this.calibrationByGroup.get(group);
+    if (!scores) {
+      scores = [];
+      this.calibrationByGroup.set(group, scores);
+    }
+    scores.push(Math.max(0, residual));
+    if (scores.length > this.config.maxCalibration) {
+      scores.splice(0, scores.length - this.config.maxCalibration);
+    }
+  }
+
+  /** 组条件保形区间（组不足回退合并池，conditional=false 如实标记） */
+  interval(group: string, pointForecast: number): MondrianInterval {
+    const mondrian = mondrianQuantile(this.calibrationByGroup, group, this.config.alpha);
+    if (mondrian.qhat === undefined) {
+      return {
+        lower: Number.NEGATIVE_INFINITY,
+        upper: Number.POSITIVE_INFINITY,
+        finite: false,
+        qhat: Number.NaN,
+        calibrationN: mondrian.calibrationN,
+        alpha: this.config.alpha,
+        group,
+        conditional: false,
+      };
+    }
+    return {
+      lower: pointForecast - mondrian.qhat,
+      upper: pointForecast + mondrian.qhat,
+      finite: true,
+      qhat: mondrian.qhat,
+      calibrationN: mondrian.calibrationN,
+      alpha: this.config.alpha,
+      group,
+      conditional: mondrian.source === 'group',
+    };
+  }
+}
+
+// ───────────────────── R5：保形 p-值（可交换性下超均匀） ─────────────────────
+
+/**
+ * 保形 p-值：p = (1 + #{s_i ≥ s}) / (n + 1)。
+ *
+ * (校准分数 s₁..s_n, 新分数 s) 可交换时，新分数的秩在 {1..n+1} 上
+ * 均匀 → p 超均匀（P(p ≤ t) ≤ t，Vovk）。与 12.0 的任意时刻 p-值
+ * 同语言：保形残差第一次能以「p 值」而非「区间」的口径进入裁决链。
+ */
+export function conformalPValue(scores: readonly number[], s: number): number {
+  const n = scores.length;
+  let count = 0;
+  for (const x of scores) if (x >= s) count += 1;
+  return (1 + count) / (n + 1);
 }
 
 /** 保形预测区间 */
@@ -265,7 +430,7 @@ export class ConformalIntervalEngine {
       this.calibration.length === 0
         ? '保形引擎待校准（calibrate 喂入首批残差后区间生效）'
         : q === undefined
-          ? `校准样本 ${this.calibration.length} 不足以支撑 ${(1 - this.config.alpha) * 100}% 覆盖（需 ${Math.ceil(1 / (1 - this.config.alpha)) - 1} 条以上）——区间诚实发散`
+          ? `校准样本 ${this.calibration.length} 不足以支撑 ${(1 - this.config.alpha) * 100}% 覆盖（需 ${Math.ceil(1 / this.config.alpha) - 1} 条以上）——区间诚实发散`
           : drift.drifting
             ? `覆盖漂移确证：经验覆盖 ${(drift.empiricalCoverage * 100).toFixed(0)}% vs 目标 ${((1 - this.config.alpha) * 100).toFixed(0)}%（e=${drift.eValue.toFixed(1)} ≥ 1/δ）——应重校准`
             : `区间生效：q̂=${q.toFixed(3)}（${this.calibration.length} 条校准），覆盖监测正常（经验 ${drift.empiricalCoverage.toFixed(2)}）`;
@@ -315,6 +480,13 @@ export interface RiskControlResult {
  * 数学允许的最严处——旧 ±0.02 步进启发式被带保证的选择取代。
  *
  * 样本不足（无合格 λ）→ 返回 undefined（调用方回退既有逻辑）。
+ *
+ * R5 性能：O(2·G·n) 双遍扫描 → **一次排序 O(n log n) + 每 λ 一次
+ * 二分 O(log n)**。#{s<λ} 由升序数组 lower-bound 二分取得（与线性
+ * 扫描逐位同值）；0/1 指示样本方差用代数恒等式
+ *   Σ(1{s<λ} − mean)² = k(1−mean)² + (n−k)·mean², k = #{s<λ}
+ * 闭式替换（解析等价，浮点级差 ≤ 1e-12）。网格遍历顺序与
+ * 「取数组序最后一个合格 λ」的既有语义逐位保持。
  */
 export function selectRiskControlledThreshold(
   samples: number[],
@@ -327,17 +499,21 @@ export function selectRiskControlledThreshold(
   if (n < 2 || grid.length === 0) return undefined;
 
   const beta = delta / grid.length; // Bonferroni 分摊
+  const sorted = [...samples].sort((a, b) => a - b); // 一次排序，全部 λ 共享
   let chosen: RiskControlResult | undefined;
   for (const lambda of grid) {
-    let below = 0;
-    let belowSqMean = 0;
-    for (const s of samples) if (s < lambda) below += 1;
-    const mean = below / n;
-    for (const s of samples) {
-      const d = (s < lambda ? 1 : 0) - mean;
-      belowSqMean += d * d;
+    // k = #{s < λ}：升序数组上的 lower-bound 二分（与旧线性扫描同值）
+    let lo = 0;
+    let hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (sorted[mid]! < lambda) lo = mid + 1;
+      else hi = mid;
     }
-    const variance = belowSqMean / (n - 1);
+    const below = lo;
+    const mean = below / n;
+    // 0/1 指示方差闭式（与两遍累加解析等价）
+    const variance = (below * (1 - mean) * (1 - mean) + (n - below) * mean * mean) / (n - 1);
     const bound = fixedSampleUpperBound(n, mean, variance, beta);
     if (bound <= alpha) {
       // 风险上界合格；取最大 λ（网格升序遍历，后者覆盖前者）

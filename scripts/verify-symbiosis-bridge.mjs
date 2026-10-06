@@ -151,7 +151,6 @@ section('E 价值铸币：任务成功 → 模型按贡献质量加权分红');
 
 const balABefore = bridge.runtime.ledger.balance(modelAgentId('model-a'));
 const balBBefore = bridge.runtime.ledger.balance(modelAgentId('model-b'));
-const repABefore = bridge.runtime.agents ? undefined : undefined; // 占位（runtime.agents 私有，经行为观测）
 const dist = bridge.settleTask({
   success: true,
   nodeResults: [

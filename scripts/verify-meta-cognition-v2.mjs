@@ -213,7 +213,7 @@ const buildKnobs = (c) => [
       forecast.crossesRiskThreshold?.threshold === 0.7 &&
       forecast.crossesRiskThreshold?.direction === 'below' &&
       forecast.crossesRiskThreshold?.withinReports === 3,
-    `操作环成功率 0.92→0.88→0.84→0.80（-0.04/期，R²=1.00，置信 high）→ 3 期外推 ${forecast?.predictededValue ?? forecast?.predictedValue}，预计 ${forecast?.crossesRiskThreshold?.withinReports} 期内穿越 0.7 健康线`,
+    `操作环成功率 0.92→0.88→0.84→0.80（-0.04/期，R²=1.00，置信 high）→ 3 期外推 ${forecast?.predictedValue}，预计 ${forecast?.crossesRiskThreshold?.withinReports} 期内穿越 0.7 健康线`,
   );
 
   const risk = report4.proactiveRisks?.[0];

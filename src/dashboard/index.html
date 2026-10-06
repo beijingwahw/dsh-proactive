@@ -16,6 +16,7 @@
   .sub { color: var(--muted); margin-bottom: 16px; font-size: 12px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .panel.wide { grid-column: 1 / -1; }
   .panel h2 { font-size: 13px; color: var(--accent); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--border); }
   .badge.ok { background: rgba(63,185,80,.15); color: var(--green); }
@@ -42,14 +43,61 @@
   .bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
   .bar > div { height: 100%; background: var(--green); }
   .empty { color: var(--muted); text-align: center; padding: 24px 0; }
+  /* ── 第三轮 A15：98 内核地图 / 意识总线 / 注意力市场 ── */
+  .kmap { max-height: 420px; overflow-y: auto; }
+  .klayer { margin-bottom: 8px; }
+  .klayer .khead { color: var(--muted); font-size: 11px; margin-bottom: 3px; }
+  .klayer .khead b { color: var(--accent); font-weight: 600; }
+  .kchip { display: inline-block; padding: 1px 6px; margin: 2px 3px 2px 0; border-radius: 4px; font-size: 11px;
+           border: 1px solid var(--border); color: var(--muted); }
+  .kchip.resident { color: var(--text); border-style: dashed; }
+  .kchip.on { color: var(--green); border-color: rgba(63,185,80,.6); background: rgba(63,185,80,.12); }
+  .klegend { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .gwt-row { padding: 5px 8px; border-bottom: 1px solid var(--border); font-size: 12px; display: flex; gap: 8px; align-items: baseline; }
+  .gwt-row .step { color: var(--muted); flex-shrink: 0; }
+  .gwt-row .winner { flex-shrink: 0; font-weight: 600; color: var(--purple); }
+  .gwt-row .bid { color: var(--yellow); flex-shrink: 0; }
+  .gwt-row .tags { color: var(--muted); word-break: break-all; }
+  .paynum { color: var(--yellow); }
+  /* ── 第四轮 R4-A15：实时告警面板（严重度分色）+ 布局持久化 ── */
+  .alarm-row { padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 12px; display: flex; gap: 8px;
+               align-items: baseline; border-left: 3px solid var(--border); }
+  .alarm-row .sev { flex-shrink: 0; font-weight: 600; width: 56px; }
+  .alarm-row .src { flex-shrink: 0; color: var(--accent); }
+  .alarm-row .alarm-title { font-weight: 600; word-break: break-all; }
+  .alarm-row .detail { color: var(--muted); word-break: break-all; }
+  .alarm-row.sev-critical { border-left-color: var(--red); }
+  .alarm-row.sev-critical .sev { color: var(--red); }
+  .alarm-row.sev-warning { border-left-color: var(--yellow); }
+  .alarm-row.sev-warning .sev { color: var(--yellow); }
+  .alarm-row.sev-info { border-left-color: var(--accent); }
+  .alarm-row.sev-info .sev { color: var(--accent); }
+  .num.critical { color: var(--red); }
+  .num.warning { color: var(--yellow); }
+  .layoutbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px;
+               color: var(--muted); font-size: 12px; }
+  .chip { display: inline-block; padding: 2px 10px; margin: 2px 4px 2px 0; border-radius: 10px; border: 1px solid var(--border);
+          background: var(--bg); color: var(--muted); font: inherit; font-size: 11px; cursor: pointer; }
+  .chip:hover { color: var(--text); border-color: var(--accent); }
+  .chip-on { color: var(--green); border-color: rgba(63,185,80,.6); background: rgba(63,185,80,.12); }
+  .panel-ctl { margin-left: auto; display: flex; gap: 4px; }
+  .pbtn { background: var(--bg); border: 1px solid var(--border); color: var(--muted); border-radius: 4px;
+          font: inherit; font-size: 11px; width: 20px; height: 18px; line-height: 14px; cursor: pointer; padding: 0; }
+  .pbtn:hover { color: var(--text); border-color: var(--accent); }
 </style>
 </head>
 <body>
 <h1>dsh-proactive 实时仪表盘</h1>
 <div class="sub">自主智能多模型协同调度系统 · 10 步执行链路实时监控 · <span id="conn-state" class="badge err">未连接</span></div>
 
-<div class="grid">
-  <div class="panel">
+<!-- ── 第四轮 R4-A15：自定义布局持久化（面板显隐/顺序，localStorage 记忆）── -->
+<div class="layoutbar" id="layout-bar">
+  <span>面板管理：</span><span id="hidden-panels"></span>
+  <button class="chip" id="layout-reset">恢复默认布局</button>
+</div>
+
+<div class="grid" id="panel-grid">
+  <div class="panel" id="overview-stats">
     <h2>全局统计</h2>
     <div class="stat-row">
       <div class="stat"><div class="num" id="st-signals">0</div><div class="label">信号总数</div></div>
@@ -65,14 +113,63 @@
     </table>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="event-stream">
     <h2>实时事件流 <span class="badge" id="event-count">0</span></h2>
     <div class="feed" id="event-feed"><div class="empty">等待事件…</div></div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="plan-feed">
     <h2>执行计划</h2>
-    <div class="feed" id="plan-feed"><div class="empty">暂无计划</div></div>
+    <div class="feed" id="plan-feed-body"><div class="empty">暂无计划</div></div>
+  </div>
+
+  <!-- ── 第三轮 A15：98 内核地图面板（20 层×编号总览 + 旗标开关态）── -->
+  <div class="panel wide" id="kernel-map">
+    <h2>内核地图 · 98 内核 / 20 层（3.0→100.0 百数封顶）<span class="badge" id="kernel-flag-badge">旗标 0/50</span></h2>
+    <div class="kmap" id="kernel-map-body"><div class="empty">加载内核地图…</div></div>
+    <div class="klegend" id="kernel-map-note">● 旗标开　○ 旗标关（缺省）　▪ 常驻内核（无旗标，恒开）</div>
+  </div>
+
+  <!-- ── 第三轮 A15：GWT 意识总线面板（96.0 最近广播流：胜者/优先级/点火）── -->
+  <div class="panel" id="gwt-panel">
+    <h2>意识总线 GWT 96.0 <span class="badge" id="gwt-steps-badge">—</span></h2>
+    <div class="stat-row">
+      <div class="stat"><div class="num" id="st-gwt-steps">—</div><div class="label">总线步数</div></div>
+      <div class="stat"><div class="num" id="st-gwt-ignite">—</div><div class="label">点火率</div></div>
+      <div class="stat"><div class="num" id="st-gwt-entropy">—</div><div class="label">胜者熵(bit)</div></div>
+      <div class="stat"><div class="num" id="st-gwt-winners">—</div><div class="label">胜出引擎</div></div>
+    </div>
+    <div class="feed" id="gwt-feed"><div class="empty">等待意识总线数据…</div></div>
+  </div>
+
+  <!-- ── 第三轮 A15：注意力市场面板（99.0 槽位分配与 VCG 支付）── -->
+  <div class="panel" id="attention-panel">
+    <h2>注意力市场 99.0 <span class="badge" id="attention-slots-badge">—</span></h2>
+    <div class="stat-row">
+      <div class="stat"><div class="num" id="st-attn-slots">—</div><div class="label">深看槽位</div></div>
+      <div class="stat"><div class="num" id="st-attn-price">—</div><div class="label">边际价格</div></div>
+      <div class="stat"><div class="num" id="st-attn-revenue">—</div><div class="label">拍卖收入</div></div>
+      <div class="stat"><div class="num" id="st-attn-idle">—</div><div class="label">空置槽</div></div>
+    </div>
+    <table>
+      <thead><tr><th>信息源</th><th>槽位</th><th>累计边际</th><th>VCG 支付</th></tr></thead>
+      <tbody id="attention-table"><tr><td colspan="4" class="empty">等待注意力市场数据…</td></tr></tbody>
+    </table>
+    <div class="klegend" id="attention-insight"></div>
+  </div>
+
+  <!-- ── 第四轮 R4-A15：实时告警面板（回归检测器/安全总督/元认知 KPI 统一视图）── -->
+  <div class="panel wide" id="alarm-panel">
+    <h2>实时告警 <span class="badge" id="alarm-total-badge">未挂载</span></h2>
+    <div class="stat-row">
+      <div class="stat"><div class="num critical" id="st-alarm-critical">—</div><div class="label">紧急(critical)</div></div>
+      <div class="stat"><div class="num warning" id="st-alarm-warning">—</div><div class="label">警告(warning)</div></div>
+      <div class="stat"><div class="num" id="st-alarm-info">—</div><div class="label">提示(info)</div></div>
+      <div class="stat"><div class="num" id="st-alarm-total">—</div><div class="label">告警总数</div></div>
+    </div>
+    <div id="alarm-filters"></div>
+    <div class="feed" id="alarm-feed"><div class="empty">等待告警数据…</div></div>
+    <div class="klegend">严重度：critical 红 / warning 黄 / info 蓝 · 按时间倒序 · 点击来源 chip 按类型过滤（来源分布为全量口径）</div>
   </div>
 </div>
 
@@ -85,6 +182,10 @@
   function fmtTime(ts) {
     const d = new Date(ts);
     return d.toTimeString().slice(0, 8);
+  }
+
+  function esc(v) {
+    return String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   }
 
   function addEvent(ev) {
@@ -107,7 +208,7 @@
   }
 
   function addPlan(ev) {
-    const feed = $('plan-feed');
+    const feed = $('plan-feed-body');
     if (feed.querySelector('.empty')) feed.innerHTML = '';
     const row = document.createElement('div');
     row.className = 'event';
@@ -152,6 +253,216 @@
     ).join('');
   }
 
+  // ── 第三轮 A15：98 内核地图（20 层×编号 + 旗标开关态；/api/kernel-map）──
+  function renderKernelMap(payload) {
+    const body = $('kernel-map-body');
+    $('kernel-flag-badge').textContent = '旗标 ' + payload.enabled + '/' + payload.flagged + ' 开';
+    body.innerHTML = payload.layers.map((layer) =>
+      '<div class="klayer"><div class="khead">第 ' + layer.index + ' 层 · <b>' + esc(layer.name) + '</b>（' + layer.range + '）</div>' +
+      layer.kernels.map((k) => {
+        const cls = !k.hasFlag ? 'kchip resident' : (k.enabled ? 'kchip on' : 'kchip');
+        const mark = !k.hasFlag ? '▪' : (k.enabled ? '●' : '○');
+        const title = !k.hasFlag ? '常驻内核（无旗标）' : (k.flagName + ' = ' + (k.enabled ? 'true' : 'false'));
+        return '<span class="' + cls + '" title="' + esc(title) + '">' + mark + ' ' + k.version + ' ' + esc(k.name) + '</span>';
+      }).join('') +
+      '</div>'
+    ).join('') +
+    '<div class="klegend">' + esc(payload.note) + '（内核总数 ' + payload.total + '）</div>';
+  }
+
+  // ── 第三轮 A15：GWT 意识总线（最近广播流：胜者/优先级/点火；/api/gwt-bus）──
+  function renderGwt(payload) {
+    $('st-gwt-steps').textContent = payload.available ? payload.steps : '—';
+    $('st-gwt-ignite').textContent = payload.available ? (payload.ignitionRatio * 100).toFixed(0) + '%' : '—';
+    $('st-gwt-entropy').textContent = payload.available ? payload.entropy.toFixed(2) : '—';
+    $('st-gwt-winners').textContent = payload.available ? payload.winCounts.length : '—';
+    $('gwt-steps-badge').textContent = payload.available ? payload.steps + ' 步' : '未挂载';
+    const feed = $('gwt-feed');
+    if (!payload.available || payload.broadcasts.length === 0) {
+      feed.innerHTML = '<div class="empty">' + esc(payload.emptyState) + '</div>';
+      return;
+    }
+    feed.innerHTML = payload.broadcasts.slice(0, 50).map((b) =>
+      '<div class="gwt-row">' +
+      '<span class="step">步 ' + b.step + '</span>' +
+      (b.ignited
+        ? '<span class="winner">⚡ ' + esc(b.winner || '?') + '</span><span class="bid">优先级 ' + (b.effectiveBid != null ? b.effectiveBid.toFixed(3) : '—') + '</span>'
+        : '<span class="winner" style="color:var(--muted)">未点火</span>') +
+      '<span class="tags">' + esc((b.tags || []).join(', ')) + '</span>' +
+      '</div>'
+    ).join('');
+  }
+
+  // ── 第三轮 A15：注意力市场（槽位分配 + VCG 支付；/api/attention-market）──
+  function renderAttention(payload) {
+    $('st-attn-slots').textContent = payload.available ? payload.slots : '—';
+    $('st-attn-price').textContent = payload.available ? payload.marginalPrice.toFixed(3) : '—';
+    $('st-attn-revenue').textContent = payload.available ? payload.revenue.toFixed(2) : '—';
+    $('st-attn-idle').textContent = payload.available ? payload.idleSlots : '—';
+    $('attention-slots-badge').textContent = payload.available ? payload.awarded + '/' + payload.slots + ' 槽' : '未挂载';
+    $('attention-insight').textContent = payload.insight || '';
+    const tbody = $('attention-table');
+    if (!payload.available || payload.rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">' + esc(payload.emptyState) + '</td></tr>';
+      return;
+    }
+    const maxPay = Math.max(0.0001, ...payload.rows.map((r) => r.payment));
+    tbody.innerHTML = payload.rows.map((r) =>
+      '<tr><td>' + esc(r.sourceId) + '</td>' +
+      '<td>' + r.slots + '</td>' +
+      '<td>' + r.totalMarginal.toFixed(3) + '</td>' +
+      '<td class="paynum"><div class="bar"><div style="width:' + Math.round((r.payment / maxPay) * 100) + '%"></div></div>' + r.payment.toFixed(3) + '</td></tr>'
+    ).join('');
+  }
+
+  // ── 第四轮 R4-A15：实时告警统一视图（严重度分色 / 时间倒序 / 来源过滤）──
+  let alarmFilter = null;
+
+  function renderAlarms(payload) {
+    $('st-alarm-critical').textContent = payload.available ? payload.counts.critical : '—';
+    $('st-alarm-warning').textContent = payload.available ? payload.counts.warning : '—';
+    $('st-alarm-info').textContent = payload.available ? payload.counts.info : '—';
+    $('st-alarm-total').textContent = payload.available ? payload.total : '—';
+    $('alarm-total-badge').textContent = payload.available ? (payload.shown + '/' + payload.total + ' 条') : '未挂载';
+    const chips = $('alarm-filters');
+    chips.innerHTML = '';
+    if (payload.available) {
+      const all = document.createElement('button');
+      all.className = 'chip' + (payload.filterSource ? '' : ' chip-on');
+      all.textContent = '全部 ' + payload.total;
+      all.onclick = () => { alarmFilter = null; pollAlarms(); };
+      chips.appendChild(all);
+      for (const s of payload.sources) {
+        const b = document.createElement('button');
+        b.className = 'chip' + (payload.filterSource === s.source ? ' chip-on' : '');
+        b.textContent = s.source + ' ' + s.count;
+        b.onclick = () => { alarmFilter = alarmFilter === s.source ? null : s.source; pollAlarms(); };
+        chips.appendChild(b);
+      }
+    }
+    const feed = $('alarm-feed');
+    if (!payload.available || payload.alarms.length === 0) {
+      feed.innerHTML = '<div class="empty">' + esc(payload.emptyState) + '</div>';
+      return;
+    }
+    feed.innerHTML = payload.alarms.map((a) =>
+      '<div class="alarm-row sev-' + a.severity + '">' +
+      '<span class="time">' + fmtTime(a.timestamp) + '</span>' +
+      '<span class="sev">' + a.severity + '</span>' +
+      '<span class="src">' + esc(a.source) + '</span>' +
+      '<span class="alarm-title">' + esc(a.title) + '</span>' +
+      (a.detail ? '<span class="detail">' + esc(a.detail) + '</span>' : '') +
+      '</div>'
+    ).join('');
+  }
+
+  async function pollAlarms() {
+    try {
+      const res = await fetch('/api/alarm-feed' + (alarmFilter ? '?source=' + encodeURIComponent(alarmFilter) : ''));
+      if (res.ok) renderAlarms(await res.json());
+    } catch (e) { /* 端点未就绪时静默 */ }
+  }
+
+  // ── 第四轮 R4-A15：自定义布局持久化（面板显隐/顺序——localStorage 记忆）──
+  // 键与服务端 DASHBOARD_LAYOUT_STORAGE_KEY 同键（dsh-dashboard-layout-v1），
+  // 读写口径与 src/dashboard/index.ts 纯函数（parse/serialize/normalize）一致。
+  const LAYOUT_KEY = 'dsh-dashboard-layout-v1';
+  const PANEL_IDS = ['overview-stats', 'event-stream', 'plan-feed', 'kernel-map', 'gwt-panel', 'attention-panel', 'alarm-panel'];
+
+  function defaultLayout() { return { hidden: [], order: PANEL_IDS.slice() }; }
+
+  function readLayout() {
+    try {
+      const raw = localStorage.getItem(LAYOUT_KEY);
+      if (!raw) return defaultLayout();
+      const p = JSON.parse(raw);
+      if (!p || p.version !== 1 || !Array.isArray(p.hidden) || !Array.isArray(p.order)) return defaultLayout();
+      const hidden = p.hidden.filter((id) => PANEL_IDS.includes(id));
+      const order = p.order.filter((id) => PANEL_IDS.includes(id));
+      for (const id of PANEL_IDS) if (!order.includes(id)) order.push(id);
+      return { hidden, order };
+    } catch (e) {
+      return defaultLayout(); // 坏输入回退默认
+    }
+  }
+
+  function writeLayout(p) {
+    try { localStorage.setItem(LAYOUT_KEY, JSON.stringify({ version: 1, hidden: p.hidden, order: p.order })); } catch (e) { /* 无痕模式等静默 */ }
+  }
+
+  function panelTitle(id) {
+    const el = $(id);
+    const h = el && el.querySelector('h2');
+    return h ? h.textContent.split(/[·（]/)[0].trim() : id;
+  }
+
+  function applyLayout(p) {
+    const grid = $('panel-grid');
+    for (const id of p.order) {
+      const el = $(id);
+      if (!el) continue;
+      grid.appendChild(el);
+      el.style.display = p.hidden.includes(id) ? 'none' : '';
+    }
+    const bar = $('hidden-panels');
+    bar.innerHTML = '';
+    if (p.hidden.length === 0) {
+      bar.innerHTML = '<span>（全部面板可见——↑↓ 调顺序 · ✕ 隐藏）</span>';
+      return;
+    }
+    for (const id of p.hidden) {
+      const b = document.createElement('button');
+      b.className = 'chip';
+      b.textContent = '↺ ' + panelTitle(id);
+      b.title = '恢复显示 ' + id;
+      b.onclick = () => togglePanel(id, true);
+      bar.appendChild(b);
+    }
+  }
+
+  function togglePanel(id, show) {
+    const p = readLayout();
+    const i = p.hidden.indexOf(id);
+    if (show && i >= 0) p.hidden.splice(i, 1);
+    if (!show && i < 0) p.hidden.push(id);
+    writeLayout(p);
+    applyLayout(p);
+  }
+
+  function movePanel(id, delta) {
+    const p = readLayout();
+    const i = p.order.indexOf(id);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= p.order.length) return;
+    const t = p.order[i];
+    p.order[i] = p.order[j];
+    p.order[j] = t;
+    writeLayout(p);
+    applyLayout(p);
+  }
+
+  function initPanelControls() {
+    for (const id of PANEL_IDS) {
+      const el = $(id);
+      const h2 = el && el.querySelector('h2');
+      if (!h2) continue;
+      const ctl = document.createElement('span');
+      ctl.className = 'panel-ctl';
+      const btn = (label, fn, title) => {
+        const b = document.createElement('button');
+        b.className = 'pbtn';
+        b.textContent = label;
+        b.title = title;
+        b.onclick = fn;
+        return b;
+      };
+      ctl.appendChild(btn('↑', () => movePanel(id, -1), '上移'));
+      ctl.appendChild(btn('↓', () => movePanel(id, 1), '下移'));
+      ctl.appendChild(btn('✕', () => togglePanel(id, false), '隐藏面板'));
+      h2.appendChild(ctl);
+    }
+  }
+
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     const ws = new WebSocket(proto + location.host + '/ws');
@@ -171,9 +482,36 @@
     } catch (e) { /* 端点未就绪时静默 */ }
   }
 
+  // 第三轮 A15：定期拉取内核地图 / 意识总线 / 注意力市场（未注入数据源 → 空态）
+  async function pollPanels() {
+    const targets = [
+      ['/api/kernel-map', renderKernelMap],
+      ['/api/gwt-bus', renderGwt],
+      ['/api/attention-market', renderAttention],
+    ];
+    for (const [url, render] of targets) {
+      try {
+        const res = await fetch(url);
+        if (res.ok) render(await res.json());
+      } catch (e) { /* 端点未就绪时静默 */ }
+    }
+  }
+
+  // 第四轮 R4-A15：布局持久化初始化（先注面板控制再套用偏好——首次访问为默认布局）
+  $('layout-reset').onclick = () => {
+    try { localStorage.removeItem(LAYOUT_KEY); } catch (e) { /* 静默 */ }
+    applyLayout(readLayout());
+  };
+  initPanelControls();
+  applyLayout(readLayout());
+
   connect();
   pollStatus();
+  pollPanels();
+  pollAlarms();
   setInterval(pollStatus, 5000);
+  setInterval(pollPanels, 5000);
+  setInterval(pollAlarms, 5000);
 })();
 </script>
 </body>

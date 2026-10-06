@@ -37,6 +37,9 @@ import type { LongTermMemory } from '../memory/long-term-memory.js';
 import type { ISandbox } from '../contracts.js';
 import { BAYES_PRIOR_STRENGTH } from '../core/evidence.js';
 
+// 第二轮创世纪 94.0：仿真校准（沙盒风洞修正——sim-to-real 域差进入部署门禁的数学）
+import { windTunnelAudit, type WindTunnelView } from '../engines-frontier/autonomy25.js';
+
 // ─────────────────────────── 校准数据 ───────────────────────────
 
 /**
@@ -308,6 +311,8 @@ export class PolicySimulator {
  * 2. 冷启动：从未见过的任务类型（压测评分函数的缺省路径）
  * 3. 特征密集：特征标签爆炸（压测规则特征条件匹配）
  * 4. 极简任务：低复杂度短文本（压测过度调度/过度分解）
+ *
+ * （第三轮升级注：固定难度版本保留为兼容口径——难度自适应见 AdversarialCurriculum）
  */
 export function generateAdversarialTasks(knownTaskTypes: string[] = [], rng: () => number = Math.random): SandboxTask[] {
   const types = knownTaskTypes.length > 0 ? knownTaskTypes : ['code-generation'];
@@ -348,6 +353,340 @@ export function generateAdversarialTasks(knownTaskTypes: string[] = [], rng: () 
   ];
 }
 
+// ─────────────────────────── 域偏移任务生成（第四轮升级：跨任务迁移的目标任务构造） ───────────────────────────
+
+/** 域偏移选项（源任务分布 → 目标任务分布的确定性变换） */
+export interface DomainShiftOptions {
+  /** 复杂度整体偏移（−0.5~0.5；正 = 目标任务更复杂；缺省 0.15） */
+  complexityShift?: number;
+  /** 复杂度逐任务抖动半径（缺省 0.05） */
+  complexityJitter?: number;
+  /** 文本长度缩放（缺省 1.2） */
+  lengthScale?: number;
+  /** 特征标签丢弃概率（缺省 0——特征分布保持） */
+  featureDropRate?: number;
+  /** 随机源（测试可注入确定性实现；缺省 Math.random） */
+  rng?: () => number;
+}
+
+/**
+ * 域偏移任务集：源任务分布的整体平移（跨任务迁移实验的目标任务构造器）
+ *
+ * 与对抗任务合成的区别：generateAdversarialTasks 造「极端压力点」，
+ * 本函数造「另一个任务域」——同一批任务类型、同一模型池可用，但
+ * 复杂度/长度分布整体平移：目标任务与源任务既不相同（冷启动有真实
+ * 差距），又相关（源任务学到的结构性基因——如组合逻辑——仍然适用）。
+ *
+ * 这是第四轮「跨任务策略迁移」的实验基础设施：源任务沙盒（原任务集）
+ * → exportTransferDonors 导出优秀策略 → 目标任务沙盒（本函数产物）
+ * → importTransferredPolicy 注入微调起点 → 迁移收益 vs 冷启动对照。
+ * 确定性：注入 rng 后同参数同输出。
+ */
+export function generateDomainShiftedTasks(base: ReadonlyArray<SandboxTask>, options?: DomainShiftOptions): SandboxTask[] {
+  const shift = Math.max(-0.5, Math.min(0.5, options?.complexityShift ?? 0.15));
+  const jitter = Math.max(0, Math.min(0.3, options?.complexityJitter ?? 0.05));
+  const lengthScale = Math.max(0.1, options?.lengthScale ?? 1.2);
+  const dropRate = Math.max(0, Math.min(1, options?.featureDropRate ?? 0));
+  const rng = options?.rng ?? Math.random;
+  return base.map((task, index) => {
+    const jittered = shift + (rng() * 2 - 1) * jitter;
+    const complexity = Math.max(0.02, Math.min(0.99, task.complexity + jittered));
+    return {
+      taskType: task.taskType,
+      complexity: Number(complexity.toFixed(3)),
+      features: dropRate > 0 ? task.features.filter(() => rng() >= dropRate) : [...task.features],
+      length: Math.max(100, Math.round(task.length * lengthScale)),
+      source: task.source,
+      label: `${task.label ?? task.taskType}（域偏移 #${index + 1}：c=${complexity.toFixed(2)}）`,
+    };
+  });
+}
+
+// ─────────────────────────── 对抗课程（第三轮升级：难度自适应 + 边界案例挖掘） ───────────────────────────
+
+/** 历史失败模式探针（边界案例挖掘的采样锚点） */
+export interface FailureModeProbe {
+  taskType: string;
+  /** 失败发生处的复杂度（0~1） */
+  complexity: number;
+  /** 失败现场的典型特征标签（缺省用密集默认集） */
+  features?: string[];
+  /** 该模式累计失败次数（采样权重；缺省 1） */
+  failures?: number;
+}
+
+/** 对抗课程配置 */
+export interface AdversarialCurriculumOptions {
+  /** 已知任务类型池（缺省 ['code-generation']） */
+  knownTaskTypes?: string[];
+  /** 随机源（测试可注入确定性实现） */
+  rng?: () => number;
+  /** 初始难度档（0~1，缺省 0.5） */
+  initialDifficulty?: number;
+  /** 难度调整步长（缺省 0.12） */
+  difficultyStep?: number;
+  /** 连续成功 N 次后加难（掌握门限，缺省 2） */
+  successStreakToHarden?: number;
+  /** 连续失败 N 次后减难（防挫折回退，缺省 2） */
+  failureStreakToSoften?: number;
+  /** 难度下限（缺省 0.05） */
+  minDifficulty?: number;
+  /** 难度上限（缺省 0.98） */
+  maxDifficulty?: number;
+  /** 历史失败模式集（空 = 关闭边界案例挖掘） */
+  failureModes?: FailureModeProbe[];
+  /** 边界案例采样占比（0~1，缺省 0.35） */
+  boundaryMiningRate?: number;
+  /** 边界案例复杂度抖动半径（缺省 0.08） */
+  boundaryJitter?: number;
+}
+
+/** 对抗课程运行报告（学习曲线可观测） */
+export interface AdversarialCurriculumReport {
+  /** 当前难度档（0~1） */
+  difficulty: number;
+  /** 累计加难次数 */
+  hardened: number;
+  /** 累计减难次数 */
+  softened: number;
+  /** 最近窗口成功率（学习前沿读数） */
+  successRate: number;
+  /** 增益窗口累计 Σ 4·p̂·(1−p̂)（59.0 倒 U 增益定律的滚动累计） */
+  frontierGain: number;
+  /** 累计生成任务数 */
+  generated: number;
+  /** 其中边界案例挖掘产物数 */
+  boundaryMined: number;
+  /** 难度轨迹（每代一档，审计学习曲线） */
+  difficultyTrail: number[];
+}
+
+/**
+ * 对抗课程——难度自适应的对抗任务生成器（59.0 课程思想在沙盒侧的自实现）
+ *
+ * 升级前的根本局限：generateAdversarialTasks 的四类压力模板是**固定难度**的
+ * ——对当前策略太易（全过，练了等于没练）或太难（全败，无信号可学）都
+ * 由同一批任务反复产生，选择压力浪费在能力两端。
+ *
+ * 升级机制：
+ * 1. **难度自适应（掌握门限状态机）**：任务复杂度由当前难度档 d 驱动
+ *    （模板复杂度 = 基线 + d × 跨度）；连续 successStreakToHarden 次成功
+ *    → 加难（d += step，任务更难）；连续 failureStreakToSoften 次失败
+ *    → 减难（退一级不是惩罚，是回到有增益的地方）——生成器始终把
+ *    被测策略骑在「能力边缘」（59.0 增益窗口 4p(1−p) 的峰值带）。
+ * 2. **边界案例挖掘**：以 boundaryMiningRate 概率从历史失败模式
+ *    （taskType × complexity × features）附近采样（复杂度 ± jitter），
+ *    失败密集处采样密度加大——回归测试式的对抗压力集中在真实弱点
+ *    附近，而非均匀撒网。
+ * 3. **学习曲线可观测**：difficultyTrail / frontierGain / successRate
+ *    输出完整学习曲线（对照实验：自适应 vs 固定难度的前沿增益差）。
+ *
+ * 兼容：固定难度口径 generateAdversarialTasks 原样保留（零漂移）。
+ */
+export class AdversarialCurriculum {
+  private types: string[];
+  private rng: () => number;
+  private difficulty: number;
+  private readonly step: number;
+  private readonly hardenStreak: number;
+  private readonly softenStreak: number;
+  private readonly minDifficulty: number;
+  private readonly maxDifficulty: number;
+  private readonly failureModes: FailureModeProbe[];
+  private readonly boundaryMiningRate: number;
+  private readonly boundaryJitter: number;
+  private successStreak = 0;
+  private failureStreak = 0;
+  private hardened = 0;
+  private softened = 0;
+  private outcomes: boolean[] = [];
+  private frontierGain = 0;
+  private generated = 0;
+  private boundaryMinedCount = 0;
+  private difficultyTrail: number[] = [];
+
+  constructor(options?: AdversarialCurriculumOptions) {
+    this.types = options?.knownTaskTypes && options.knownTaskTypes.length > 0 ? [...options.knownTaskTypes] : ['code-generation'];
+    this.rng = options?.rng ?? Math.random;
+    this.difficulty = clamp01(options?.initialDifficulty ?? 0.5);
+    this.step = Math.max(0.01, Math.min(0.5, options?.difficultyStep ?? 0.12));
+    this.hardenStreak = Math.max(1, Math.floor(options?.successStreakToHarden ?? 2));
+    this.softenStreak = Math.max(1, Math.floor(options?.failureStreakToSoften ?? 2));
+    this.minDifficulty = Math.max(0.01, Math.min(0.5, options?.minDifficulty ?? 0.05));
+    this.maxDifficulty = Math.max(this.minDifficulty + 0.01, Math.min(1, options?.maxDifficulty ?? 0.98));
+    this.failureModes = (options?.failureModes ?? []).filter((m) => m && typeof m.taskType === 'string' && Number.isFinite(m.complexity));
+    this.boundaryMiningRate = Math.max(0, Math.min(1, options?.boundaryMiningRate ?? 0.35));
+    this.boundaryJitter = Math.max(0.001, Math.min(0.3, options?.boundaryJitter ?? 0.08));
+    this.difficultyTrail.push(this.difficulty);
+  }
+
+  /** 当前难度档（0~1） */
+  getDifficulty(): number {
+    return this.difficulty;
+  }
+
+  /** 历史失败模式（只读快照） */
+  getFailureModes(): FailureModeProbe[] {
+    return this.failureModes.map((m) => ({ ...m, features: m.features ? [...m.features] : undefined }));
+  }
+
+  /**
+   * 生成一批对抗任务（难度自适应 + 边界案例挖掘）
+   *
+   * 模板沿用四类压力模式（极端复杂/冷启动/特征密集/极简），但复杂度由
+   * 当前难度档线性驱动（d=0 → 模板下界，d=1 → 模板上界）；边界案例
+   * 任务按概率替换生成，标签「边界案例挖掘」并在 curriculum 元数据中
+   * 标记，供评估报告区分来源。
+   */
+  generate(count = 4): SandboxTask[] {
+    const total = Math.max(1, Math.floor(count));
+    const tasks: SandboxTask[] = [];
+    for (let i = 0; i < total; i += 1) {
+      const mode = i % 4;
+      // 边界案例挖掘：失败模式非空且掷中概率 → 在历史失败现场附近采样
+      if (this.failureModes.length > 0 && this.rng() < this.boundaryMiningRate) {
+        tasks.push(this.mineBoundaryCase());
+        continue;
+      }
+      const d = this.difficulty;
+      const pickType = this.types[Math.floor(this.rng() * this.types.length)] ?? 'code-generation';
+      if (mode === 0) {
+        tasks.push({
+          taskType: pickType,
+          complexity: round3(0.55 + 0.44 * d),
+          features: ['code', 'review', 'test', 'documentation'],
+          length: Math.round(20_000 + 70_000 * d),
+          source: 'adversarial',
+          label: '极端复杂任务',
+          curriculum: { difficulty: round3(d), boundaryMined: false, mode: 'extreme' },
+        });
+      } else if (mode === 1) {
+        tasks.push({
+          taskType: `unseen-${Math.floor(this.rng() * 1_000_000)}`,
+          complexity: round3(0.3 + 0.5 * d),
+          features: [],
+          length: 2_000,
+          source: 'adversarial',
+          label: '冷启动任务',
+          curriculum: { difficulty: round3(d), boundaryMined: false, mode: 'cold-start' },
+        });
+      } else if (mode === 2) {
+        tasks.push({
+          taskType: pickType,
+          complexity: round3(0.4 + 0.5 * d),
+          features: ['code', 'review', 'test', 'analysis', 'translation', 'documentation'],
+          length: Math.round(10_000 + 30_000 * d),
+          source: 'adversarial',
+          label: '特征密集任务',
+          curriculum: { difficulty: round3(d), boundaryMined: false, mode: 'feature-dense' },
+        });
+      } else {
+        tasks.push({
+          taskType: pickType,
+          complexity: round3(0.05 + 0.15 * d),
+          features: [],
+          length: Math.round(100 + 60 * d),
+          source: 'adversarial',
+          label: '极简任务',
+          curriculum: { difficulty: round3(d), boundaryMined: false, mode: 'minimal' },
+        });
+      }
+    }
+    this.generated += tasks.length;
+    return tasks;
+  }
+
+  /** 边界案例挖掘：在历史失败模式附近采样（失败次数加权 + 复杂度抖动） */
+  private mineBoundaryCase(): SandboxTask {
+    // 失败次数加权选择（失败密集处采样密度大——回归压力集中真实弱点）
+    const weights = this.failureModes.map((m) => Math.max(0.5, m.failures ?? 1));
+    const totalWeight = weights.reduce((s, w) => s + w, 0);
+    let roll = this.rng() * totalWeight;
+    let chosen = this.failureModes[0]!;
+    for (let i = 0; i < this.failureModes.length; i += 1) {
+      roll -= weights[i]!;
+      if (roll <= 0) {
+        chosen = this.failureModes[i]!;
+        break;
+      }
+    }
+    const jitter = (this.rng() * 2 - 1) * this.boundaryJitter;
+    const complexity = Math.max(0.02, Math.min(0.99, chosen.complexity + jitter));
+    this.boundaryMinedCount += 1;
+    return {
+      taskType: chosen.taskType,
+      complexity: round3(complexity),
+      features: chosen.features && chosen.features.length > 0 ? [...chosen.features] : ['code', 'analysis'],
+      length: Math.round(4_000 + complexity * 20_000),
+      source: 'adversarial',
+      label: '边界案例挖掘',
+      curriculum: { difficulty: round3(this.difficulty), boundaryMined: true, mode: 'boundary' },
+    };
+  }
+
+  /**
+   * 回报一条任务执行结果（驱动难度自适应）
+   *
+   * 掌握门限状态机：连续成功 hardenStreak 次 → 加难；连续失败
+   * softenStreak 次 → 减难；难度轨迹入档（学习曲线）。同时滚动
+   * 维护成功率 p̂ 与增益窗口累计 frontierGain += 4·p̂·(1−p̂)
+   * （59.0 增益定律——好的课程应持续把 p̂ 骑在倒 U 峰值带）。
+   */
+  recordOutcome(success: boolean): void {
+    this.outcomes.push(success);
+    if (this.outcomes.length > 8) this.outcomes.shift();
+    if (success) {
+      this.successStreak += 1;
+      this.failureStreak = 0;
+      if (this.successStreak >= this.hardenStreak) {
+        this.difficulty = round3(Math.min(this.maxDifficulty, this.difficulty + this.step));
+        this.successStreak = 0;
+        this.hardened += 1;
+        this.difficultyTrail.push(this.difficulty);
+      }
+    } else {
+      this.failureStreak += 1;
+      this.successStreak = 0;
+      if (this.failureStreak >= this.softenStreak) {
+        this.difficulty = round3(Math.max(this.minDifficulty, this.difficulty - this.step));
+        this.failureStreak = 0;
+        this.softened += 1;
+        this.difficultyTrail.push(this.difficulty);
+      }
+    }
+    const p = this.outcomes.length > 0 ? this.outcomes.filter(Boolean).length / this.outcomes.length : 0.5;
+    this.frontierGain = Number((this.frontierGain + 4 * p * (1 - p)).toFixed(6));
+  }
+
+  /** 批量回报（一批任务的成败序列） */
+  recordOutcomes(successes: ReadonlyArray<boolean>): void {
+    for (const s of successes) this.recordOutcome(s);
+  }
+
+  /** 运行报告（学习曲线：难度轨迹 / 加难减难计数 / 前沿增益） */
+  report(): AdversarialCurriculumReport {
+    const p = this.outcomes.length > 0 ? this.outcomes.filter(Boolean).length / this.outcomes.length : 0;
+    return {
+      difficulty: this.difficulty,
+      hardened: this.hardened,
+      softened: this.softened,
+      successRate: Number(p.toFixed(4)),
+      frontierGain: this.frontierGain,
+      generated: this.generated,
+      boundaryMined: this.boundaryMinedCount,
+      difficultyTrail: [...this.difficultyTrail],
+    };
+  }
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+function round3(v: number): number {
+  return Number(v.toFixed(3));
+}
+
 // ─────────────────────────── 历史任务回放集 ───────────────────────────
 
 /**
@@ -361,7 +700,10 @@ export function extractReplayTasks(memory: LongTermMemory): SandboxTask[] {
   for (const pattern of memory.getAllTaskPatterns()) {
     const [taskType, complexityRaw, featuresRaw] = pattern.fingerprint.split('::');
     if (!taskType) continue;
-    const complexity = Number(complexityRaw ?? 0.5);
+    // 复杂度段缺失/非数字时回退 0.5：NaN 一路传播会让全任务集评估的
+    // reward/gain/LCB 变 NaN（NaN ≥ 0 恒 false）——进化门禁被单个脏指纹静默锁死
+    const parsedComplexity = Number(complexityRaw ?? 0.5);
+    const complexity = Number.isFinite(parsedComplexity) ? parsedComplexity : 0.5;
     const features = (featuresRaw ?? '').split(',').filter(Boolean);
     const records = Math.max(1, pattern.successfulPlans.length + pattern.failureRecords.length);
     // 每个成功/失败记录各产出 1 个回放任务（高频模式权重更高）
@@ -412,6 +754,37 @@ export class Sandbox implements ISandbox {
   /** 替换任务集（进化周期之间可刷新历史回放集） */
   setTaskSet(tasks: SandboxTask[]): void {
     this.tasks = [...tasks];
+  }
+
+  /**
+   * 替换模型快照（进化周期之间可刷新——操作环模型池增删/画像漂移同步进沙盒）。
+   * 此前模型快照仅构造时注入：宿主「每轮进化前刷新任务集/校准/模型快照」的
+   * 素材同步缺少模型侧入口（setTaskSet / setCalibration 均不覆盖模型）。
+   */
+  setModels(models: SimModelStatus[]): void {
+    this.simulator = new PolicySimulator(models, this.config);
+  }
+
+  /**
+   * 94.0：挂载风洞修正透镜（幂等覆盖，挂载即生效——只读咨询口径）。
+   *
+   * 沙盒评估产出的 per-task 质量分序列与操作环真实质量分构成两样本：
+   * mmd2/energyDistance 量化「模拟器此刻失真多少」，密度比 r̂ 把沙盒
+   * 统计换算真实口径（真实口径增益 ≈ 再加权统计）——上线判据的离线通道
+   * 素材（与 88.0 合成「沙盒分数 → 真实口径反事实」的完整换算链）。
+   * ESS/n 低（重度再加权）时换算不可信，报告提示回退保守门禁。纯读数
+   * （不改变 evaluate 路径，零漂移）。
+   */
+  attachSimCalibration(): void {
+    this.simCalibrationEnabled = true;
+  }
+
+  /** 94.0：风洞修正旗标（未挂载零介入） */
+  private simCalibrationEnabled?: boolean;
+
+  /** 94.0：风洞修正读数（未挂载 / 样本不足时 undefined；sim/real = 两样本质量分序列） */
+  windTunnelReport(simScores: ReadonlyArray<number>, realScores: ReadonlyArray<number>): WindTunnelView | undefined {
+    return this.simCalibrationEnabled ? windTunnelAudit(simScores, realScores) : undefined;
   }
 
   /** 刷新校准表（操作环真实结果持续锚定模拟器） */

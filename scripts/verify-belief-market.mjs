@@ -202,7 +202,6 @@ async function runFutarchyCase({ goodSignals, governorBlocked }) {
 {
   // 好信号：市场资助
   const good = await runFutarchyCase({ goodSignals: true, governorBlocked: false });
-  const decisionAsset = good.t1.beliefBets.length === 0 ? undefined : undefined;
   ok(good.t1.futarchyDecisions.length === 0, '提案轮不决议（市场需要时间消化）');
   ok(good.t2.futarchyDecisions.length === 1 && good.t2.futarchyDecisions[0].decision === 'funded', `好信号：隐含概率 ${good.t2.futarchyDecisions[0].impliedProb.toFixed(3)} ≥ 0.55 → 市场资助进化`);
   ok(good.cycleRuns === 1, '被资助的进化真实执行一次');

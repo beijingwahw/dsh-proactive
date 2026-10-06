@@ -1,7 +1,7 @@
 {
   "name": "dsh-proactive",
-  "version": "0.5.0",
-  "description": "自主智能多模型协同调度系统 — 主动感知、自主决策、多模型并行、质量反思自愈、经验沉淀进化",
+  "version": "1.0.0",
+  "description": "自主智能多模型协同调度系统 — 主动感知、自主决策、多模型并行、质量反思自愈、经验沉淀进化、全部模块世界性升级（第三轮）+ 激活与深化（第四轮）+ 全部内核世界性进化（第五轮）",
   "type": "module",
   "main": "dist/index.mjs",
   "types": "dist/index.d.mts",

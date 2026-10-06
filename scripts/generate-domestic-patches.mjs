@@ -177,6 +177,8 @@ ${allModels.join('\n')}
 }
 
 /** 渲染根目录 cordis patch YML（封装全部国产模型 + 运行配置，零密钥） */
+// 契约：模板须与已提交的 cordis.patch.yml 逐字节一致（含 autonomy 全部功能键），
+// 重跑生成器对仓库应是零 diff；新增功能键时同步维护此处模板与 cordis.patch.yml。
 function renderRootPatch() {
   const allModels = [];
   for (const vendor of VENDORS) {
@@ -320,6 +322,139 @@ ${allModels.join('\n')}
             enabled: false
             targetWaitMs: 5000
             defaultScv: 2.0
+          # 26.0 高斯过程：世界模型预测校准升级为 GP 序列修正（带不确定度
+          # 的乘性因子；校准史不足时恒 1）。缺省关闭（零漂移）
+          gaussianProcess:
+            enabled: false
+            maxPoints: 48
+            minPoints: 6
+            sigmaN: 0.15
+          # 27.0 卡尔曼滤波：KPI 异常判定升级为 (level, slope) 趋势滤波 +
+          # NIS χ² 门控（99.7% 不该发生的才算异常）。缺省关闭
+          kalmanFilter:
+            enabled: false
+            qLevel: 0.0001
+            qSlope: 0.000001
+            r: 0.0002
+            gateP: 0.997
+          # 28.0 极值理论：延迟样本 POT/GPD 尾部外推（p99.9 不再是样本
+          # 最大值的运气）。缺省关闭
+          extremeValue:
+            enabled: false
+            targetP99Ms: 30000
+            minSamples: 60
+            thresholdQuantile: 0.9
+            bootstrap: 200
+          # 29.0 MCTS：深思推荐从 beam search 切换 UCT（序贯预算分配）。
+          # 缺省关闭（零漂移——原 beam search）
+          mcts:
+            enabled: false
+            iterations: 600
+            explorationC: 1.41421356
+            discount: 0.95
+          # 30.0 次模优化：好奇心探索预算从新颖度 top-k 升级为加权覆盖
+          # 惰性贪心（CELF，≥ (1−1/e)·OPT）。缺省关闭（零漂移）
+          submodular:
+            enabled: false
+            coverageStrength: 0.7
+          # 31.0 对抗组合：模型评分叠加 Fixed-Share Hedge 有界乘数——
+          # 对手无论怎么出招，对事后最优固定模型的遗憾 ≤ √(2T lnN)。
+          # 缺省关闭（零漂移——乘数恒 1）
+          hedgePortfolio:
+            enabled: false
+            eta: 0.3
+            alpha: 0.05
+          # 32.0 全局指派：同批动态选型节点经匈牙利算法求全局总收益最优
+          # 一对一指派（O(n³) 精确解 + 对偶证书；最优模型不被重复超订）。
+          # 缺省关闭（零漂移——逐节点贪心）
+          optimalAssignment:
+            enabled: false
+            candidateCap: 8
+          # 33.0 随机矩阵：模型失败相关性经 Marchenko–Pastur 噪声带清洗，
+          # 头号特征值显著超带 = 共同因子暴露（热备冗余是统计幻觉）。
+          # 缺省关闭（零漂移）
+          randomMatrix:
+            enabled: false
+            window: 32
+            minModels: 4
+            edgeFactor: 1.1
+            systemicShare: 0.35
+          # 34.0 分布鲁棒：每模型超时 = margin × CVaR_α(延迟史)（α 置信
+          # 水平，0.95 即最坏 5% 尾）——按最坏尾部的期望定价，取代固定
+          # 魔数。依赖 robustStatistics 启用。缺省关闭
+          cvarTimeouts:
+            enabled: false
+            alpha: 0.95
+            margin: 1.5
+            minSamples: 30
+            floorMs: 5000
+            capMs: 300000
+          # 35.0 反馈控制：并发上限从静态口径升级为闭环 LQR（DARE 闭式
+          # 增益 + Lyapunov 稳定证书 + 死区抗抖振）。缺省关闭（零漂移）
+          concurrencyControl:
+            enabled: false
+            target: 0.75
+            plantGain: 0.4
+            r: 4.0
+            deadband: 0.05
+          # 37.0 信息瓶颈：蒸馏门槛从纯水位升维为水位 + 信息量双门
+          # （IB 保留率 I(T;Y)/I(X;Y) 低于下限 → 样本同构，诚实跳过）。
+          # 缺省关闭（零漂移）
+          informationBottleneck:
+            enabled: false
+            beta: 5.0
+            retentionFloor: 0.4
+          # 38.0 非线性动力学：KPI 体质分类（混沌/持续/反持续/随机；
+          # 混沌 → 预测视野 ~1/λ₁ 步）。缺省关闭（零漂移）
+          chaosDiagnostics:
+            enabled: false
+            minPoints: 96
+            lambdaThreshold: 0.05
+            hurstDelta: 0.08
+          # 39.0 谱排序：知识图 PageRank 骨架（related() 联想序升维为
+          # 影响力加权；topInfluential 输出知识骨架）。缺省关闭
+          spectralRanking:
+            enabled: false
+            damping: 0.85
+          # 40.0 首达时间：熔断冷却的概率定价（逆高斯首达模型解出
+          # 「以 target 概率确信已恢复」的最小冷却建议）。缺省关闭
+          firstPassageCooldown:
+            enabled: false
+            targetProb: 0.9
+          # 41.0 排队网络：各模型作为独立 M/M(c) 站（Jackson 乘积形式），
+          # 心跳 2.9 段解瓶颈站（ρ 最大）——哪一站钳制整条链路。
+          # 缺省关闭（零漂移）
+          queueingNetwork:
+            enabled: false
+            rhoThreshold: 0.85
+          # 42.0 谱日历：到达节律从数据里解出（FFT 周期图 + Fisher g
+          # 检验；显著时相位感知季节因子取代小时直方图）。缺省关闭
+          spectralCalendar:
+            enabled: false
+            bins: 128
+          # 43.0 容量前沿：类型需求 × 模型容量的 max-flow / min-cut 诊断
+          # （吞吐上限 + 钳制者归因，纯诊断口径）。缺省关闭
+          capacityFrontier:
+            enabled: false
+          # 44.0 公平预算：探索预算按域加权极大极小注水（任何活跃域的
+          # 相对份额不被压扁）。缺省关闭（零漂移——原 top-k / 次模）
+          fairBudget:
+            enabled: false
+          # 45.0 OCBA：基准瓶颈确认的最优预算分配（P(CS) 渐近最优，
+          # 报告附加 bottleneckFocus）。缺省关闭（零漂移）
+          ocbaAllocator:
+            enabled: false
+            confirmationBudget: 200
+          # 49.0 多尺度：KPI 小波视图（趋势/漂移带/突发分离）。
+          # 纯读数口径。缺省关闭（零漂移）
+          waveletView:
+            enabled: false
+            minPoints: 64
+          # 50.0 潜因子：能力矩阵 ALS 低秩补全（冷启动外推）。
+          # 纯诊断口径。缺省关闭（零漂移）
+          latentFactors:
+            enabled: false
+            rank: 3
         # 宿主融合层：全宿主工具可观测 + 安全治理；关闭后 isActive()=false
         hostFusion:
           enabled: true

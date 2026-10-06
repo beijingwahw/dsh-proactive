@@ -43,6 +43,28 @@
  * 在分布漂移下失效，本内核是保形区间的**绊线**（先见漂移、再谈覆盖）；
  * 与 14.0 的关系：Sinkhorn 给出探索预算跨 niche 的最优搬运方案，
  * 多样性维护从「均匀采样」升维为「最小代价再平衡」。
+ *
+ * R5 进化（第五轮·信息几何世界性进化）：
+ * 5. **精确一维 Wasserstein-p（CDF 双指针合并，O((m+n)log(m+n))）**：
+ *      经验分布（任意样本数 m ≠ n）的最优单调耦合由西北角法则给出——
+ *      按剩余质量逐段配对，W_p = (Σ_k w_k·|a_(i)−b_(j)|ᵖ)^{1/p} 是**精确值**
+ *      （不是分位网格插值近似）；等样本数时退化为逐秩配对。W₁ 是真度量
+ *      （恒等 / 对称 / 三角不等式逐条可验）。
+ * 6. **Sinkhorn 散度（去偏，Feydy et al. 2019）**：
+ *      S_ε(μ,ν) = OT_ε(μ,ν) − ½·OT_ε(μ,μ) − ½·OT_ε(ν,ν)
+ *      带偏的 ⟨C,π_ε⟩ 含 ε 级熵偏置且 S_ε(μ,μ) ≠ 0；去偏后（共享支撑
+ *      + 对称代价）S_ε(μ,μ) = 0、S_ε(μ,ν) > 0（μ≠ν）、ε → 0 收敛到真
+ *      W——点测度（并支撑代价）情形对任意 ε **精确**去偏（−ε 偏置被
+ *      自能项逐位抵消）。一般非对称交叉代价不保证正性（诚实边界）。
+ * 7. **热启动 + 零分配迭代（性能）**：SinkhornConfig.warmStart 接收
+ *      上一解的对偶势 (f,g)；SinkhornResult.potentials 回传当前解——
+ *      序列问题（分布微移、预算微调）从不动点附近起步，迭代数骤降；
+ *      不动点在 Hilbert 度量下唯一（至多差可加常数），冷/热解一致。
+ *      迭代内循环去除每行/列两次 .map 分配（预分配缓冲），浮点序不变。
+ * 8. **边际（KKT）残差报告（数值稳健性）**：SinkhornResult.marginalResidual
+ *      = max|π1−μ|, |πᵀ1−ν|——原 residual 只报对偶势漂移，边际残差是
+ *      约束满足度的直接读数；TransportDriftEvent.at 改用确定性观测
+ *      序号（逻辑时钟——内核宪章：无 Date.now/Math.random，全程可复现）。
  */
 
 // ─────────────────────────── 一维精确 Wasserstein ───────────────────────────
@@ -81,6 +103,47 @@ export function quantileSorted(sorted: readonly number[], q: number): number {
   return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (pos - lo);
 }
 
+/**
+ * 精确一维经验 Wasserstein-p（R5）：CDF 双指针西北角合并，任意样本数。
+ *
+ * 一维最优传输 = 分位数单调配对（comonotone 耦合）；经验分布（等权
+ * 点质量）的该耦合由西北角法则显式给出——按「当前样本剩余质量」逐段
+ * 配对，段质量 w_k 取双方剩余量的较小者：
+ *   W_p = ( Σ_k w_k·|a_(i) − b_(j)|ᵖ )^{1/p}，Σ_k w_k = 1
+ * 这是**精确值**（Villani 2009, Thm 2.18 一维情形），不是分位网格插值
+ * 近似；排序后 O(m+n)，总复杂度 O((m+n)log(m+n))。m = n 时退化为
+ * 逐秩配对 |a_(i) − b_(i)|。W₁ 在实轴分布上满足度量公理（恒等 /
+ * 对称 / 三角），可直接做距离公理的随机检验。
+ */
+export function wassersteinExact1D(samplesA: readonly number[], samplesB: readonly number[], p = 1): number {
+  if (!(p >= 1)) throw new Error('wassersteinExact1D: p 必须 ≥ 1');
+  const a = [...samplesA].filter(Number.isFinite).sort((x, y) => x - y);
+  const b = [...samplesB].filter(Number.isFinite).sort((x, y) => x - y);
+  if (a.length === 0 || b.length === 0) return 0;
+  const n = a.length;
+  const m = b.length;
+  let i = 0;
+  let j = 0;
+  let remA = 1; // 当前 a[i] 的剩余质量（占自身点质量的比分 ∈ (0,1]）
+  let remB = 1;
+  let acc = 0;
+  while (i < n && j < m) {
+    const w = Math.min(remA / n, remB / m);
+    acc += w * Math.pow(Math.abs(a[i]! - b[j]!), p);
+    remA -= w * n;
+    remB -= w * m;
+    if (remA <= 1e-12) {
+      i += 1;
+      remA = 1;
+    }
+    if (remB <= 1e-12) {
+      j += 1;
+      remB = 1;
+    }
+  }
+  return Math.pow(acc, 1 / p);
+}
+
 // ─────────────────────────── Wasserstein 重心 ───────────────────────────
 
 /**
@@ -117,12 +180,14 @@ export function wassersteinBarycenter1D(
 export interface SinkhornConfig {
   /** 熵正则强度 ε（越小越接近精确 OT、收敛越慢；缺省 0.05） */
   epsilon: number;
-  /** 最大迭代数（缺省 200） */
+  /** 最大迭代数（缺省 300） */
   maxIterations: number;
-  /** 收敛容差（边际约束残差；缺省 1e-9） */
+  /** 收敛容差（对偶势漂移 ‖Δf‖∞,‖Δg‖∞；缺省 1e-8） */
   tolerance: number;
   /** 代价矩阵数值范围保护（|C| 上限；缺省 100） */
   maxCost: number;
+  /** 热启动对偶势（R5）：上一解的 (f,g) 作为迭代起点——序列问题迭代数骤降 */
+  warmStart?: { f: readonly number[]; g: readonly number[] };
 }
 
 export const DEFAULT_SINKHORN_CONFIG: SinkhornConfig = {
@@ -144,6 +209,10 @@ export interface SinkhornResult {
   iterations: number;
   /** 边际约束最大残差 */
   residual: number;
+  /** R5：边际约束残差 max(|π1−μ|, |πᵀ1−ν|)——约束满足度的直接读数 */
+  marginalResidual: number;
+  /** R5：收敛对偶势（乘子），可回传 warmStart 复用（热启动） */
+  potentials: { f: number[]; g: number[] };
 }
 
 /**
@@ -153,7 +222,9 @@ export interface SinkhornResult {
  *   f_i ← −ε log Σ_j exp((g_j − C_ij)/ε) a_j
  *   g_j ← −ε log Σ_i exp((f_i − C_ij)/ε) b_i
  * 全程 log-sum-exp，指数下溢免疫；f、g 为对偶势（Kantorovich 最优
- * 对偶变量的熵正则版）。
+ * 对偶变量的熵正则版）。R5：迭代内循环改预分配缓冲（去除每行/列
+ * 两次 .map 临时数组分配，浮点运算次序不变——解逐位一致）；支持
+ * warmStart 热启动（上一解的对偶势作起点；不动点唯一，冷/热收敛同解）。
  */
 export function sinkhorn(
   cost: readonly (readonly number[])[],
@@ -162,17 +233,52 @@ export function sinkhorn(
   config?: Partial<SinkhornConfig>,
 ): SinkhornResult {
   const cfg = { ...DEFAULT_SINKHORN_CONFIG, ...config };
+  const core = solveSinkhornCore(cost, sourceMass, targetMass, cfg);
+  if (core === undefined) {
+    return { plan: [], cost: 0, converged: false, iterations: 0, residual: Infinity, marginalResidual: Infinity, potentials: { f: [], g: [] } };
+  }
+  return {
+    plan: core.plan,
+    cost: round(core.transportCost),
+    converged: core.converged,
+    iterations: core.iterations,
+    residual: round(core.residual),
+    marginalResidual: round(core.marginalResidual),
+    potentials: { f: Array.from(core.f), g: Array.from(core.g) },
+  };
+}
+
+/** Sinkhorn 核心求解（内部共享：sinkhorn / sinkhornDivergence 同一代码路径） */
+interface SinkhornCoreResult {
+  f: Float64Array;
+  g: Float64Array;
+  plan: number[][];
+  transportCost: number;
+  converged: boolean;
+  iterations: number;
+  residual: number;
+  marginalResidual: number;
+  /** ⟨f,a⟩ + ⟨g,b⟩（对偶目标主项，OT_ε 公式用） */
+  potentialDot: number;
+  /** Σ_ij π_ij（收敛时应为 1） */
+  planMass: number;
+  a: number[];
+  b: number[];
+}
+
+function solveSinkhornCore(
+  cost: readonly (readonly number[])[],
+  sourceMass: readonly number[],
+  targetMass: readonly number[],
+  cfg: SinkhornConfig,
+): SinkhornCoreResult | undefined {
   const n = sourceMass.length;
   const m = targetMass.length;
-  if (n === 0 || m === 0 || cost.length !== n) {
-    return { plan: [], cost: 0, converged: false, iterations: 0, residual: Infinity };
-  }
+  if (n === 0 || m === 0 || cost.length !== n) return undefined;
   // 归一化质量（允许输入未归一权重）
   const sumA = sourceMass.reduce((s, x) => s + x, 0);
   const sumB = targetMass.reduce((s, x) => s + x, 0);
-  if (!(sumA > 0) || !(sumB > 0)) {
-    return { plan: [], cost: 0, converged: false, iterations: 0, residual: Infinity };
-  }
+  if (!(sumA > 0) || !(sumB > 0)) return undefined;
   const a = sourceMass.map((x) => x / sumA);
   const b = targetMass.map((x) => x / sumB);
   // 对数域代价（截断保护 + ε 缩放）
@@ -189,23 +295,41 @@ export function sinkhorn(
   const logA = a.map((x) => (x > 0 ? Math.log(x) : -Infinity));
   const logB = b.map((x) => (x > 0 ? Math.log(x) : -Infinity));
 
+  // 热启动：维度匹配则从上一解的对偶势起步（缺省 0——与原口径逐位一致）
   const f = new Float64Array(n);
   const g = new Float64Array(m);
-  const prevF = new Float64Array(n);
-  const prevG = new Float64Array(m);
+  const warm = cfg.warmStart;
+  if (warm && warm.f.length === n && warm.g.length === m) {
+    for (let i = 0; i < n; i += 1) {
+      const v = warm.f[i]!;
+      f[i] = Number.isFinite(v) ? v : 0;
+    }
+    for (let j = 0; j < m; j += 1) {
+      const v = warm.g[j]!;
+      g[j] = Number.isFinite(v) ? v : 0;
+    }
+  }
+  const prevF = new Float64Array(f);
+  const prevG = new Float64Array(g);
   let converged = false;
   let iterations = 0;
   let residual = Infinity;
+  // 预分配行/列缓冲（R5：去除迭代内 .map 分配；元素运算次序与原实现一致）
+  const rowBuf = new Array<number>(m);
+  const colBuf = new Array<number>(n);
 
   for (let iter = 0; iter < cfg.maxIterations; iter += 1) {
     iterations = iter + 1;
     // f 行更新：f_i = −ε log Σ_j exp((g_j − C_ij)/ε + log b_j)
     for (let i = 0; i < n; i += 1) {
-      f[i] = -logSumExp(logC[i].map((lc, j) => g[j] + lc + logB[j]));
+      const row = logC[i]!;
+      for (let j = 0; j < m; j += 1) rowBuf[j] = g[j]! + row[j]! + logB[j]!;
+      f[i] = -logSumExp(rowBuf);
     }
     // g 列更新：g_j = −ε log Σ_i exp((f_i − C_ij)/ε + log a_i)
     for (let j = 0; j < m; j += 1) {
-      g[j] = -logSumExp(logC.map((row, i) => f[i] + row[j]! + logA[i]));
+      for (let i = 0; i < n; i += 1) colBuf[i] = f[i]! + logC[i]![j]! + logA[i]!;
+      g[j] = -logSumExp(colBuf);
     }
     // 收敛判据：对偶势（乘子）漂移（边际在每次更新后恒精确，不具判据力）
     let maxDrift = 0;
@@ -224,16 +348,136 @@ export function sinkhorn(
   //（对偶势口径：u_i = a_i·e^{f_i}，v_j = b_j·e^{g_j}，π = diag(u) K diag(v)）
   const plan: number[][] = [];
   let transportCost = 0;
+  let planMass = 0;
+  let potentialDot = 0;
   for (let i = 0; i < n; i += 1) {
     const row: number[] = [];
     for (let j = 0; j < m; j += 1) {
       const pij = a[i]! * b[j]! * Math.exp(f[i]! + g[j]! + logC[i]![j]!);
       row.push(pij);
       transportCost += pij * Math.abs(cost[i]![j] ?? 0);
+      planMass += pij;
     }
     plan.push(row);
+    potentialDot += a[i]! * f[i]!;
   }
-  return { plan, cost: round(transportCost), converged, iterations, residual: round(residual) };
+  for (let j = 0; j < m; j += 1) potentialDot += b[j]! * g[j]!;
+  // 边际（KKT）残差：max |π1 − a|, |πᵀ1 − b|（R5：约束满足度直接读数）
+  let marginalResidual = 0;
+  for (let i = 0; i < n; i += 1) {
+    let s = 0;
+    for (let j = 0; j < m; j += 1) s += plan[i]![j]!;
+    marginalResidual = Math.max(marginalResidual, Math.abs(s - a[i]!));
+  }
+  for (let j = 0; j < m; j += 1) {
+    let s = 0;
+    for (let i = 0; i < n; i += 1) s += plan[i]![j]!;
+    marginalResidual = Math.max(marginalResidual, Math.abs(s - b[j]!));
+  }
+  return {
+    f,
+    g,
+    plan,
+    transportCost,
+    converged,
+    iterations,
+    residual,
+    marginalResidual,
+    potentialDot,
+    planMass,
+    a,
+    b,
+  };
+}
+
+// ─────────────────────────── Sinkhorn 散度（去偏） ───────────────────────────
+
+/** Sinkhorn 散度（去偏）结果 */
+export interface SinkhornDivergenceResult {
+  /** S_ε(μ,ν) = OT_ε(μ,ν) − ½·OT_ε(μ,μ) − ½·OT_ε(ν,ν)（≥ 0，μ=ν 时 = 0） */
+  divergence: number;
+  /** OT_ε(μ,ν)：熵正则传输主项（带偏） */
+  otEps: number;
+  /** OT_ε(μ,μ)：源侧自能项 */
+  selfTermLeft: number;
+  /** OT_ε(ν,ν)：目标侧自能项 */
+  selfTermRight: number;
+  /** ⟨C, π_ε⟩：带偏的传输代价（≥ 真 W₁——π_ε 对精确 OT 可行） */
+  biasedCost: number;
+  converged: boolean;
+  iterations: number;
+  residual: number;
+  marginalResidual: number;
+}
+
+/**
+ * Sinkhorn 散度（去偏，Feydy–Séjourné–Trouvé–Cuturi 2019）：
+ *
+ *   S_ε(μ,ν) = OT_ε(μ,ν) − ½·OT_ε(μ,μ) − ½·OT_ε(ν,ν)
+ *   OT_ε(μ,ν) = ε·( ⟨f,a⟩ + ⟨g,b⟩ − Σ_ij a_i b_j e^{(f_i+g_j−C_ij)/ε} )
+ *
+ * 性质口径（诚实边界）：
+ * - **共享支撑 + 对称代价**（C 同一核上定义、C = Cᵀ）：S_ε(μ,μ) = 0、
+ *   S_ε(μ,ν) > 0（μ ≠ ν）、S_ε(μ,ν) = S_ε(ν,μ)、ε → 0 收敛精确 W——
+ *   Feydy et al. 2019 的定理设定；点测度（并支撑代价矩阵）情形对任意
+ *   ε **逐位精确**：S_ε = |c|（−ε 熵偏置被两个自能项各回补 ε/2）。
+ * - 一般**非对称交叉代价**（源/目标不同支撑、自能项沿用交叉矩阵）：
+ *   S_ε 可为负（无定理覆盖——去偏只保证自零与 ε→0 极限，不保证正性）；
+ *   调用方按需选择口径，本函数不做掩盖。
+ * 退化输入（空质量 / 非正质量）返回 divergence=NaN、converged=false。
+ */
+export function sinkhornDivergence(
+  cost: readonly (readonly number[])[],
+  sourceMass: readonly number[],
+  targetMass: readonly number[],
+  config?: Partial<SinkhornConfig>,
+): SinkhornDivergenceResult {
+  const cfg = { ...DEFAULT_SINKHORN_CONFIG, ...config };
+  const main = solveSinkhornCore(cost, sourceMass, targetMass, cfg);
+  if (main === undefined) {
+    return {
+      divergence: NaN,
+      otEps: NaN,
+      selfTermLeft: NaN,
+      selfTermRight: NaN,
+      biasedCost: NaN,
+      converged: false,
+      iterations: 0,
+      residual: Infinity,
+      marginalResidual: Infinity,
+    };
+  }
+  // 自能项热启动：主解的对偶势是良好的同量级起点（对称问题收敛更快）
+  const selfLeft = solveSinkhornCore(cost, main.a, main.a, { ...cfg, warmStart: { f: Array.from(main.f), g: Array.from(main.f) } });
+  const selfRight = solveSinkhornCore(cost, main.b, main.b, { ...cfg, warmStart: { f: Array.from(main.g), g: Array.from(main.g) } });
+  if (selfLeft === undefined || selfRight === undefined) {
+    return {
+      divergence: NaN,
+      otEps: NaN,
+      selfTermLeft: NaN,
+      selfTermRight: NaN,
+      biasedCost: NaN,
+      converged: false,
+      iterations: 0,
+      residual: Infinity,
+      marginalResidual: Infinity,
+    };
+  }
+  const otEps = cfg.epsilon * (main.potentialDot - main.planMass);
+  const termL = cfg.epsilon * (selfLeft.potentialDot - selfLeft.planMass);
+  const termR = cfg.epsilon * (selfRight.potentialDot - selfRight.planMass);
+  const divergence = otEps - 0.5 * termL - 0.5 * termR;
+  return {
+    divergence: round(divergence),
+    otEps: round(otEps),
+    selfTermLeft: round(termL),
+    selfTermRight: round(termR),
+    biasedCost: round(main.transportCost),
+    converged: main.converged && selfLeft.converged && selfRight.converged,
+    iterations: main.iterations + selfLeft.iterations + selfRight.iterations,
+    residual: round(Math.max(main.residual, selfLeft.residual, selfRight.residual)),
+    marginalResidual: round(Math.max(main.marginalResidual, selfLeft.marginalResidual, selfRight.marginalResidual)),
+  };
 }
 
 /** log-sum-exp（数值稳定） */
@@ -258,7 +502,7 @@ export interface TransportDriftConfig {
   thresholdQuantile: number;
   /** 最小样本量（双方达标才开始判定；缺省 20） */
   minSamples: number;
-  /** 严重度平滑因子（severity = W₁ / threshold 的自然缩放；缺省 1） */
+  /** 严重度平滑因子（severity = (W₁/threshold − 1) 的缩放；缺省 1） */
   severityScale: number;
 }
 
@@ -278,7 +522,7 @@ export interface TransportDriftView {
   threshold: number;
   /** 是否判定漂移 */
   drifting: boolean;
-  /** 严重度 = w1 / threshold（>1 越多越严重） */
+  /** 严重度 = w1/threshold − 1（阈值处 0，超出越多越大；未漂移恒 0） */
   severity: number;
   /** 方向洞察：均值位移量（窗口均值 − 基准均值） */
   meanShift: number;
@@ -293,6 +537,7 @@ export interface TransportDriftView {
 
 /** 漂移事件（翻转沿审计） */
 export interface TransportDriftEvent {
+  /** 观测序号（确定性逻辑时钟——R5 起替代 Date.now()，内核全程可复现） */
   at: number;
   kind: TransportDriftView['kind'];
   severity: number;
@@ -320,6 +565,8 @@ export class TransportDriftMonitor {
   private readonly historyW1: number[] = [];
   private lastDrifting = false;
   private events: TransportDriftEvent[] = [];
+  /** 观测序号（确定性逻辑时钟：observe 每调用一次 +1） */
+  private tick = 0;
 
   constructor(config?: Partial<TransportDriftConfig>) {
     this.config = { ...DEFAULT_TRANSPORT_DRIFT_CONFIG, ...config };
@@ -327,6 +574,7 @@ export class TransportDriftMonitor {
 
   /** 观测一次被监测量 */
   observe(x: number): TransportDriftView {
+    this.tick += 1;
     const v = Number.isFinite(x) ? x : 0;
     this.buffer.push(v);
     if (this.buffer.length > this.config.referenceSize) this.buffer.shift();
@@ -336,9 +584,9 @@ export class TransportDriftMonitor {
       this.historyW1.push(view.w1);
       if (this.historyW1.length > 200) this.historyW1.shift();
     }
-    // 翻转沿审计
+    // 翻转沿审计（at = 观测序号：确定性逻辑时钟，宪章禁 Date.now）
     if (view.drifting !== this.lastDrifting) {
-      this.events.push({ at: Date.now(), kind: view.kind, severity: view.severity, w1: view.w1, threshold: view.threshold });
+      this.events.push({ at: this.tick, kind: view.kind, severity: view.severity, w1: view.w1, threshold: view.threshold });
       if (this.events.length > 50) this.events.shift();
       this.lastDrifting = view.drifting;
     }

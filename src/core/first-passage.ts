@@ -22,6 +22,18 @@
  *     P(T_recover ≤ cooldown) ≥ target 的最小 cooldown——熔断冷却从
  *     魔数升维为「以 target 概率确信已恢复」的定价。
  *
+ * R5-A10 世界性进化（随机过程第五轮·轴 1 数学）:
+ *   G. 反射原理的**带漂移精化**: P(sup_{s≤t}(μs+σW_s) ≥ a) =
+ *     Φ((μt−a)/(σ√t)) + e^{2μa/σ²}Φ(−(μt+a)/(σ√t))——无漂移情形退化为
+ *     既有 reflectionMaxProb 的 2(1−Φ(·))；μ<0 时 t→∞ 极限收敛到
+ *     终究命中概率 e^{2μa/σ²} < 1（「结构性恶化」第一次有了精确读数，
+ *     而非笼统的 probByHorizon=0）。第二项在 log 域计算（μa/σ² 大时
+ *     e^{2μa/σ²} 溢出而乘积有限——logΦ(−z) 渐近展开消除假溢出）。
+ *   H. 首达分布的**数值反演**: inverseGaussianQuantile(p)——IG-CDF 单调
+ *     → 指数扩张上界 + 二分，往返恒等 CDF(Q(p)) = p（1e-6 级）；
+ *     中位数 < 均值（IG 右偏的分布学读数）；与 firstPassageCooldown 的
+ *     内部搜索互补（任意分位的冷却定价，不止单 target）。
+ *
  * 零漂移: 未挂载时熔断与治理行为与升级前逐位一致。
  */
 
@@ -59,7 +71,15 @@ export function inverseGaussianCdf(t: number, mean: number, shape: number): numb
   if (t <= 0 || !(mean > 0) || !(shape > 0)) return 0;
   const root = Math.sqrt(shape / t);
   const first = normalCdf((root * (t - mean)) / mean);
-  const second = Math.exp((2 * shape) / mean) * normalCdf((-root * (t + mean)) / mean);
+  // 第二项 e^{2λ/μ}·Φ(−z₂)：2λ/μ > 700 时指数溢出为 ∞，与下溢的 Φ(−z₂)
+  // 相乘得 NaN（或整体被钳到 1）——与 driftPassageProb 同款 log 域组装
+  // 防假溢出（数学上该项 ≤ 1，min(0, ·) 钳顶安全；常规区间走直算零漂移）。
+  const z2 = (root * (t + mean)) / mean;
+  const expArg = (2 * shape) / mean;
+  const second =
+    expArg > 700
+      ? Math.exp(Math.min(0, expArg + logNormalTail(z2)))
+      : Math.exp(expArg) * normalCdf(-z2);
   return Math.min(1, Math.max(0, first + second));
 }
 
@@ -72,12 +92,75 @@ export function gamblerRuin(i: number, n: number, p: number): number {
   return (1 - Math.pow(ratio, i)) / (1 - Math.pow(ratio, n));
 }
 
+// ─────────────────── R5-A10 数学进化 G：带漂移的反射原理 ───────────────────
+
+/** log Φ(−z)（z ≥ 0）的大 z 渐近口径: −z²/2 − ln z − ½ln 2π + ln(1−1/z²) */
+function logNormalTail(z: number): number {
+  if (z <= 8) return Math.log(Math.max(normalCdf(-z), Number.MIN_VALUE));
+  return -0.5 * z * z - Math.log(z) - 0.5 * Math.log(2 * Math.PI) + Math.log1p(-1 / (z * z));
+}
+
+/**
+ * 带漂移 Brownian 的首达 CDF（反射原理精化，闭式）:
+ *
+ *   P(sup_{s≤t} (μs + σW_s) ≥ a)
+ *     = Φ((μt−a)/(σ√t)) + e^{2μa/σ²} · Φ(−(μt+a)/(σ√t))
+ *
+ * μ=0 退化为 reflectionMaxProb 的 2(1−Φ(a/(σ√t)))；μ>0 时 t→∞ → 1；
+ * μ<0 时 t→∞ → e^{2μa/σ²}（终究命中概率 < 1——结构性恶化的精确读数）。
+ * 第二项在 log 域组装（e^{2μa/σ²} 与 Φ(−z₂) 的乘积有限但因子可溢出）。
+ */
+export function driftPassageProb(threshold: number, mu: number, sigma: number, horizon: number): number {
+  if (!(threshold > 0) || !(horizon > 0) || !(sigma > 0) || !Number.isFinite(mu)) return 0;
+  const root = sigma * Math.sqrt(horizon);
+  const z1 = (mu * horizon - threshold) / root;
+  const z2 = (mu * horizon + threshold) / root;
+  const first = normalCdf(z1);
+  // log(term2) = 2μa/σ² + logΦ(−z₂)（z₂ > 0 恒成立——a>0 且 t,σ>0）
+  const logSecond = (2 * mu * threshold) / (sigma * sigma) + logNormalTail(z2);
+  const second = Math.exp(Math.min(0, logSecond));
+  return Math.min(1, Math.max(0, first + second));
+}
+
+/** 终究命中概率: μ>0 → 1；μ≤0 → e^{2μa/σ²}（漂移背向阈值时仍可能命中的残余概率） */
+export function hittingProbability(threshold: number, mu: number, sigma: number): number {
+  if (!(threshold > 0) || !(sigma > 0) || !Number.isFinite(mu)) return NaN;
+  if (mu >= 0) return 1;
+  return Math.exp((2 * mu * threshold) / (sigma * sigma));
+}
+
+// ─────────────────── R5-A10 数学进化 H：首达分布的数值反演 ───────────────────
+
+/**
+ * 逆高斯分位数（IG-CDF 的单调数值反演）: 指数扩张定上界（IG 右重尾，
+ * F(hi) ≥ p 的 hi 可到 mean 的许多倍）+ 200 步二分到机器精度。
+ * 往返恒等验证锚点: inverseGaussianCdf(Q(p)) = p（±1e-6）。
+ */
+export function inverseGaussianQuantile(p: number, mean: number, shape: number): number {
+  if (!(p > 0) || p >= 1) {
+    throw new Error(`inverseGaussianQuantile: p ∈ (0,1) 必需（得到 ${p}）`);
+  }
+  if (!(mean > 0) || !(shape > 0) || !Number.isFinite(mean) || !Number.isFinite(shape)) {
+    throw new Error(`inverseGaussianQuantile: mean>0, shape>0 必需（得到 ${mean}, ${shape}）`);
+  }
+  let lo = 1e-12 * mean;
+  let hi = mean;
+  for (let k = 0; k < 1200 && inverseGaussianCdf(hi, mean, shape) < p; k += 1) hi *= 2;
+  if (inverseGaussianCdf(hi, mean, shape) < p) return hi; // 极重尾诚实返回上界
+  for (let k = 0; k < 200; k += 1) {
+    const mid = Math.sqrt(lo * hi); // 几何中点（IG 的 t 跨多个量级）
+    if (inverseGaussianCdf(mid, mean, shape) >= p) hi = mid;
+    else lo = mid;
+  }
+  return Math.sqrt(lo * hi);
+}
+
 export interface FirstPassageEstimate {
   /** 漂移估计 μ̂（每单位时间步长；≤ 0 = 结构性恶化，恢复不保证） */
   mu: number;
   /** 波动估计 σ̂ */
   sigma: number;
-  /** 首达概率 P(T ≤ horizon)（μ̂ > 0 时逆高斯 CDF；≤ 0 时 1 − 破产反转口径） */
+  /** 首达概率 P(T ≤ horizon)（μ̂ > 0 时逆高斯 CDF；μ̂ ≤ 0 时诚实报 0——结构性恶化不承诺有限期恢复） */
   probByHorizon: number;
   /** 期望恢复时间 a/μ̂（μ̂ > 0；否则 undefined） */
   expectedTime: number | undefined;

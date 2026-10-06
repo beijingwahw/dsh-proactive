@@ -28,6 +28,21 @@
  *
  * 审计性：全部干预记录（谁、何时、do 了什么、结果）保留链式日志，
  * 因果结论可追溯到每一次实验 —— 因果断言可被审计、可被证伪。
+ *
+ * R5 · 6.0 进化（第五轮·世界性进化）：
+ * A. 反事实边界（数学轴）—— naturalEffects：自然直接/间接效应分解。
+ *    6.0 之前的 mediation 只做「链上 ATE 乘积」的线性近似；本版本引入
+ *    前门调整重构 E[Y|do(X=x)] = Σ_m P(M=m|do(X=x))·E[Y|do(M=m)]，
+ *    在「M 完全中介 + 无 X·M 交互」两条显式假设下给出自然间接效应
+ *    NIE = ΔP(M|do(X))·ΔE(Y|do(M)) 与自然直接效应 NDE = 总效应 − NIE
+ *    （Pearl 因果阶梯第三层口径），并以「前门重构 vs 直测 ATE」的
+ *    背离作为未测中介/残余混杂的指纹（consistencyGap）。
+ * B. 效应缓存（性能轴）—— effect() 的逐边记忆化：snapshot/rankCauses/
+ *    detectConfounding/suggestExperiments 都反复调用 effect()，同一
+ *    (图代, now) 下第二次起直接命中缓存（返回防御性拷贝），snapshot
+ *    的 effect 计算量减半；缓存严格失效于一切写路径（observe/
+ *    intervene/deserialize），输出与无缓存逐位一致（等价性由
+ *    verify-r5-causal.mjs 锚定）。
  */
 
 import { decayFactor, wilsonLowerBound, wilsonUpperBound, BAYES_PRIOR_STRENGTH, DECAY_HALF_LIFE_DAYS } from './evidence.js';
@@ -138,6 +153,48 @@ export interface CausalExperiment {
   uncertainty: number;
 }
 
+// ─────────────────────────── R5 · 6.0 自然效应（反事实边界） ───────────────────────────
+
+/**
+ * 自然效应分解结果（X → M → Y 三段边的一次反事实边界问答）。
+ *
+ * 数学（前门调整 + 自然效应，Pearl 2001 mediation 口径的二值化简）：
+ * - 前门重构：E[Y|do(X=x)] = Σ_m P(M=m|do(X=x))·E[Y|do(M=m)]
+ *   （M 完全中介 + 两段干预各自无混杂时精确成立——do-证据直接支持两因子）
+ * - 自然间接效应（加性可分离假设下）：NIE = ΔP(M|do(X))·ΔE(Y|do(M))
+ * - 自然直接效应：NDE = 总效应 − NIE（绕过中介的直门路径）
+ * - 一致性指纹：|直测 ATE − 前门重构总效应| = 未测中介/残余混杂的证据
+ */
+export interface NaturalEffect {
+  from: string;
+  mediator: string;
+  to: string;
+  /** 前门重构 E[Y|do(X=1)] */
+  frontDoorP1: number;
+  /** 前门重构 E[Y|do(X=0)] */
+  frontDoorP0: number;
+  /** 前门口径总效应 = frontDoorP1 − frontDoorP0 */
+  frontDoorTotal: number;
+  /** 自然间接效应 NIE（经 M 传导的部分） */
+  nie: number;
+  /** 自然直接效应 NDE = 直测总效应 − NIE */
+  nde: number;
+  /** X→Y 直测 ATE（对照口径） */
+  directAte: number;
+  /** 前门重构与直测 ATE 的背离（未测中介/残余混杂的指纹） */
+  consistencyGap: number;
+  /** 三段边干预证据是否齐全（可识别门槛：每段 ≥ 3 干预样本） */
+  identifiable: boolean;
+  /** NIE 区间下界（两段效应区间的乘积传播，截到 [−1,1]） */
+  nieLower: number;
+  /** NIE 区间上界 */
+  nieUpper: number;
+  /** 识别假设（诚实边界声明——违反任一条则点估计失效） */
+  assumptions: string[];
+  /** 机制解读 */
+  interpretation: string;
+}
+
 // ─────────────────────────── 配置 ───────────────────────────
 
 /** 因果内核配置 */
@@ -179,6 +236,12 @@ export class CausalKernel {
   /** 干预审计链（seq 单调递增） */
   private interventionLog: InterventionRecord[] = [];
   private seq = 0;
+  /** R5·6.0：图代计数——一切写路径递增，effect 缓存据此失效 */
+  private generation = 0;
+  /** R5·6.0：effect() 记忆化（键 = 边键；仅在同一 (generation, now) 下有效） */
+  private effectCache = new Map<string, CausalEffect>();
+  private effectCacheGeneration = -1;
+  private effectCacheNow: number | undefined;
 
   constructor(config?: Partial<CausalKernelConfig>) {
     this.config = { ...DEFAULT_CAUSAL_CONFIG, ...config };
@@ -189,6 +252,11 @@ export class CausalKernel {
   /** 登记因果节点（幂等；重复登记仅更新元信息） */
   addNode(node: CausalNode): void {
     this.nodeMap.set(node.id, { ...node, label: node.label ?? node.id });
+  }
+
+  /** R5·6.0：图代推进（一切证据写路径调用——effect 缓存随之整体失效） */
+  private touch(): void {
+    this.generation += 1;
   }
 
   /** 便捷登记：模型动作节点（from 形如 `use:model-x`） */
@@ -230,6 +298,7 @@ export class CausalKernel {
   observe(from: string, to: string, x: boolean, y: boolean, now = Date.now()): void {
     const edge = this.ensureNodes(from, to, 'action', 'kpi');
     this.decayEdge(edge, now);
+    this.touch();
     if (x && y) edge.evidence.obsBoth += 1;
     else if (x) edge.evidence.obsXOnly += 1;
     else if (y) edge.evidence.obsYOnly += 1;
@@ -257,6 +326,7 @@ export class CausalKernel {
   ): InterventionRecord {
     const edge = this.ensureNodes(from, to, 'action', 'kpi');
     this.decayEdge(edge, now);
+    this.touch();
     if (setTo) {
       if (observedY) edge.evidence.doXSuccess += 1;
       else edge.evidence.doXFailure += 1;
@@ -291,11 +361,29 @@ export class CausalKernel {
    * 口径优先级：
    * 1. 双臂干预证据齐全 → 纯干预 ATE（黄金口径）
    * 2. 仅处理臂 → 对照臂回退观测基线 P(Y=1|X=0)，混杂折扣已含在 confidence
-   * 3. 无任何干预 → ATE = 观测关联 × 0.5（结构性折扣：未经实验的关联
-   *    只值一半信任），confidence 上限 0.4（永不 established）
+   * 3. 无任何干预 → 两臂各自回退观测 Beta 后验，ATE 仍统一为 pDo − pDoNot
+   *    （点估计不混入折扣），未经实验由 confidence 上限 0.4 / 宽区间 /
+   *    永不 established 表达（结构性折扣在置信度，不在 ATE）
    */
   effect(from: string, to: string, now = Date.now()): CausalEffect {
     const key = `${from}→${to}`;
+    // R5·6.0：同一 (图代, now) 下的重复问答直接命中缓存（返回防御性拷贝，
+    // 调用方改写不污染缓存）。等价性：缓存值即首次计算的同一结果。
+    if (this.effectCacheGeneration === this.generation && this.effectCacheNow === now) {
+      const hit = this.effectCache.get(key);
+      if (hit !== undefined) return { ...hit };
+    } else {
+      this.effectCache.clear();
+      this.effectCacheGeneration = this.generation;
+      this.effectCacheNow = now;
+    }
+    const result = this.computeEffect(from, to, key, now);
+    this.effectCache.set(key, result);
+    return { ...result };
+  }
+
+  /** effect 的无缓存本体（R5·6.0 起由 effect() 记忆化包裹） */
+  private computeEffect(from: string, to: string, key: string, now: number): CausalEffect {
     const edge = this.edgeMap.get(key);
     if (!edge) {
       return {
@@ -509,6 +597,85 @@ export class CausalKernel {
   }
 
   /**
+   * R5 · 6.0：自然效应分解（反事实边界）—— X 对 Y 的效应中，
+   * 「经 M 传导的部分」（自然间接效应 NIE）与「绕过 M 的部分」
+   * （自然直接效应 NDE）各自多大。
+   *
+   * 与 mediation（线性链近似）的分水岭：mediation 把三段 ATE 乘起来
+   * 当作间接效应；naturalEffects 用前门调整重构干预计量
+   *   E[Y|do(X=x)] = Σ_m P(M=m|do(X=x))·E[Y|do(M=m)]
+   * （M 完全中介时精确成立——两个因子都直接来自 do-证据，不经任何
+   * 观测回退），并在「无 X·M 交互」假设下给出与自然效应一致的
+   *   NIE = [P(M=1|do(X=1)) − P(M=1|do(X=0))]·[E(Y|do(M=1)) − E(Y|do(M=0))]
+   * 前门重构总效应与直测 ATE 的背离（consistencyGap）= 存在未测中介
+   * 或残余混杂的指纹——不可识别时点估计失效，方法只诚实报告区间与假设。
+   *
+   * 识别门槛：三段边各有 ≥ 3 个干预样本（identifiable=false 时输出仍给
+   * 出区间口径，但 interpretation 明确声明证据不足）。
+   */
+  naturalEffects(from: string, mediator: string, to: string, now = Date.now()): NaturalEffect {
+    const xm = this.effect(from, mediator, now);
+    const my = this.effect(mediator, to, now);
+    const xy = this.effect(from, to, now);
+    const identifiable =
+      xm.interventionalSamples >= 3 && my.interventionalSamples >= 3 && xy.interventionalSamples >= 3;
+
+    // P(M=1|do(X=x))：X→M 两臂干预后验
+    const pM1 = xm.pDo;
+    const pM0 = xm.pDoNot;
+    // E[Y|do(M=m)]：M→Y 两臂干预后验
+    const eY1 = my.pDo;
+    const eY0 = my.pDoNot;
+
+    // 前门重构：M 完全中介 + 两段干预无混杂时精确成立
+    const frontDoorP1 = pM1 * eY1 + (1 - pM1) * eY0;
+    const frontDoorP0 = pM0 * eY1 + (1 - pM0) * eY0;
+    const frontDoorTotal = frontDoorP1 - frontDoorP0;
+
+    // 自然间接效应（加性可分离假设下与自然效应一致）
+    const nie = (pM1 - pM0) * (eY1 - eY0);
+    // 总效应以直测 X→Y ATE 为准；NDE = 总效应 − NIE（恒等式严格成立）
+    const nde = xy.ate - nie;
+    const consistencyGap = Math.abs(xy.ate - frontDoorTotal);
+
+    // NIE 区间：两段效应区间（ATE Wilson 口径 lower/upper）的乘积传播
+    const candidates = [xm.lower * my.lower, xm.lower * my.upper, xm.upper * my.lower, xm.upper * my.upper];
+    const nieLower = Math.max(-1, Math.min(...candidates));
+    const nieUpper = Math.min(1, Math.max(...candidates));
+
+    const assumptions = [
+      `${mediator} 是 ${from}→${to} 的完全中介（前门重构成立的前提）`,
+      `无 ${from}·${mediator} 交互（加性可分离——NIE/NDE 与自然效应一致的门槛）`,
+      `${mediator}→${to} 无未测混杂（该段干预证据无混杂残余）`,
+    ];
+    let interpretation: string;
+    if (!identifiable) {
+      interpretation = `三段边干预证据不足（X→M ${xm.interventionalSamples}、M→Y ${my.interventionalSamples}、X→Y ${xy.interventionalSamples} 个干预样本），自然效应分解暂不可靠——先补 do-实验`;
+    } else if (consistencyGap > 0.2) {
+      interpretation = `前门重构总效应 ${round(frontDoorTotal)} 与直测 ATE ${xy.ate} 背离 ${round(consistencyGap)}——存在未测中介或残余混杂，分解假设存疑`;
+    } else {
+      interpretation = `${from} 对 ${to} 的总效应 ${xy.ate}：自然间接（经 ${mediator}）${round(nie)} + 自然直接 ${round(nde)}——前门一致性 ${round(consistencyGap)} < 0.2，分解可信`;
+    }
+    return {
+      from,
+      mediator,
+      to,
+      frontDoorP1: round(frontDoorP1),
+      frontDoorP0: round(frontDoorP0),
+      frontDoorTotal: round(frontDoorTotal),
+      nie: round(nie),
+      nde: round(nde),
+      directAte: xy.ate,
+      consistencyGap: round(consistencyGap),
+      identifiable,
+      nieLower: round(nieLower),
+      nieUpper: round(nieUpper),
+      assumptions,
+      interpretation,
+    };
+  }
+
+  /**
    * 反事实查询：给定实际发生了 actionActual 且结果为 actualY，
    * 「若当时做 actionAlternative」成功概率几何。
    *
@@ -656,6 +823,7 @@ export class CausalKernel {
     for (const e of data.edges) this.edgeMap.set(`${e.from}→${e.to}`, e);
     this.interventionLog = [...data.interventions];
     this.seq = data.seq ?? this.interventionLog.length;
+    this.touch(); // R5·6.0：整图替换 = 图代推进（缓存失效）
   }
 
   // ── 内部 ──

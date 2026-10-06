@@ -17,6 +17,21 @@
  * 预算记账: PrivacyAccountant 维护总 ε 预算, 每次发布折半分账(几何分配, 永不超支),
  * 超预算返回 undefined 并标记 exhausted —— 差分隐私的保证以预算纪律为前提。
  *
+ * R5 第五轮进化（内核世界性进化·统计推断组）：
+ * - 数学：exponentialMechanism —— **指数机制**（McSherry–Talwar 2007，
+ *   (ε,0)-DP 的通用机制）：对效用 u_i 依 P(i) ∝ exp(ε·u_i/(2Δu)) 采样，
+ *   效用最大化与隐私同时成立——「选最优租户/最优策略」这类**非数值
+ *   查询」第一次有 DP 机制（Laplace/Gaussian 只会加噪破坏离散选择）。
+ * - 数学：gaussianRdpEpsilon / rdpToEpsilonOptimal —— RDP→(ε,δ) 的
+ *   **最优阶转换**：单阶记账是 RDP(α_ord)+ln(1/δ)/(α_ord−1)，对高斯
+ *   RDP(α)=αΔ²/(2σ²) 关于 α 凸，最优阶有闭式 α* = 1+σ√(2ln(1/δ))/Δ
+ *   （对目标函数求导置零），夹到 [2,∞)。任意参数下 optimal ≤ 固定阶 8
+ *   ——同一噪声 σ 的**精确隐私账单**比固定阶更省 ε（或同 ε 下允许更
+ *   小噪声）：rdpToEpsilonOptimal 对任意 RDP 阶集合取逐阶最小。
+ * - 数值稳健：指数机制全程 log 域（log-sum-exp + 归一化游走采样）：
+ *   ε·u/(2Δ) ~ 5000 时线性 softmax 直接 exp 溢出为 NaN，log 域精确
+ *   给出「最优项概率 ≈ 1」的合法分布。
+ *
  * 零漂移: 未启用时一切导出路径输出与升级前逐位一致。
  */
 
@@ -86,6 +101,124 @@ export function dpHistogram(counts: number[], epsilon: number, rng: Rng = Math.r
 /** RDP(α_ord) 转 (ε, δ): 单阶记账的解析转换 */
 export function rdpToEpsilon(rdpAtOrder: number, order: number, delta: number): number {
   return rdpAtOrder + Math.log(1 / Math.max(delta, 1e-15)) / (order - 1);
+}
+
+// ───────────────────── R5：最优阶 RDP→(ε,δ) 转换（精确化记账） ─────────────────────
+
+/** RDP 阶-值条目（某机制在给定阶下的 Rényi-DP 值） */
+export interface RdpOrderEntry {
+  /** Rényi 散度阶 α（须 > 1） */
+  order: number;
+  /** 该阶下的 RDP 值（α 阶 Rényi 散度） */
+  rdp: number;
+}
+
+/**
+ * 最优阶 RDP→(ε,δ) 转换：ε = min_α [RDP(α) + ln(1/δ)/(α−1)]。
+ *
+ * 每个阶都给出一个合法的 (ε(α), δ) 转换（标准 RDP→DP 引理），取逐阶
+ * 最小即该机制在 δ 下的**精确**账单——多阶记账（如 Gaussian 机制沿
+ * α 网格评估）不用猜哪个阶好，直接取最优。
+ */
+export function rdpToEpsilonOptimal(orders: ReadonlyArray<RdpOrderEntry>, delta: number): number {
+  const lnInvDelta = Math.log(1 / Math.max(delta, 1e-15));
+  let best = Number.POSITIVE_INFINITY;
+  for (const entry of orders) {
+    if (!(entry.order > 1) || !Number.isFinite(entry.rdp)) continue;
+    const candidate = entry.rdp + lnInvDelta / (entry.order - 1);
+    if (candidate < best) best = candidate;
+  }
+  return best;
+}
+
+/** 高斯机制最优阶转换读取视图 */
+export interface GaussianRdpEpsilonResult {
+  /** 精确 (ε, δ) 账单（最优阶） */
+  epsilon: number;
+  /** 闭式最优阶 α* = 1 + σ√(2·ln(1/δ))/Δ，夹到 [2, ∞) */
+  optimalOrder: number;
+  /** 固定阶 8 的旧账单（对照口径） */
+  fixedOrderEpsilon: number;
+  /** 节省量 fixed − optimal（≥ 0，任意参数下非负） */
+  saving: number;
+}
+
+/**
+ * 高斯机制的精确 RDP 账单（闭式最优阶）。
+ *
+ * 高斯 RDP：R(α) = α·Δ₂²/(2σ²)。转换目标 f(α) = R(α) + ln(1/δ)/(α−1)
+ * 关于 α 严格凸，f′(α) = Δ₂²/(2σ²) − ln(1/δ)/(α−1)² = 0 给出闭式
+ *   α* = 1 + σ·√(2·ln(1/δ))/Δ₂
+ * 夹到 [2, ∞)（RDP 引理要求 α > 1；工程取 α ≥ 2 与 RDP_ORDER=8 口径
+ * 可比）。任意 (σ, Δ, δ) 下 epsilon ≤ fixedOrderEpsilon——固定阶 8
+ * 只在 α* 恰为 8 时最优，其余情形精确账单严格更省（同噪声更小 ε /
+ * 同 ε 预算更小 σ 更高效用）。
+ */
+export function gaussianRdpEpsilon(sigma: number, l2Sensitivity: number, delta: number): GaussianRdpEpsilonResult {
+  const s = Math.max(1e-12, Math.abs(sigma));
+  const d = Math.max(1e-12, Math.abs(l2Sensitivity));
+  const lnInvDelta = Math.log(1 / Math.max(delta, 1e-15));
+  const alphaStar = Math.max(2, 1 + (s * Math.sqrt(2 * lnInvDelta)) / d);
+  const rdpAt = (alpha: number): number => (alpha * d * d) / (2 * s * s);
+  const epsilon = rdpAt(alphaStar) + lnInvDelta / (alphaStar - 1);
+  const fixed = rdpToEpsilon(rdpAt(RDP_ORDER), RDP_ORDER, Math.max(delta, 1e-15));
+  return { epsilon, optimalOrder: alphaStar, fixedOrderEpsilon: fixed, saving: fixed - epsilon };
+}
+
+// ───────────────────── R5：指数机制（非数值查询的 DP 选择） ─────────────────────
+
+/**
+ * 指数机制（McSherry–Talwar 2007）：P(选择 i) ∝ exp(ε·u_i/(2Δu))。
+ *
+ * 对任意效用函数 u 与敏感度 Δu（相邻数据集下 max|u_i − u′_i|），
+ * 采样输出满足 (ε, 0)-DP——效用越大概率越大，隐私账单精确 ε。
+ * 敏感度 ≤ 0（效用不依赖数据）→ 均匀采样（0-DP）。全程 log 域：
+ *   log w_i = ε·u_i/(2Δu)，归一化经 log-sum-exp，
+ *   逆 CDF 游走采样（单次 rng 调用，给定 rng 流完全确定）。
+ * NaN/±∞ 效用：−∞ 视为永不选中（除非全部 −∞ → 均匀），NaN 视为 0 效用。
+ */
+export function exponentialMechanism(
+  utilities: readonly number[],
+  epsilon: number,
+  sensitivity: number,
+  rng: Rng = Math.random,
+): number {
+  const m = utilities.length;
+  if (m === 0) return -1;
+  if (m === 1) return 0;
+  const eps = Math.max(0, epsilon);
+  if (eps === 0 || sensitivity <= 0 || !Number.isFinite(sensitivity)) {
+    // 零隐私预算或数据无关效用：均匀采样（合法且信息最省）
+    return Math.min(m - 1, Math.floor(Math.max(1e-12, Math.min(1 - 1e-12, rng())) * m));
+  }
+  const scale = eps / (2 * sensitivity);
+  let maxLog = Number.NEGATIVE_INFINITY;
+  const logWeights: number[] = new Array(m);
+  for (let i = 0; i < m; i += 1) {
+    const u = utilities[i]!;
+    // NaN 视为 0 效用（文档契约）；±∞ 分别映射为 ±∞ 对数权重
+    const lw = Number.isFinite(u) ? u * scale : Number.isNaN(u) ? 0 : u > 0 ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+    logWeights[i] = lw;
+    if (lw > maxLog) maxLog = lw;
+  }
+  if (maxLog === Number.NEGATIVE_INFINITY) {
+    return Math.min(m - 1, Math.floor(Math.max(1e-12, Math.min(1 - 1e-12, rng())) * m)); // 全 −∞：均匀
+  }
+  if (maxLog === Number.POSITIVE_INFINITY) {
+    // 存在 +∞ 权重：退化为其中的等权选择（log-sum-exp 的 m−max→+∞ 段）
+    const winners: number[] = [];
+    for (let i = 0; i < m; i += 1) if (logWeights[i] === Number.POSITIVE_INFINITY) winners.push(i);
+    return winners[Math.min(winners.length - 1, Math.floor(Math.max(1e-12, Math.min(1 - 1e-12, rng())) * winners.length))]!;
+  }
+  // log-sum-exp 归一化 + 逆 CDF 游走（log 域，exp(5000) 级不溢出）
+  const lse = maxLog + Math.log(logWeights.reduce((s, lw) => s + Math.exp(lw - maxLog), 0));
+  const r = Math.max(1e-12, Math.min(1 - 1e-12, rng()));
+  let cumulative = 0;
+  for (let i = 0; i < m; i += 1) {
+    cumulative += Math.exp(logWeights[i]! - lse);
+    if (cumulative >= r) return i;
+  }
+  return m - 1; // 浮点游走兜底（r < 1）
 }
 
 /**

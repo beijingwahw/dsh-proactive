@@ -90,7 +90,6 @@ section('41.0 排队网络：串联 M/M/1 模拟对照 + Jackson 独立性');
   let s2Busy = 0;
   const samples = [];
   const sojourns = [];
-  const DEPART_TAG = 'd1';
   for (let ev = 0; ev < 120_000; ev += 1) {
     const options = [
       { t: nextArrival, kind: 'arr' },
@@ -112,14 +111,11 @@ section('41.0 排队网络：串联 M/M/1 模拟对照 + Jackson 独立性');
       s2Busy = 0;
     }
     if (s1Busy === 0 && q1.length > 0) {
-      const head = q1[0];
       s1Busy = t + exp(1);
-      void head;
     }
     if (s2Busy === 0 && q2.length > 0) s2Busy = t + exp(2);
     if (ev % 97 === 0 && ev > 20_000) samples.push([q1.length, q2.length]);
   }
-  void DEPART_TAG;
   const audit = jacksonIndependenceAudit(samples);
   ok(Math.abs(audit.correlation) < 0.15,
     `Jackson 边际独立性：稳态队长相关性 ≈ 0（r=${audit.correlation.toFixed(3)}，n=${audit.samples}）`);

@@ -20,9 +20,34 @@
  * 交由元认知控制器保守执行（本引擎只诊断不开药方剂量）。
  *
  * 报告历史持久化（JSON）：重启后恢复，趋势分析与效果判定跨重启连续。
+ *
+ * ── 3.0 世界性升级：可追溯的自我修改 + 诚实的自我评估 ──
+ * 1. 自我变更日志（applySelfChange）：一切对自我模型自身的修改原子入账
+ *    （改动前后 + 理由 + 触发者）；rollbackSelfChanges 按日志逆向恢复，
+ *    snapshotSelf / restoreSelf 整体快照回滚（含趋势基线与校准记忆）。
+ * 2. 自我评估校准（recordSelfAssessment）：「能力自评 vs 实际表现」配对
+ *    流的滚动偏差追踪（窗口均值 + EMA 双口径），自评过高/过低的翻转沿
+ *    告警；calibrated = claimed − biasEma 给出校正后的诚实自评。
+ * 3. 注入时钟（config.clock）：报告/日志时间戳可注入（确定性验证口径）。
+ *
+ * ── 4.0 世界性升级：自我效能预测（per-task-type Beta 后验 + 校准追踪） ──
+ * recordSelfEfficacy / predictSuccess / selfEfficacyView：按任务类型维护
+ * 成功率的 Beta 后验（先验 + 历史成败），预测携带 Wilson 90% 区间而非
+ * 点值；每对「预测 vs 结果」流入校准追踪（偏差 EMA + Brier EMA）——
+ * 预测过高（把「预计能成」当「真能成」）与预测质量差（Brier 高）都
+ * 可观测。心智报告新增 selfEfficacy 字段（有样本才输出，缺省零漂移）。
  */
 
 import fs from 'node:fs';
+
+// 第二轮创世纪 100.0：自我边界（「哪些变化是我造成的」的因果归因边界 +
+// 身份断点监控）
+import {
+  agencyAttribution,
+  identityContinuityScore,
+  type AgencyAttributionView,
+  type IdentityContinuity,
+} from '../engines-frontier/autonomy25.js';
 import type { DecisionFeedback } from '../memory/long-term-memory.js';
 import type { PolicyEvolverStatus } from '../policy/policy-evolver.js';
 import type {
@@ -40,6 +65,10 @@ import type {
   OperationalMetrics,
   ProactiveRisk,
   RecommendedAdjustment,
+  SelfCalibrationSummary,
+  SelfEfficacySummary,
+  SelfEfficacyTypeView,
+  SelfModelChange,
   StrategyPerformanceSummary,
   SystemMetrics,
   SystemStabilitySummary,
@@ -67,6 +96,62 @@ export interface SelfModelConfig {
   anomalyZThreshold?: number;
   /** 稳态目标带（未配置的指标不做稳态评估；元认知控制器同款配置用于步长自适应） */
   homeostasisBands?: HomeostasisBands;
+  /**
+   * 3.0：注入时钟（确定性验证口径）。
+   * 提供时报告时间戳与变更日志时间戳全部取自该时钟（缺省 wall-clock，
+   * 行为不变）。
+   */
+  clock?: () => number;
+  // ── 3.0：自我评估校准 ──
+  /** 自评-实际配对偏差的滚动窗口长度（缺省 32） */
+  calibrationWindow?: number;
+  /** 偏差 EMA 平滑系数（缺省 0.25） */
+  calibrationEmaAlpha?: number;
+  /** 校准容忍带 |biasEma| ≤ tolerance 视为 calibrated（缺省 0.05） */
+  calibrationTolerance?: number;
+  /** 校准预热样本数（低于此 state=warming-up 不告警；缺省 6） */
+  calibrationWarmup?: number;
+  // ── 4.0：自我效能预测（按任务类型 Beta 后验） ──
+  /** Beta 平滑先验权重 α₀=β₀=efficacyPriorWeight（缺省 1，即均匀先验） */
+  efficacyPriorWeight?: number;
+  /** 预测-结果偏差/Brier 的 EMA 平滑系数（缺省 0.2） */
+  efficacyEmaAlpha?: number;
+  /** 效能校准预热样本数（低于此 state=warming-up；缺省 8） */
+  efficacyWarmup?: number;
+  /** 效能校准容忍带 |biasEma| ≤ tolerance 视为 calibrated（缺省 0.05） */
+  efficacyTolerance?: number;
+}
+
+/** 3.0：自我模型快照（snapshotSelf 产物；不透明整体回滚凭据） */
+export interface SelfModelSnapshot {
+  /** 配置浅拷贝（函数引用保真——同进程内恢复） */
+  config: SelfModelConfig;
+  /** 报告历史深拷贝 */
+  history: MentalReport[];
+  /** token 趋势检测基线 */
+  lastTokensPerExecution?: number;
+  /** 变更日志深拷贝 */
+  changeLog: SelfModelChange[];
+  /** 自我评估校准状态深拷贝 */
+  calibration: {
+    samples: number;
+    biasWindow: number[];
+    biasEma: number;
+    latestClaimed?: number;
+    state: SelfCalibrationSummary['state'];
+    alarms: number;
+    lastAlarm?: 'overconfident' | 'underconfident';
+  } | null;
+  /** 4.0：自我效能状态深拷贝（未启用为 null） */
+  efficacy: {
+    types: Array<{ taskType: string; trials: number; successes: number }>;
+    samples: number;
+    biasEma: number;
+    brierEma: number;
+    state: SelfEfficacySummary['state'];
+  } | null;
+  /** 变更序号（id 生成器状态） */
+  changeSeq: number;
 }
 
 /** 数据采集器（由编排层桥接到真实组件；全部同步只读） */
@@ -155,12 +240,368 @@ export function computeHomeostasis(
  * 手动触发（人类审查入口）。
  */
 export class SelfModel {
-  private config: Required<Omit<SelfModelConfig, 'persistPath'>> & Pick<SelfModelConfig, 'persistPath'>;
+  private config: Required<Omit<SelfModelConfig, 'persistPath' | 'clock'>> & Pick<SelfModelConfig, 'persistPath' | 'clock'>;
   private collectors: SelfModelCollectors;
   /** 报告历史（升序；趋势分析与改进证据的对比基线） */
   private history: MentalReport[] = [];
   /** 上一报告窗口的单次执行平均 token（趋势检测基线） */
   private lastTokensPerExecution?: number;
+
+  // ── 3.0：自我变更日志 + 快照 + 自我评估校准 ──
+  /** 变更日志（升序；一切自我修改入账：改动前后 + 理由 + 触发者） */
+  private changeLog: SelfModelChange[] = [];
+  private changeSeq = 0;
+  /** 自我评估校准状态（recordSelfAssessment 流式更新） */
+  private calibration: {
+    samples: number;
+    biasWindow: number[];
+    biasEma: number;
+    latestClaimed?: number;
+    state: SelfCalibrationSummary['state'];
+    alarms: number;
+    lastAlarm?: 'overconfident' | 'underconfident';
+  } | null = null;
+
+  // ── 4.0：自我效能预测（按任务类型 Beta 后验 + 校准追踪） ──
+  /** 各任务类型的成败计数（Beta 后验的充分统计量） */
+  private efficacyTypes = new Map<string, { trials: number; successes: number }>();
+  /** 预测-结果对数（校准追踪） */
+  private efficacySamples = 0;
+  private efficacyBiasEma = 0;
+  private efficacyBrierEma = 0;
+  private efficacyState: SelfEfficacySummary['state'] = 'warming-up';
+
+  /** 3.0：统一时钟（注入时钟优先；缺省 wall-clock，行为不变） */
+  private now(): number {
+    return this.config.clock ? this.config.clock() : Date.now();
+  }
+
+  /**
+   * 100.0：挂载自我边界透镜（幂等覆盖，挂载即生效——影子计算口径）。
+   *
+   * 归因边界：把每个决策周期的「自身动作流」（模型切换/调参/进化部署
+   * 事件序列）与「信号通道」（成功率/延迟/token 消耗遥测）喂 detectAgency
+   * ——自致通道的改进记入 improvementEvidence（策略升级的真功绩），非
+   * 自致通道的波动不揽功（防把环境红利记成自我进步）；已知共因（任务
+   * 难度/时段负载）作为 confounders 注入。身份断点：策略部署前后参数
+   * 向量 + 行为探针跑 identityContinuity——breakAlarm 联动金丝雀回滚
+   * 判据（连续性崩塌 = 身份突变而非渐进学习）。影子计算——心智报告
+   * 既有字段逐位不变（零漂移）。
+   */
+  attachSelfBoundary(): void {
+    this.selfBoundaryEnabled = true;
+  }
+
+  /** 100.0：自我边界旗标（未挂载零介入） */
+  private selfBoundaryEnabled?: boolean;
+
+  /** 100.0：能动性归因读数（未挂载 / 流过短时 undefined；confounders = 已知共因候选流） */
+  agencyAudit(
+    actions: ReadonlyArray<number>,
+    signals: ReadonlyArray<ReadonlyArray<number>>,
+    options?: { confounders?: ReadonlyArray<ReadonlyArray<number>>; seed?: number },
+  ): AgencyAttributionView | undefined {
+    return this.selfBoundaryEnabled ? agencyAttribution(actions, signals, options) : undefined;
+  }
+
+  /** 100.0：身份连续性读数（未挂载 / 参数向量非法时 undefined；breakAlarm = 身份断点信号） */
+  identityAudit(
+    before: ReadonlyArray<number>,
+    after: ReadonlyArray<number>,
+    options?: {
+      behaviorTests?: ReadonlyArray<{ probe: ReadonlyArray<number>; run: (parameters: ReadonlyArray<number>, probe: ReadonlyArray<number>) => number }>;
+      breakThreshold?: number;
+    },
+  ): IdentityContinuity | undefined {
+    return this.selfBoundaryEnabled ? identityContinuityScore(before, after, options) : undefined;
+  }
+
+  // ─────────────────── 3.0：自我变更日志 + 快照回滚 ───────────────────
+
+  /**
+   * 3.0：应用一次自我修改（一切自我修改的唯一入口）。
+   *
+   * 自我模型是「会改自己的模型」：反馈窗口、异常阈值、稳态带等配置
+   * 会被外环或人工修改。本方法把每次修改原子化入账：逐键记录
+   * from/to + 理由 + 触发者，再写回配置——没有日志的自我修改等于
+   * 失忆的进化（改了什么、为什么改、谁改的，一概不可追溯）。
+   *
+   * @param patch.config 要修改的配置键值（仅接受 SelfModelConfig 已知键）
+   * @param patch.reason 为什么改（入日志）
+   * @param patch.trigger 谁改的（meta-controller / manual / system…）
+   * @returns 本次产生的变更日志条目（空 patch 返回空数组）
+   */
+  applySelfChange(patch: { config?: Partial<SelfModelConfig>; reason: string; trigger: string }): SelfModelChange[] {
+    const entries: SelfModelChange[] = [];
+    if (patch.config) {
+      for (const [key, to] of Object.entries(patch.config)) {
+        if (!(key in this.config)) continue; // 未知键拒绝（防脏写）
+        const from = (this.config as Record<string, unknown>)[key];
+        if (from === to) continue; // 无变化不入账
+        (this.config as Record<string, unknown>)[key] = to;
+        this.changeSeq += 1;
+        entries.push({
+          id: `self-change-${this.changeSeq}`,
+          timestamp: this.now(),
+          key,
+          from,
+          to,
+          reason: patch.reason,
+          trigger: patch.trigger,
+        });
+      }
+    }
+    this.changeLog.push(...entries);
+    if (this.changeLog.length > 200) this.changeLog.splice(0, this.changeLog.length - 200);
+    this.persist();
+    return structuredClone(entries);
+  }
+
+  /** 3.0：变更日志（升序只读副本） */
+  selfChangeLog(): SelfModelChange[] {
+    return structuredClone(this.changeLog);
+  }
+
+  /**
+   * 3.0：按日志逆向回滚最近 count 次自我修改（状态恢复）。
+   *
+   * 只逆转尚未 undone 的条目（从尾部倒数），config[key] 写回 from 值；
+   * 已被逆转的条目不再重复逆转。返回实际恢复的条目。
+   */
+  rollbackSelfChanges(count = 1): { restored: number; changes: SelfModelChange[] } {
+    const restored: SelfModelChange[] = [];
+    for (let i = this.changeLog.length - 1; i >= 0 && restored.length < count; i -= 1) {
+      const entry = this.changeLog[i];
+      if (entry.undone) continue;
+      (this.config as Record<string, unknown>)[entry.key] = entry.from;
+      entry.undone = true;
+      restored.push(entry);
+    }
+    if (restored.length > 0) this.persist();
+    return { restored: restored.length, changes: structuredClone(restored) };
+  }
+
+  /** 3.0：整体快照（配置 + 报告历史 + 校准状态 + 日志；不透明回滚凭据） */
+  snapshotSelf(): SelfModelSnapshot {
+    return {
+      config: { ...this.config },
+      history: structuredClone(this.history),
+      lastTokensPerExecution: this.lastTokensPerExecution,
+      changeLog: structuredClone(this.changeLog),
+      calibration: this.calibration ? { ...this.calibration, biasWindow: [...this.calibration.biasWindow] } : null,
+      efficacy:
+        this.efficacySamples > 0 || this.efficacyTypes.size > 0
+          ? {
+              types: [...this.efficacyTypes.entries()].map(([taskType, t]) => ({ taskType, ...t })),
+              samples: this.efficacySamples,
+              biasEma: this.efficacyBiasEma,
+              brierEma: this.efficacyBrierEma,
+              state: this.efficacyState,
+            }
+          : null,
+      changeSeq: this.changeSeq,
+    };
+  }
+
+  /** 3.0：整体恢复（把自我模型精确还原到快照时刻——含趋势基线与校准记忆） */
+  restoreSelf(snapshot: SelfModelSnapshot): void {
+    this.config = { ...snapshot.config } as typeof this.config;
+    this.history = structuredClone(snapshot.history);
+    this.lastTokensPerExecution = snapshot.lastTokensPerExecution;
+    this.changeLog = structuredClone(snapshot.changeLog);
+    this.calibration = snapshot.calibration
+      ? { ...snapshot.calibration, biasWindow: [...snapshot.calibration.biasWindow] }
+      : null;
+    // 4.0：效能记忆一并还原（旧快照无该字段 → 清零，行为不变）
+    this.efficacyTypes = new Map((snapshot.efficacy?.types ?? []).map((t) => [t.taskType, { trials: t.trials, successes: t.successes }]));
+    this.efficacySamples = snapshot.efficacy?.samples ?? 0;
+    this.efficacyBiasEma = snapshot.efficacy?.biasEma ?? 0;
+    this.efficacyBrierEma = snapshot.efficacy?.brierEma ?? 0;
+    this.efficacyState = snapshot.efficacy?.state ?? 'warming-up';
+    this.changeSeq = snapshot.changeSeq;
+    this.persist();
+  }
+
+  // ─────────────────── 3.0：自我评估校准 ───────────────────
+
+  /**
+   * 3.0：记录一对「能力自评 vs 实际表现」（校准追踪的流式输入）。
+   *
+   * @param pair.claimed 自评（0~1 或任务域分数口径，与 actual 同尺度）
+   * @param pair.actual 实际表现（外部可测的客观成绩）
+   * @param pair.domain 可选任务域标签（仅记录语义，不分区统计）
+   * @returns 更新后的校准摘要
+   */
+  recordSelfAssessment(pair: { claimed: number; actual: number; domain?: string }): SelfCalibrationSummary {
+    void pair.domain;
+    if (!Number.isFinite(pair.claimed) || !Number.isFinite(pair.actual)) return this.calibrationView() ?? this.emptyCalibration();
+    const bias = pair.claimed - pair.actual;
+    if (!this.calibration) {
+      this.calibration = { samples: 0, biasWindow: [], biasEma: 0, state: 'warming-up', alarms: 0 };
+    }
+    const cal = this.calibration;
+    cal.samples += 1;
+    cal.biasWindow.push(bias);
+    const windowSize = Math.max(4, Math.floor(this.config.calibrationWindow ?? 32));
+    if (cal.biasWindow.length > windowSize) cal.biasWindow.splice(0, cal.biasWindow.length - windowSize);
+    const alpha = this.config.calibrationEmaAlpha ?? 0.25;
+    cal.biasEma = cal.samples === 1 ? bias : cal.biasEma + alpha * (bias - cal.biasEma);
+    cal.latestClaimed = pair.claimed;
+    this.reevaluateCalibrationState();
+    this.persist();
+    return this.calibrationView() ?? this.emptyCalibration();
+  }
+
+  /** 3.0：校准状态重估（告警翻转沿计数） */
+  private reevaluateCalibrationState(): void {
+    const cal = this.calibration;
+    if (!cal) return;
+    const warmup = Math.max(1, Math.floor(this.config.calibrationWarmup ?? 6));
+    const tolerance = this.config.calibrationTolerance ?? 0.05;
+    const previous = cal.state;
+    if (cal.samples < warmup) {
+      cal.state = 'warming-up';
+      return;
+    }
+    if (Math.abs(cal.biasEma) <= tolerance) {
+      cal.state = 'calibrated';
+    } else if (cal.biasEma > 0) {
+      cal.state = 'overconfident';
+    } else {
+      cal.state = 'underconfident';
+    }
+    // 告警 = 从非告警态进入过高/过低态的翻转沿（稳态不重复计）
+    const wasAlarming = previous === 'overconfident' || previous === 'underconfident';
+    const isAlarming = cal.state === 'overconfident' || cal.state === 'underconfident';
+    if (isAlarming && !wasAlarming) {
+      cal.alarms += 1;
+      cal.lastAlarm = cal.state === 'overconfident' ? 'overconfident' : 'underconfident';
+    }
+  }
+
+  /** 3.0：校准摘要（无样本返回 undefined——旧报告口径不变） */
+  calibrationView(): SelfCalibrationSummary | undefined {
+    const cal = this.calibration;
+    if (!cal) return undefined;
+    const biasMean = cal.biasWindow.length > 0 ? cal.biasWindow.reduce((s, b) => s + b, 0) / cal.biasWindow.length : 0;
+    return {
+      samples: cal.samples,
+      biasMean: Number(biasMean.toFixed(4)),
+      biasEma: Number(cal.biasEma.toFixed(4)),
+      calibrated:
+        cal.latestClaimed !== undefined ? Number((cal.latestClaimed - cal.biasEma).toFixed(4)) : null,
+      state: cal.state,
+      alarms: cal.alarms,
+      lastAlarm: cal.lastAlarm,
+    };
+  }
+
+  /** 3.0：空校准摘要（防御性兜底，正常路径不触达） */
+  private emptyCalibration(): SelfCalibrationSummary {
+    return { samples: 0, biasMean: 0, biasEma: 0, calibrated: null, state: 'warming-up', alarms: 0 };
+  }
+
+  // ─────────────────── 4.0：自我效能预测（Beta 后验 + 校准追踪） ───────────────────
+
+  /** 4.0：任务类型的 Beta 后验参数（α, β；先验 = 均匀 Beta(w, w)） */
+  private efficacyBeta(taskType: string): { alpha: number; beta: number; trials: number; successes: number } {
+    const w = Math.max(0.001, this.config.efficacyPriorWeight ?? 1);
+    const t = this.efficacyTypes.get(taskType) ?? { trials: 0, successes: 0 };
+    return { alpha: w + t.successes, beta: w + (t.trials - t.successes), trials: t.trials, successes: t.successes };
+  }
+
+  /**
+   * 4.0：预测某任务类型的成功率（历史 Beta 后验均值 + Wilson 90% 区间）。
+   *
+   * 预测在看到结果**之前**做出（预注册口径）：调用方拿它去规划/承诺，
+   * 之后 recordSelfEfficacy 回填结果——预测 vs 实际的偏差因此可归因。
+   * 未有历史时返回先验均值 0.5 与宽区间（诚实无知，不装懂）。
+   */
+  predictSuccess(taskType: string): { predicted: number; ci90: { lower: number; upper: number }; trials: number; successes: number } {
+    const { alpha, beta, trials, successes } = this.efficacyBeta(taskType);
+    const p = alpha / (alpha + beta);
+    const n = alpha + beta;
+    // Wilson 90% 区间（正态近似分位 z=1.645；对小样本比 Wald 区间诚实）
+    const z = 1.645;
+    const denom = 1 + (z * z) / n;
+    const center = (p + (z * z) / (2 * n)) / denom;
+    const half = (z / denom) * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n));
+    return {
+      predicted: Number(p.toFixed(4)),
+      ci90: { lower: Number(Math.max(0, center - half).toFixed(4)), upper: Number(Math.min(1, center + half).toFixed(4)) },
+      trials,
+      successes,
+    };
+  }
+
+  /**
+   * 4.0：结算一次任务执行（自我效能的流式输入）。
+   *
+   * @param event.taskType 任务类型（Beta 后验按类型分化：擅长/平庸/短板）
+   * @param event.predicted 事前预测（缺省取当前后验均值——先预测后看结果，
+   *        预测与结果的时间顺序由本方法保证，杜绝事后诸葛）
+   * @param event.success 实际成败
+   * @returns 更新后的自我效能摘要
+   */
+  recordSelfEfficacy(event: { taskType: string; predicted?: number; success: boolean }): SelfEfficacySummary {
+    if (typeof event.taskType !== 'string' || event.taskType.length === 0) return this.selfEfficacyView() ?? this.emptyEfficacy();
+    // ① 预测先行（事后验后验更新之前——预测时点合法）
+    const fallback = this.predictSuccess(event.taskType).predicted;
+    const prediction =
+      Number.isFinite(event.predicted) && event.predicted !== undefined ? Math.max(0, Math.min(1, event.predicted)) : fallback;
+    const outcome = event.success ? 1 : 0;
+    // ② 校准追踪（预测 vs 结果：偏差与 Brier）
+    const alpha = Math.max(0.01, Math.min(1, this.config.efficacyEmaAlpha ?? 0.2));
+    this.efficacySamples += 1;
+    const bias = prediction - outcome;
+    const brier = (prediction - outcome) ** 2;
+    this.efficacyBiasEma = this.efficacySamples === 1 ? bias : this.efficacyBiasEma + alpha * (bias - this.efficacyBiasEma);
+    this.efficacyBrierEma = this.efficacySamples === 1 ? brier : this.efficacyBrierEma + alpha * (brier - this.efficacyBrierEma);
+    // ③ 后验更新（看到结果之后）
+    const t = this.efficacyTypes.get(event.taskType) ?? { trials: 0, successes: 0 };
+    t.trials += 1;
+    if (event.success) t.successes += 1;
+    this.efficacyTypes.set(event.taskType, t);
+    // ④ 校准状态重估
+    const warmup = Math.max(1, Math.floor(this.config.efficacyWarmup ?? 8));
+    const tolerance = this.config.efficacyTolerance ?? 0.05;
+    if (this.efficacySamples < warmup) this.efficacyState = 'warming-up';
+    else if (Math.abs(this.efficacyBiasEma) <= tolerance) this.efficacyState = 'calibrated';
+    else this.efficacyState = this.efficacyBiasEma > 0 ? 'over-predicting' : 'under-predicting';
+    this.persist();
+    return this.selfEfficacyView() ?? this.emptyEfficacy();
+  }
+
+  /** 4.0：自我效能摘要（无样本返回 undefined——旧报告口径不变） */
+  selfEfficacyView(): SelfEfficacySummary | undefined {
+    if (this.efficacySamples === 0 && this.efficacyTypes.size === 0) return undefined;
+    const types: SelfEfficacyTypeView[] = [...this.efficacyTypes.entries()]
+      .sort((a, b) => b[1].trials - a[1].trials)
+      .map(([taskType]) => {
+        const { trials, successes } = this.efficacyTypes.get(taskType)!;
+        const { predicted, ci90 } = this.predictSuccess(taskType);
+        return {
+          taskType,
+          trials,
+          successes,
+          predicted,
+          ci90,
+          empirical: trials > 0 ? Number((successes / trials).toFixed(4)) : null,
+        };
+      });
+    return {
+      types,
+      calibrationBiasEma: Number(this.efficacyBiasEma.toFixed(4)),
+      brierEma: Number(this.efficacyBrierEma.toFixed(4)),
+      samples: this.efficacySamples,
+      state: this.efficacyState,
+    };
+  }
+
+  /** 4.0：空效能摘要（防御性兜底，正常路径不触达） */
+  private emptyEfficacy(): SelfEfficacySummary {
+    return { types: [], calibrationBiasEma: 0, brierEma: 0, samples: 0, state: 'warming-up' };
+  }
 
   constructor(params: { collectors: SelfModelCollectors; config?: SelfModelConfig }) {
     this.config = {
@@ -171,6 +612,14 @@ export class SelfModel {
       minForecastHistory: 3,
       anomalyZThreshold: 2.5,
       homeostasisBands: {},
+      calibrationWindow: 32,
+      calibrationEmaAlpha: 0.25,
+      calibrationTolerance: 0.05,
+      calibrationWarmup: 6,
+      efficacyPriorWeight: 1,
+      efficacyEmaAlpha: 0.2,
+      efficacyWarmup: 8,
+      efficacyTolerance: 0.05,
       ...params.config,
     };
     this.collectors = params.collectors;
@@ -218,7 +667,7 @@ export class SelfModel {
     };
 
     return {
-      collectedAt: Date.now(),
+      collectedAt: this.now(),
       operational,
       memory: {
         counts: {
@@ -268,7 +717,7 @@ export class SelfModel {
     }
 
     const report: MentalReport = {
-      timestamp: new Date().toISOString(),
+      timestamp: new Date(this.now()).toISOString(),
       reportIndex,
       generatedAt: metrics.collectedAt,
       strategyPerformance,
@@ -281,6 +730,10 @@ export class SelfModel {
       proactiveRisks,
       knobEffectiveness: metaLayer?.knobEffectiveness,
       metaStability,
+      // 3.0：自我评估校准（有 recordSelfAssessment 样本时输出）
+      selfCalibration: this.calibrationView(),
+      // 4.0：自我效能预测（有 recordSelfEfficacy 样本时输出）
+      selfEfficacy: this.selfEfficacyView(),
     };
 
     this.history.push(report);
@@ -427,6 +880,43 @@ export class SelfModel {
       } else if (ms.homeostasis.length > 0) {
         lines.push('║   稳态带: 全部指标处于目标带内');
       }
+    }
+    // ── 3.0：自我评估校准 ──
+    if (report.selfCalibration && report.selfCalibration.samples > 0) {
+      lines.push('║ [自我评估校准]');
+      const sc = report.selfCalibration;
+      const stateLabel =
+        sc.state === 'overconfident'
+          ? `⚠ 自评过高（偏差 EMA +${sc.biasEma.toFixed(3)}，把「感觉良好」当「表现良好」）`
+          : sc.state === 'underconfident'
+            ? `⚠ 自评过低（偏差 EMA ${sc.biasEma.toFixed(3)}，过度保守/求助）`
+            : sc.state === 'calibrated'
+              ? '已校准（偏差 EMA 在容忍带内）'
+              : '预热中（样本不足，不告警）';
+      lines.push(
+        `║   ${sc.samples} 对自评-实际样本：滚动偏差均值 ${sc.biasMean >= 0 ? '+' : ''}${sc.biasMean.toFixed(3)}，${stateLabel}${sc.alarms > 0 ? `，累计告警 ${sc.alarms} 次（最近 ${sc.lastAlarm === 'overconfident' ? '过高' : '过低'}）` : ''}${sc.calibrated !== null ? `；校正口径：最新自评扣偏差 EMA → ${sc.calibrated}` : ''}`,
+      );
+    }
+    // ── 4.0：自我效能预测 ──
+    if (report.selfEfficacy && report.selfEfficacy.samples > 0) {
+      lines.push('║ [自我效能预测]');
+      const se = report.selfEfficacy;
+      for (const t of se.types) {
+        lines.push(
+          `║   ${t.taskType}: 预测 ${(t.predicted * 100).toFixed(1)}%（90% CI ${(t.ci90.lower * 100).toFixed(0)}~${(t.ci90.upper * 100).toFixed(0)}%）${t.empirical !== null ? `，实测 ${(t.empirical * 100).toFixed(1)}%（${t.trials} 试）` : `（${t.trials} 试）`}`,
+        );
+      }
+      const stLabel =
+        se.state === 'over-predicting'
+          ? `⚠ 预测过高（偏差 EMA +${se.calibrationBiasEma.toFixed(3)}）`
+          : se.state === 'under-predicting'
+            ? `⚠ 预测过低（偏差 EMA ${se.calibrationBiasEma.toFixed(3)}）`
+            : se.state === 'calibrated'
+              ? '已校准'
+              : '预热中';
+      lines.push(
+        `║   校准：${se.samples} 对预测-结果，偏差 EMA ${se.calibrationBiasEma >= 0 ? '+' : ''}${se.calibrationBiasEma.toFixed(3)}，Brier EMA ${se.brierEma.toFixed(3)}（0=完美，0.25=瞎猜）——${stLabel}`,
+      );
     }
     if (report.recommendedAdjustments.length > 0) {
       lines.push('║ [推荐调整]');
@@ -1091,7 +1581,22 @@ export class SelfModel {
     try {
       fs.writeFileSync(
         this.config.persistPath,
-        JSON.stringify({ history: this.history, savedAt: Date.now() }),
+        JSON.stringify({
+          history: this.history,
+          savedAt: Date.now(),
+          // 3.0：自我变更日志 + 校准状态（缺省字段向后兼容旧持久化文件）
+          changeLog: this.changeLog,
+          changeSeq: this.changeSeq,
+          calibration: this.calibration,
+          // 4.0：自我效能记忆（缺省字段向后兼容旧持久化文件）
+          efficacy: {
+            types: [...this.efficacyTypes.entries()].map(([taskType, t]) => ({ taskType, ...t })),
+            samples: this.efficacySamples,
+            biasEma: this.efficacyBiasEma,
+            brierEma: this.efficacyBrierEma,
+            state: this.efficacyState,
+          },
+        }),
         'utf-8',
       );
     } catch {
@@ -1104,8 +1609,28 @@ export class SelfModel {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.config.persistPath, 'utf-8')) as {
         history?: MentalReport[];
+        changeLog?: SelfModelChange[];
+        changeSeq?: number;
+        calibration?: SelfModelSnapshot['calibration'];
+        efficacy?: NonNullable<SelfModelSnapshot['efficacy']>;
       };
       if (Array.isArray(parsed.history)) this.history = parsed.history;
+      // 3.0：变更日志与校准状态跨重启连续（旧文件无这些字段 → 从零开始）
+      if (Array.isArray(parsed.changeLog)) this.changeLog = parsed.changeLog;
+      if (typeof parsed.changeSeq === 'number') this.changeSeq = parsed.changeSeq;
+      if (parsed.calibration && typeof parsed.calibration.samples === 'number') {
+        this.calibration = { ...parsed.calibration, biasWindow: [...(parsed.calibration.biasWindow ?? [])] };
+      }
+      // 4.0：自我效能记忆跨重启连续（旧文件无该字段 → 从零开始）
+      if (parsed.efficacy && typeof parsed.efficacy.samples === 'number') {
+        this.efficacyTypes = new Map(
+          (parsed.efficacy.types ?? []).map((t) => [t.taskType, { trials: t.trials, successes: t.successes }]),
+        );
+        this.efficacySamples = parsed.efficacy.samples;
+        this.efficacyBiasEma = parsed.efficacy.biasEma ?? 0;
+        this.efficacyBrierEma = parsed.efficacy.brierEma ?? 0;
+        this.efficacyState = parsed.efficacy.state ?? 'warming-up';
+      }
     } catch {
       /* 损坏文件忽略，从零开始 */
     }

@@ -272,7 +272,14 @@ const t4 = await runtime.tick();
   const repBefore = memoryAgent.reputation();
   ok(repBefore.tier === 'seed', '新智能体信誉等级 seed（不可自封）');
 
-  const d0 = runtime.settleTaskOutcome(true, [{ agentId: 'agent-memory' }, { agentId: 'agent-optimizer' }]);
+  // 显式等权：缺省 fallback 是 Wilson 下界——随 Date.now() 时间衰减，两贡献者
+  // 证据时间戳相差数毫秒即权重 infinitesimally 不等，floor(40×w/Σ) 合计可能
+  // 39≠40（偶发统计边界）。等权 1:1 → 精确 20+20=40，断言语义不变；
+  // Wilson fallback 路径仍由下方 dW（显式低权重 vs fallback）覆盖。
+  const d0 = runtime.settleTaskOutcome(true, [
+    { agentId: 'agent-memory', weight: 1 },
+    { agentId: 'agent-optimizer', weight: 1 },
+  ]);
   ok(d0.totalDistributed === 40 && d0.shares.length === 2, '任务成功 → 央行铸币 40 全额分红');
 
   // 失败的统计代价：零铸币

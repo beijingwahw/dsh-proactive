@@ -230,7 +230,7 @@ const buildKnobs = (c, overrides = {}) => [
   });
   // 让必炸旋钮获得最高优先级：直接注入推荐（经 selfModel 的 reactive 推荐）
   const ctl = new MetaCognitiveController({ selfModel, knobs });
-  const r = await ctl.evaluateAndAdjust();
+  await ctl.evaluateAndAdjust();
   // 蒸馏积压推荐 autoDistillThreshold↓（优先级 0.7）；boomKnob 无推荐则不会被选。
   // 改为直接验证：所有旋钮 write 全炸时 → 无 adjust 审计 + no-op
   const knobsAllBoom = buildKnobs(c).map((k) => ({
@@ -365,7 +365,7 @@ const buildKnobs = (c, overrides = {}) => [
       firstReport.proactiveRisks?.length === 0 &&
       r.status === 'adjusted' &&
       r.applied[0].source === 'reactive',
-    `首份报告 forecasts=${firstReport.forecasts?.length} 条（历史点不足无外推）、proactiveRisks 空 → 控制器首拍即按反应式推荐调整（source=${r.applied[0]?.source ?? r.applied[0]?.source}）——预测能力不阻塞基础闭环`,
+    `首份报告 forecasts=${firstReport.forecasts?.length} 条（历史点不足无外推）、proactiveRisks 空 → 控制器首拍即按反应式推荐调整（source=${r.applied[0]?.source ?? '（无）'}）——预测能力不阻塞基础闭环`,
   );
 }
 

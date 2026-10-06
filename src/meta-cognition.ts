@@ -13,6 +13,19 @@
  * 4. 自愈目标触发：参数调整仍无法解决的结构性问题（如某模型持续失败）
  *    产出高严重度洞察，交给目标引擎生成自愈目标
  * 5. 健康报告：综合评分 + 各 KPI 状态 + 调整历史，可查询可追溯
+ * 6. 3.0：相对基线偏差带（attachRelativeKpiBand）：KPI 判定从静态目标线
+ *    升级为「相对自身滚动基线的偏离」（中位数 ± 稳健 MAD 带，借 23.0
+ *    稳健统计思想自实现 robustBaseline）——慢漂移在静态阈值之前暴露，
+ *    平稳噪声不误报；时钟可注入（config.clock，确定性验证口径）
+ * 7. 4.0：多时间尺度监控（attachMultiScaleMonitor）：同一 KPI 的短/中/长
+ *    三窗并行监控——短窗灵敏（毛刺立即可见）、长窗稳态（锚定冻结基线）；
+ *    报警携带尺度标签，短窗报警但长窗健康时降级为「波动」而非「退化」
+ *    （单次毛刺不打扰调参），中窗先行时报「慢漂移」，三尺度同向才报
+ *    「真退化」——尺度区分取代单一阈值的「一切突变都算退化」。
+ * 8. 4.0：KPI 相关性图（attachKpiCorrelation）：KPI 间滚动 Pearson 相关
+ *    矩阵——一个调整常同时影响多个联动 KPI（归因混淆源）；调整动作
+ *    自动附注受影响 KPI 集合（TuningAction.affectedKpis），把「调 A 却
+ *    动了 B」的暗耦合显式化。
  */
 
 import type { Insight } from './goal-engine.js';
@@ -27,6 +40,8 @@ import { TransportDriftMonitor, type TransportDriftView } from './core/optimal-t
 import { LocalLinearTrendFilter, type TrendFilterConfig, type TrendStepRead } from './core/kalman-filter.js';
 import { dynamicsRegime, type DynamicsAssessment, type DynamicsRegime } from './core/nonlinear-dynamics.js';
 import { multiScaleView } from './core/multiscale-wavelet.js';
+// 创世纪 57.0：变分推断（平均场后验，6.0 自由能 q 分布的供给方）
+import { VariationalEngine } from './core/variational-inference.js';
 
 /** KPI 快照 */
 export interface KpiSnapshot {
@@ -66,6 +81,14 @@ export interface TuningAction {
   timestamp: number;
   /** 5.0：因果依据（该旋钮对目标 KPI 的干预效应估计） */
   causalBasis?: { ate: number; lower: number; confidence: number; interventionalSamples: number };
+  /**
+   * 4.0：受影响 KPI 集合（挂载 attachKpiCorrelation 后自动附注）。
+   *
+   * 与目标 KPI 滚动相关 |r| ≥ 阈值的 KPI 一并列入——调整的影响面从
+   * 「我以为只动 A」升级为「相关图说 B/C 也会被牵动」，归因时防止
+   * 把联动的 B 变化误记到别的头上。
+   */
+  affectedKpis?: string[];
 }
 
 /** 健康报告 */
@@ -169,6 +192,49 @@ export interface HealthReport {
     streams: Array<{ kpi: string; level: number; slope: number; nis: number; threshold: number; gated: boolean }>;
     interpretation: string;
   };
+  /**
+   * 3.0：相对基线偏差带（挂载 attachRelativeKpiBand 后输出）。
+   *
+   * KPI 判定从「静态目标线」升级为「相对自身基线的偏离」：滚动中位数
+   * ± 稳健 MAD 带（借 23.0 稳健统计思想自实现，见 robustBaseline）。
+   * 静态线回答「还达标吗」（0.95 → 0.7 之间的一切都算健康，慢漂移
+   * 全程不可见）；相对带回答「还是原来的我吗」——基线 0.95 的系统
+   * 跌到 0.88 仍是静态意义上的「健康」，但相对自身已显著退化，
+   * 报警比静态线早几十个批次，且对平稳噪声不误报（MAD 口径）。
+   */
+  relativeBands?: {
+    streams: Array<{
+      kpi: string;
+      samples: number;
+      baselineMedian: number;
+      madSigma: number;
+      value: number;
+      robustZ: number;
+      bandWidthMad: number;
+      outOfBand: boolean;
+      degraded: boolean;
+    }>;
+    interpretation: string;
+  };
+  /**
+   * 4.0：多时间尺度监控（挂载 attachMultiScaleMonitor 后输出）。
+   *
+   * 同一 KPI 的短/中/长三窗读数（各窗均值 vs 冻结锚点的退化方向归一
+   * 偏离 z）+ 当前报警尺度集合 + 尺度合成判级（fluctuation 波动 /
+   * drift 慢漂移 / degradation 真退化）。
+   */
+  multiScale?: { streams: MultiScaleRead[]; interpretation: string };
+  /**
+   * 4.0：KPI 相关性图（挂载 attachKpiCorrelation 后输出）——滚动
+   * Pearson 相关矩阵与联动对（|r| ≥ 阈值），调整的影响面据此附注。
+   */
+  kpiCorrelations?: {
+    window: number;
+    samples: number;
+    threshold: number;
+    pairs: Array<{ a: string; b: string; r: number; linked: boolean }>;
+    interpretation: string;
+  };
 }
 
 /** 元认知配置 */
@@ -195,6 +261,11 @@ export interface MetaCognitionConfig {
    * 目标）为基线——「放宽」才名实相符；未提供时保持旧行为（零漂移）。
    */
   getQualityThreshold?: () => number;
+  /**
+   * 3.0：注入时钟（确定性验证口径）。
+   * 提供时异常/调参时间戳全部取自该时钟（缺省 Date.now，行为不变）。
+   */
+  clock?: () => number;
 }
 
 /** 默认配置 */
@@ -207,6 +278,124 @@ export const DEFAULT_META_COGNITION_CONFIG: MetaCognitionConfig = {
   modelHealthThreshold: 0.4,
   tuningCooldownMs: 30_000,
 };
+
+// ─────────────────── 3.0：相对基线偏差带（稳健统计小工具 + 挂载口径） ───────────────────
+
+/**
+ * 3.0：稳健基线估计（借 23.0 稳健统计思想自实现：中位数 + MAD×1.4826）。
+ *
+ * 为什么不用均值/标准差：窗口里的漂移样本会污染自己的基线（均值被
+ * 拉着走，慢漂移在窗口内永远「看起来正常」）；离群点会把 σ 撑大，
+ * 让后续真突变全部漏报。中位数对 50% 以下的污染不敏感，MAD（中位
+ * 绝对偏差）×1.4826 是正态一致的标准差稳健估计——基线只反映「系统
+ * 一直在哪」，不反映「系统最近被漂移/离群带去了哪」。
+ *
+ * @param samples 非空有限数样本（基线窗；不含待检的当前值）
+ * @returns median 中位数；madSigma = 1.4826×MAD（退化时兜底 1e-9，
+ *          此时任何偏离当前中位数的值都会满格越带——诚实退化为电平检测）
+ */
+export function robustBaseline(samples: number[]): { median: number; madSigma: number } {
+  const n = samples.length;
+  if (n === 0) return { median: Number.NaN, madSigma: Number.NaN };
+  const sorted = [...samples].sort((a, b) => a - b);
+  const median = n % 2 === 1 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
+  const deviations = samples.map((x) => Math.abs(x - median)).sort((a, b) => a - b);
+  const mad = n % 2 === 1 ? deviations[(n - 1) / 2] : (deviations[n / 2 - 1] + deviations[n / 2]) / 2;
+  return { median, madSigma: Math.max(1.4826 * mad, 1e-9) };
+}
+
+/** 3.0：相对基线带挂载选项 */
+export interface RelativeKpiBandOptions {
+  /** 覆盖的 KPI（缺省全部四项） */
+  kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+  /** 滚动窗口长度（缺省 24；当前值与基线窗合并后有界） */
+  window?: number;
+  /** 越带带宽（单位 = 稳健 σ；缺省 3.5） */
+  bandWidthMad?: number;
+  /** 基线生效的最小样本数（缺省 8） */
+  minSamples?: number;
+}
+
+/** 3.0：单 KPI 的相对基线带读数（纯读取） */
+export interface RelativeKpiBandRead {
+  kpi: string;
+  samples: number;
+  baselineMedian: number;
+  madSigma: number;
+  value: number;
+  /** 稳健 z = (value − median) / madSigma */
+  robustZ: number;
+  bandWidthMad: number;
+  outOfBand: boolean;
+  /** 退化方向（avgLatency 上升 = 退化；其余下降 = 退化） */
+  degraded: boolean;
+}
+
+// ─────────────────── 4.0：多时间尺度监控 + KPI 相关性图 ───────────────────
+
+/** 4.0：多时间尺度判级（尺度合成的报警等级） */
+export type MultiScaleKind = 'healthy' | 'fluctuation' | 'drift' | 'degradation';
+
+/** 4.0：尺度标签（报警携带） */
+export type MultiScaleTag = 'short' | 'medium' | 'long';
+
+/** 4.0：多时间尺度监控挂载选项 */
+export interface MultiScaleMonitorOptions {
+  /** 覆盖的 KPI（缺省全部四项） */
+  kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+  /** 短窗长度（灵敏尺度；缺省 4） */
+  shortWindow?: number;
+  /** 中窗长度（慢漂移尺度；缺省 12） */
+  mediumWindow?: number;
+  /** 长窗长度（稳态锚定尺度；缺省 36） */
+  longWindow?: number;
+  /** 短窗报警阈值（退化方向归一偏离；缺省 3） */
+  shortZ?: number;
+  /** 中窗报警阈值（缺省 3） */
+  mediumZ?: number;
+  /** 长窗报警阈值（缺省 3） */
+  longZ?: number;
+  /**
+   * σ 下限（锚点中位数的相对比例，缺省 0.02）：常序列 MAD=0 时任何
+   * 偏离都是 ∞σ（电平检测退化），σ 下限给出「相对基线 2% 以内不算
+   * 事」的物理底——阈值语义对任意 KPI 量纲一致。
+   */
+  relFloor?: number;
+}
+
+/** 4.0：单 KPI 的多时间尺度读数（纯读取） */
+export interface MultiScaleRead {
+  kpi: string;
+  /** 长窗积累的样本数（未满 longWindow 时读数缺席） */
+  samples: number;
+  /** 冻结锚点中位数（清晰健康时缓慢重锚；异常期冻结） */
+  anchorMedian: number;
+  /** σ 下界 = max(锚点 MAD σ, relFloor×|锚点中位数|) */
+  sigmaFloor: number;
+  shortMean: number;
+  mediumMean: number;
+  longMean: number;
+  /** 退化方向归一偏离（正 = 退化幅度；各窗均值 vs 锚点 / σ 下界） */
+  shortZ: number;
+  mediumZ: number;
+  longZ: number;
+  /** 当前越限报警的尺度集合 */
+  scales: MultiScaleTag[];
+  /** 尺度合成判级 */
+  kind: MultiScaleKind;
+}
+
+/** 4.0：KPI 相关性图挂载选项 */
+export interface KpiCorrelationOptions {
+  /** 参与相关矩阵的 KPI（缺省全部四项） */
+  kpis?: Array<'successRate' | 'avgQuality' | 'avgLatency' | 'cacheHitRate'>;
+  /** 滚动窗口长度（缺省 24） */
+  window?: number;
+  /** 出相关读数的最小样本数（缺省 12） */
+  minSamples?: number;
+  /** 联动判定阈值 |r| ≥ threshold（缺省 0.7） */
+  threshold?: number;
+}
 
 /**
  * 元认知监控引擎
@@ -229,6 +418,11 @@ export class MetaCognitionEngine {
 
   constructor(config?: Partial<MetaCognitionConfig>) {
     this.config = { ...DEFAULT_META_COGNITION_CONFIG, ...config };
+  }
+
+  /** 3.0：统一时钟（注入时钟优先；缺省 wall-clock，行为不变） */
+  private now(): number {
+    return this.config.clock ? this.config.clock() : Date.now();
   }
 
   /** 5.0：挂载因果内核（幂等） */
@@ -264,6 +458,38 @@ export class MetaCognitionEngine {
   /** 11.0：挂载理论内核（理论前沿 KPI 数据源；幂等） */
   attachTheoristEngine(engine: import('./core/theorist.js').TheoristEngine): void {
     this.theoristEngine = engine;
+  }
+
+  /**
+   * 57.0：挂载变分推断（幂等覆盖，挂载即生效——旁路咨询口径）。
+   *
+   * variationalPosterior() 把「点估计 + 手拍区间」升级为平均场高斯后验
+   * N(m_i, s_i²)（CAVI / Armijo 回溯，ELBO 单调可审计）——为 6.0 自由能
+   * 引擎的 KL(q‖p) 提供真正的 q 分布；fit().converged === false 时不采信
+   * （诚实降级，不拿半收敛的后验冒充真后验）。不改变任何既有 KPI 路径
+   * （零漂移）。
+   */
+  attachVariationalInference(options?: Partial<import('./core/variational-inference.js').VIConfig>): void {
+    this.variationalConfig = options ?? {};
+  }
+
+  /** 57.0：变分推断配置（未挂载 undefined） */
+  private variationalConfig?: Partial<import('./core/variational-inference.js').VIConfig>;
+
+  /**
+   * 57.0：平均场后验拟合（未挂载返回 undefined）。
+   * @param problem VI 问题（linearRegression 共轭闭式 / gaussianVI 非共轭）
+   */
+  variationalPosterior(
+    problem: import('./core/variational-inference.js').VIProblem,
+    options?: import('./core/variational-inference.js').VIFitOptions,
+  ): import('./core/variational-inference.js').VIFitResult | undefined {
+    if (!this.variationalConfig) return undefined;
+    try {
+      return new VariationalEngine(problem, this.variationalConfig).fit(options);
+    } catch {
+      return undefined; // 问题规格非法 → 诚实降级
+    }
   }
 
   private freeEnergyEngine?: import('./core/free-energy.js').FreeEnergyEngine;
@@ -471,6 +697,329 @@ export class MetaCognitionEngine {
     if (!series || !Number.isFinite(value)) return;
     series.push(value);
     if (series.length > 256) series.splice(0, series.length - 256);
+  }
+
+  // ─────────────────── 3.0：相对基线偏差带 ───────────────────
+
+  /** 3.0：相对基线带滚动窗（kpi → 含当前值的最近 window 个观测） */
+  private relativeBandWindows?: Map<string, number[]>;
+  /** 3.0：各 KPI 的上次退化越带态（翻转沿触发洞察，稳态不重复打扰） */
+  private relativeBandState = new Map<string, boolean>();
+  /** 3.0：相对基线带参数（attach 时定格） */
+  private relativeBandCfg = { window: 24, bandWidthMad: 3.5, minSamples: 8 };
+
+  // ─────────────────── 4.0：多时间尺度监控 ───────────────────
+
+  /** 4.0：多时间尺度状态（kpi → 滚动窗 + 冻结锚点 + 上次判级） */
+  private multiScaleStreams?: Map<string, { window: number[]; anchor?: { median: number; madSigma: number }; lastKind: MultiScaleKind }>;
+  /** 4.0：多时间尺度参数（attach 时定格） */
+  private multiScaleCfg = {
+    shortWindow: 4,
+    mediumWindow: 12,
+    longWindow: 36,
+    shortZ: 3,
+    mediumZ: 3,
+    longZ: 3,
+    relFloor: 0.02,
+  };
+
+  /**
+   * 4.0：挂载多时间尺度监控（幂等覆盖，挂载即生效）。
+   *
+   * 三窗分工：短窗（缺省 4）对毛刺灵敏——单批恶化立刻越限；中窗
+   * （缺省 12）区分「连续几批走弱」的慢漂移早期；长窗（缺省 36）锚定
+   * 系统稳态（首个满窗的中位数±MAD 冻结为锚点，清晰健康时缓慢重锚，
+   * 异常期冻结——锚点不被正在发生的退化拉走）。报警按尺度合成判级：
+   * 仅短窗越限 = fluctuation（波动，不打扰调参）；中窗越限 = drift
+   * （慢漂移早期）；长窗越限 = degradation（稳态已破，真退化）。
+   * 未挂载零漂移。
+   */
+  attachMultiScaleMonitor(options?: MultiScaleMonitorOptions): void {
+    const kpis = options?.kpis ?? ['successRate', 'avgQuality', 'avgLatency', 'cacheHitRate'];
+    const long = Math.max(12, Math.floor(options?.longWindow ?? 36));
+    const medium = Math.min(Math.max(4, Math.floor(options?.mediumWindow ?? 12)), long - 4);
+    const short = Math.min(Math.max(2, Math.floor(options?.shortWindow ?? 4)), medium - 1);
+    this.multiScaleCfg = {
+      shortWindow: short,
+      mediumWindow: medium,
+      longWindow: long,
+      shortZ: Number.isFinite(options?.shortZ) ? options!.shortZ! : 3,
+      mediumZ: Number.isFinite(options?.mediumZ) ? options!.mediumZ! : 3,
+      longZ: Number.isFinite(options?.longZ) ? options!.longZ! : 3,
+      relFloor: Number.isFinite(options?.relFloor) ? options!.relFloor! : 0.02,
+    };
+    this.multiScaleStreams = new Map();
+    for (const kpi of kpis) this.multiScaleStreams.set(kpi, { window: [], lastKind: 'healthy' });
+  }
+
+  /** 4.0：KPI 的多时间尺度读数（纯读取；未挂载/长窗未满返回 undefined） */
+  multiScaleView(kpi: string): MultiScaleRead | undefined {
+    const st = this.multiScaleStreams?.get(kpi);
+    if (!st || st.window.length < this.multiScaleCfg.longWindow || !st.anchor) return undefined;
+    return this.computeMultiScale(kpi, { window: st.window, anchor: st.anchor });
+  }
+
+  /** 4.0：尺度读数计算（纯函数：窗 + 锚点 → 三窗 z + 判级） */
+  private computeMultiScale(
+    kpi: string,
+    st: { window: number[]; anchor: { median: number; madSigma: number } },
+  ): MultiScaleRead {
+    const cfg = this.multiScaleCfg;
+    const { median, madSigma } = st.anchor;
+    const sigmaFloor = Math.max(madSigma, cfg.relFloor * Math.abs(median), 1e-9);
+    // 退化方向归一偏离：avgLatency 上升 = 退化；其余下降 = 退化
+    const degradedShift = (mean: number) => (kpi === 'avgLatency' ? mean - median : median - mean);
+    const meanOf = (n: number) => {
+      const slice = st.window.slice(-n);
+      return slice.reduce((s, v) => s + v, 0) / slice.length;
+    };
+    const shortZ = degradedShift(meanOf(cfg.shortWindow)) / sigmaFloor;
+    const mediumZ = degradedShift(meanOf(cfg.mediumWindow)) / sigmaFloor;
+    const longZ = degradedShift(meanOf(cfg.longWindow)) / sigmaFloor;
+    const scales: MultiScaleTag[] = [];
+    if (shortZ >= cfg.shortZ) scales.push('short');
+    if (mediumZ >= cfg.mediumZ) scales.push('medium');
+    if (longZ >= cfg.longZ) scales.push('long');
+    const kind: MultiScaleKind = scales.includes('long')
+      ? 'degradation'
+      : scales.includes('medium')
+        ? 'drift'
+        : scales.includes('short')
+          ? 'fluctuation'
+          : 'healthy';
+    return {
+      kpi,
+      samples: st.window.length,
+      anchorMedian: median,
+      sigmaFloor,
+      shortMean: Number(meanOf(cfg.shortWindow).toFixed(4)),
+      mediumMean: Number(meanOf(cfg.mediumWindow).toFixed(4)),
+      longMean: Number(meanOf(cfg.longWindow).toFixed(4)),
+      shortZ: Number(shortZ.toFixed(2)),
+      mediumZ: Number(mediumZ.toFixed(2)),
+      longZ: Number(longZ.toFixed(2)),
+      scales,
+      kind,
+    };
+  }
+
+  /** 4.0：多时间尺度检验（每批快照后调用；判级翻转沿产出洞察） */
+  private checkMultiScale(kpi: string, value: number): Insight[] {
+    const st = this.multiScaleStreams?.get(kpi);
+    if (!st || !Number.isFinite(value)) return [];
+    st.window.push(value);
+    if (st.window.length > this.multiScaleCfg.longWindow) st.window.splice(0, st.window.length - this.multiScaleCfg.longWindow);
+    if (st.window.length < this.multiScaleCfg.longWindow) return []; // 长窗未满：诚实预热，不判
+    // 首个满窗冻结为稳态锚点
+    const anchor = st.anchor ?? (st.anchor = robustBaseline(st.window));
+    const read = this.computeMultiScale(kpi, { window: st.window, anchor });
+    // 清晰健康时缓慢重锚（跟随系统的合法慢迁移；异常期锚点冻结）
+    if (read.kind === 'healthy' && read.longZ < this.multiScaleCfg.longZ * 0.5) {
+      st.anchor = robustBaseline(st.window);
+    }
+    const last = st.lastKind;
+    st.lastKind = read.kind;
+    if (read.kind === 'healthy' || read.kind === last) return []; // 只在判级翻转沿打扰
+    const cfg = this.multiScaleCfg;
+    const scaleNote = `尺度标签 ${read.scales.join('+')}（短 z=${read.shortZ} / 中 z=${read.mediumZ} / 长 z=${read.longZ}，锚点 ${read.anchorMedian.toFixed(3)}）`;
+    if (read.kind === 'fluctuation') {
+      return [
+        {
+          source: 'meta-cognition',
+          category: 'kpi-multiscale-fluctuation',
+          severity: 0.35,
+          message: `KPI ${kpi} 短窗（${cfg.shortWindow} 批）偏离长窗稳态但中/长窗健康——单次波动而非退化（${scaleNote}）`,
+          suggestion: `短窗灵敏、长窗稳态未破：按波动处理（观察即可），勿触发调参或自愈——等待后续批读数确认是否持续；连续波动升级为 drift 时再行动`,
+        },
+      ];
+    }
+    if (read.kind === 'drift') {
+      return [
+        {
+          source: 'meta-cognition',
+          category: 'kpi-multiscale-drift',
+          severity: 0.6,
+          message: `KPI ${kpi} 中窗（${cfg.mediumWindow} 批）持续偏离而长窗稳态未破——慢漂移早期（${scaleNote}）`,
+          suggestion: `中期持续走弱但稳态锚点尚存：结合 3.0 相对带与 27.0 滤波斜率定位漂移速率，在长窗破位（真退化）之前介入——此时干预成本最低`,
+        },
+      ];
+    }
+    return [
+      {
+        source: 'meta-cognition',
+        category: 'kpi-multiscale-degradation',
+        severity: 0.85,
+        message: `KPI ${kpi} 短/中/长三尺度同向退化，长窗稳态锚点已破——真退化而非毛刺（${scaleNote}）`,
+        suggestion: `稳态已破：按 ${kpi} 的因果旋钮排序实施干预并持续观察保证层裁决；与「kpi-multiscale-fluctuation」的区别在于长窗均值也越限——持续性得到确认`,
+      },
+    ];
+  }
+
+  // ─────────────────── 4.0：KPI 相关性图 ───────────────────
+
+  /** 4.0：相关性滚动窗（kpi → 最近 window 个观测） */
+  private kpiCorrelationWindows?: Map<string, number[]>;
+  /** 4.0：相关性参数（attach 时定格） */
+  private kpiCorrelationCfg = { window: 24, minSamples: 12, threshold: 0.7 };
+
+  /**
+   * 4.0：挂载 KPI 相关性图（幂等覆盖，挂载即生效）。
+   *
+   * 维护 KPI 间滚动 Pearson 相关矩阵：与目标 KPI |r| ≥ 阈值的 KPI 视为
+   * 联动——调参动作自动附注 affectedKpis（调整的影响面），把「调 A 却
+   * 动了 B」的暗耦合显式化（归因混淆的第一道防线）。未挂载零漂移。
+   */
+  attachKpiCorrelation(options?: KpiCorrelationOptions): void {
+    const kpis = options?.kpis ?? ['successRate', 'avgQuality', 'avgLatency', 'cacheHitRate'];
+    this.kpiCorrelationCfg = {
+      window: Math.max(8, Math.floor(options?.window ?? 24)),
+      minSamples: Math.max(4, Math.floor(options?.minSamples ?? 12)),
+      threshold: Number.isFinite(options?.threshold) ? options!.threshold! : 0.7,
+    };
+    this.kpiCorrelationWindows = new Map();
+    for (const kpi of kpis) this.kpiCorrelationWindows.set(kpi, []);
+  }
+
+  /** 4.0：Pearson 相关系数（常序列 → 0，诚实无相关） */
+  private static pearson(x: number[], y: number[]): number {
+    const n = Math.min(x.length, y.length);
+    if (n < 2) return 0;
+    const sx = x.slice(-n);
+    const sy = y.slice(-n);
+    const mx = sx.reduce((s, v) => s + v, 0) / n;
+    const my = sy.reduce((s, v) => s + v, 0) / n;
+    let num = 0;
+    let dx = 0;
+    let dy = 0;
+    for (let i = 0; i < n; i += 1) {
+      num += (sx[i] - mx) * (sy[i] - my);
+      dx += (sx[i] - mx) ** 2;
+      dy += (sy[i] - my) ** 2;
+    }
+    const den = Math.sqrt(dx * dy);
+    return den > 1e-12 ? num / den : 0;
+  }
+
+  /** 4.0：相关性矩阵视图（纯读取；未挂载/样本不足返回 undefined） */
+  kpiCorrelationView():
+    | { window: number; samples: number; threshold: number; pairs: Array<{ a: string; b: string; r: number; linked: boolean }> }
+    | undefined {
+    const windows = this.kpiCorrelationWindows;
+    if (!windows) return undefined;
+    const kpis = [...windows.keys()];
+    const samples = kpis.length > 0 ? windows.get(kpis[0])!.length : 0;
+    const pairs: Array<{ a: string; b: string; r: number; linked: boolean }> = [];
+    if (samples >= this.kpiCorrelationCfg.minSamples) {
+      for (let i = 0; i < kpis.length; i += 1) {
+        for (let j = i + 1; j < kpis.length; j += 1) {
+          const r = MetaCognitionEngine.pearson(windows.get(kpis[i])!, windows.get(kpis[j])!);
+          pairs.push({ a: kpis[i], b: kpis[j], r: Number(r.toFixed(4)), linked: Math.abs(r) >= this.kpiCorrelationCfg.threshold });
+        }
+      }
+    }
+    return { window: this.kpiCorrelationCfg.window, samples, threshold: this.kpiCorrelationCfg.threshold, pairs };
+  }
+
+  /** 4.0：与目标 KPI 联动的 KPI 集合（|r| ≥ 阈值；纯读取） */
+  linkedKpis(kpi: string): Array<{ kpi: string; r: number }> {
+    const view = this.kpiCorrelationView();
+    if (!view) return [];
+    const linked: Array<{ kpi: string; r: number }> = [];
+    for (const p of view.pairs) {
+      if (p.a === kpi && p.linked) linked.push({ kpi: p.b, r: p.r });
+      else if (p.b === kpi && p.linked) linked.push({ kpi: p.a, r: p.r });
+    }
+    return linked;
+  }
+
+  /** 4.0：相关性序列喂入（observe 调用；未挂载零开销） */
+  private feedKpiCorrelation(kpi: string, value: number): void {
+    const window = this.kpiCorrelationWindows?.get(kpi);
+    if (!window || !Number.isFinite(value)) return;
+    window.push(value);
+    if (window.length > this.kpiCorrelationCfg.window) window.splice(0, window.length - this.kpiCorrelationCfg.window);
+  }
+
+  /**
+   * 3.0：挂载相对基线偏差带（幂等覆盖，挂载即生效）。
+   *
+   * 与 1 号静态目标线 / 12.0 保证层 / 27.0 卡尔曼的分工：
+   * - 静态目标线问「绝对水平是否达标」——慢漂移在 0.95→0.7 之间隐身；
+   * - 保证层问「是否确证低于水位线」——同一水位线的偷看免疫裁决；
+   * - 卡尔曼问「新息是否超模型方差」——需要状态转移模型先验；
+   * - 本层问「是否偏离自身滚动基线」——中位数±MAD 带给出无先验、
+   *   无绝对阈值的相对口径：基线跟系统走，慢漂移在静态线之前暴露，
+   *   平稳噪声（|z| ≲ 1.5）不误报。
+   */
+  attachRelativeKpiBand(options?: RelativeKpiBandOptions): void {
+    const kpis = options?.kpis ?? ['successRate', 'avgQuality', 'avgLatency', 'cacheHitRate'];
+    this.relativeBandCfg = {
+      window: Math.max(8, Math.floor(options?.window ?? 24)),
+      bandWidthMad: Number.isFinite(options?.bandWidthMad) ? options!.bandWidthMad! : 3.5,
+      minSamples: Math.max(3, Math.floor(options?.minSamples ?? 8)),
+    };
+    this.relativeBandWindows = new Map();
+    this.relativeBandState = new Map();
+    for (const kpi of kpis) this.relativeBandWindows.set(kpi, []);
+  }
+
+  /** 3.0：KPI 的当前相对基线带读数（纯读取；未挂载/样本不足返回 undefined） */
+  relativeKpiBandView(kpi: string): RelativeKpiBandRead | undefined {
+    const window = this.relativeBandWindows?.get(kpi);
+    if (!window || window.length === 0) return undefined;
+    const prior = window.slice(0, -1);
+    if (prior.length < this.relativeBandCfg.minSamples) return undefined;
+    const value = window[window.length - 1];
+    return this.computeRelativeBand(kpi, prior, value);
+  }
+
+  /** 3.0：相对带计算（基线 = 不含当前值的先验窗） */
+  private computeRelativeBand(kpi: string, prior: number[], value: number): RelativeKpiBandRead {
+    const { median, madSigma } = robustBaseline(prior);
+    const robustZ = (value - median) / madSigma;
+    const outOfBand = Math.abs(robustZ) > this.relativeBandCfg.bandWidthMad;
+    const degraded = outOfBand && (kpi === 'avgLatency' ? robustZ > 0 : robustZ < 0);
+    return {
+      kpi,
+      samples: prior.length,
+      baselineMedian: median,
+      madSigma,
+      value,
+      robustZ,
+      bandWidthMad: this.relativeBandCfg.bandWidthMad,
+      outOfBand,
+      degraded,
+    };
+  }
+
+  /** 3.0：相对带检验（每批快照后调用；进入退化越带的翻转沿产出洞察） */
+  private checkRelativeBand(kpi: string, value: number): Insight[] {
+    const window = this.relativeBandWindows?.get(kpi);
+    if (!window || !Number.isFinite(value)) return [];
+    window.push(value);
+    if (window.length > this.relativeBandCfg.window) window.splice(0, window.length - this.relativeBandCfg.window);
+    const prior = window.slice(0, -1);
+    if (prior.length < this.relativeBandCfg.minSamples) return [];
+    const read = this.computeRelativeBand(kpi, prior, value);
+    const last = this.relativeBandState.get(kpi) ?? false;
+    this.relativeBandState.set(kpi, read.degraded);
+    if (!read.degraded || last) return []; // 只在进入退化越带的翻转沿打扰
+    const staticTarget =
+      kpi === 'successRate' ? this.config.successRateTarget : kpi === 'avgQuality' ? this.config.qualityTarget : undefined;
+    const staticNote =
+      staticTarget !== undefined && value > staticTarget
+        ? `（仍高于静态目标线 ${staticTarget}，静态口径此时不可见）`
+        : '';
+    return [
+      {
+        source: 'meta-cognition',
+        category: 'kpi-relative-drift',
+        severity: Math.min(0.85, 0.5 + Math.min(0.3, (Math.abs(read.robustZ) - read.bandWidthMad) / 20)),
+        message: `KPI ${kpi} 相对自身基线显著偏离：当前 ${value.toFixed(3)} vs 滚动中位数 ${read.baselineMedian.toFixed(3)}（稳健 z=${read.robustZ.toFixed(1)}，MAD 带 ±${(read.bandWidthMad * read.madSigma).toFixed(4)}，${read.samples} 样本）${staticNote}`,
+        suggestion:
+          '相对基线早于静态阈值报警：系统正在偏离「一贯的自己」而非仅仅跌破绝对目标线——优先排查渐进性退化（模型缓慢劣化/负载结构漂移），结合 27.0 滤波斜率与 17.0 形状漂移定位漂移速率',
+      },
+    ];
   }
 
   /** 38.0：KPI 的动力学体质读数（纯读取；未挂载/未满窗返回 undefined） */
@@ -707,6 +1256,29 @@ export class MetaCognitionEngine {
       }
     }
 
+    // 0.95 3.0：相对基线偏差带（中位数±MAD；慢漂移早于静态阈值暴露）
+    if (this.relativeBandWindows) {
+      for (const kpi of this.relativeBandWindows.keys()) {
+        const value = kpi === 'avgLatency' ? snapshot.avgLatency : kpi === 'cacheHitRate' ? snapshot.cacheHitRate : kpi === 'successRate' ? snapshot.successRate : snapshot.avgQuality;
+        insights.push(...this.checkRelativeBand(kpi, value));
+      }
+    }
+
+    // 0.96 4.0：多时间尺度监控（短/中/长三窗；判级翻转沿产出尺度标签洞察）
+    if (this.multiScaleStreams) {
+      for (const kpi of this.multiScaleStreams.keys()) {
+        const value = kpi === 'avgLatency' ? snapshot.avgLatency : kpi === 'cacheHitRate' ? snapshot.cacheHitRate : kpi === 'successRate' ? snapshot.successRate : snapshot.avgQuality;
+        insights.push(...this.checkMultiScale(kpi, value));
+      }
+    }
+
+    // 0.97 4.0：KPI 相关性图（序列喂入；纯读数，不产洞察——零打扰）
+    if (this.kpiCorrelationWindows) {
+      for (const kpi of this.kpiCorrelationWindows.keys()) {
+        this.feedKpiCorrelation(kpi, kpi === 'avgLatency' ? snapshot.avgLatency : kpi === 'cacheHitRate' ? snapshot.cacheHitRate : kpi === 'successRate' ? snapshot.successRate : snapshot.avgQuality);
+      }
+    }
+
     // 1. z-score 异常检测（窗口足够时）
     if (this.history.length >= 5) {
       for (const kpi of ['successRate', 'avgQuality', 'cacheHitRate'] as const) {
@@ -829,6 +1401,65 @@ export class MetaCognitionEngine {
             return { streams, interpretation };
           })()
         : undefined,
+      // 3.0：相对基线偏差带（挂载后输出；中位数±MAD 相对口径）
+      relativeBands: this.relativeBandWindows
+        ? (() => {
+            const streams = [...this.relativeBandWindows!.keys()]
+              .map((kpi) => this.relativeKpiBandView(kpi))
+              .filter((r): r is RelativeKpiBandRead => r !== undefined)
+              .map((r) => ({
+                kpi: r.kpi,
+                samples: r.samples,
+                baselineMedian: Number(r.baselineMedian.toFixed(4)),
+                madSigma: Number(r.madSigma.toFixed(6)),
+                value: Number(r.value.toFixed(4)),
+                robustZ: Number(r.robustZ.toFixed(2)),
+                bandWidthMad: r.bandWidthMad,
+                outOfBand: r.outOfBand,
+                degraded: r.degraded,
+              }));
+            const degraded = streams.filter((s) => s.degraded);
+            const interpretation =
+              streams.length === 0
+                ? '相对基线带已挂载，等待基线窗积累'
+                : degraded.length === 0
+                  ? '全部 KPI 处于自身滚动基线带内（中位数±MAD 相对口径，慢漂移可见）'
+                  : `${degraded.map((s) => s.kpi).join('、')} 偏离自身基线（稳健 z=${degraded.map((s) => s.robustZ).join('/')}，静态阈值可能尚未可见）`;
+            return { streams, interpretation };
+          })()
+        : undefined,
+      // 4.0：多时间尺度监控（挂载后输出；短/中/长三窗 + 尺度合成判级）
+      multiScale: this.multiScaleStreams
+        ? (() => {
+            const streams = [...this.multiScaleStreams!.keys()]
+              .map((kpi) => this.multiScaleView(kpi))
+              .filter((r): r is MultiScaleRead => r !== undefined);
+            const alarming = streams.filter((s) => s.kind !== 'healthy');
+            const interpretation =
+              streams.length === 0
+                ? '多时间尺度监控已挂载，等待长窗积累'
+                : alarming.length === 0
+                  ? '全部 KPI 三尺度健康（短窗灵敏、长窗稳态锚点均未破）'
+                  : alarming
+                      .map((s) => `${s.kpi}=${s.kind}（${s.scales.join('+')} 越限）`)
+                      .join('、') + (alarming.some((s) => s.kind === 'degradation') ? '——长窗稳态已破，真退化' : '——长窗稳态未破，按波动/漂移口径处理');
+            return { streams, interpretation };
+          })()
+        : undefined,
+      // 4.0：KPI 相关性图（挂载后输出；滚动 Pearson 矩阵 + 联动对）
+      kpiCorrelations: this.kpiCorrelationWindows
+        ? (() => {
+            const view = this.kpiCorrelationView()!;
+            const linked = view.pairs.filter((p) => p.linked);
+            const interpretation =
+              view.pairs.length === 0
+                ? 'KPI 相关性图已挂载，样本积累中'
+                : linked.length === 0
+                  ? '无联动 KPI 对（各 KPI 独立运动，调整影响面干净）'
+                  : `联动对：${linked.map((p) => `${p.a}↔${p.b}（r=${p.r}）`).join('、')}——调整任一侧的影响面自动扩至对侧（归因防混淆）`;
+            return { ...view, interpretation };
+          })()
+        : undefined,
     };
   }
 
@@ -865,7 +1496,7 @@ export class MetaCognitionEngine {
       baseline: mean,
       zScore: Number(z.toFixed(2)),
       direction: z < 0 ? 'degraded' : 'improved',
-      timestamp: Date.now(),
+      timestamp: this.now(),
     };
   }
 
@@ -916,7 +1547,7 @@ export class MetaCognitionEngine {
    *    成败自动写回因果图（元认知从「调参」升级为「做实验」）。
    */
   private tryTune(kpi: string, value: number, target: number): TuningAction | null {
-    if (Date.now() - this.lastTuningAt < this.config.tuningCooldownMs) return null;
+    if (this.now() - this.lastTuningAt < this.config.tuningCooldownMs) return null;
 
     let action: TuningAction | null = null;
 
@@ -932,7 +1563,7 @@ export class MetaCognitionEngine {
           from: target,
           to: Number((target + step).toFixed(2)),
           reason: `因果证据优先：${parameter} 对 ${kpi} 的干预效应 ${bestKnob.ate.toFixed(2)} [${bestKnob.lower.toFixed(2)}, ${bestKnob.upper.toFixed(2)}]（${bestKnob.interventionalSamples} 次实验）`,
-          timestamp: Date.now(),
+          timestamp: this.now(),
           causalBasis: {
             ate: bestKnob.ate,
             lower: bestKnob.lower,
@@ -959,7 +1590,7 @@ export class MetaCognitionEngine {
               from,
               to,
               reason: `成功率 ${value.toFixed(2)} 低于目标 ${target}，放宽质量阈值：当前 ${from.toFixed(2)} → ${to.toFixed(2)}，减少重试风暴`,
-              timestamp: Date.now(),
+              timestamp: this.now(),
             };
           }
         } else {
@@ -971,7 +1602,7 @@ export class MetaCognitionEngine {
               from: target,
               to: relaxed,
               reason: `成功率 ${value.toFixed(2)} 低于目标 ${target}，放宽质量阈值减少重试风暴`,
-              timestamp: Date.now(),
+              timestamp: this.now(),
             };
           }
         }
@@ -982,13 +1613,18 @@ export class MetaCognitionEngine {
           from: 2,
           to: 3,
           reason: `平均质量 ${value.toFixed(2)} 低于目标 ${target}，增加重试次数`,
-          timestamp: Date.now(),
+          timestamp: this.now(),
         };
       }
     }
 
     if (action) {
-      this.lastTuningAt = Date.now();
+      this.lastTuningAt = this.now();
+      // 4.0：相关图附注影响面（与目标 KPI 联动的 KPI 一并列入——归因防混淆）
+      if (this.kpiCorrelationWindows) {
+        const linked = this.linkedKpis(kpi);
+        if (linked.length > 0) action.affectedKpis = linked.map((l) => l.kpi);
+      }
       // 5.0：登记待对账干预（下批快照结算成败 → 写回因果图）
       this.registerTuningIntervention(action, kpi, value);
     }

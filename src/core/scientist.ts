@@ -41,10 +41,24 @@
  * 与 6-9.0 的关系：6.0 定价行动、7.0 定价计划、8.0 定价思考、
  * 9.0 让知识跨域流动，本内核定价**知识获取本身**。
  * 科学家心智 = 抽象心智 × 主动求知的经济学。
+ *
+ * R5 · 11.0 进化（第五轮·世界性进化）：
+ * A. 贪心 EIG 批次（数学轴）—— designBatch：一次预约 K 个实验的
+ *    批次口径设计。单实验 EIG 只看一步；批次中同边重复实验的边际
+ *    价值递减（期望熵收缩的次模性），此前 maxCount 截断把 K 个
+ *    独立第一名重复发放——同边第 2 个实验按单实验 EIG 计价是虚报。
+ *    本版本以联合期望信息增益 jointEIG(k) = H(先验) − E_{K~Binom(k,p)}
+ *    [H(α+K, β+k−K)] 定价批次，贪心每步选全局最大边际净价值
+ *    （次模 ⇒ 贪心 ≥ (1−1/e)·最优的近似保证）。
+ * B. EIG 网格共享子计算（性能轴）—— batchEigOfBeta 的熵网格：
+ *    ψ/lnΓ 沿递推 ψ(x+1)=ψ(x)+1/x、lnΓ(x+1)=lnΓ(x)+ln x 展开
+ *    （每网格各 2 个超越函数种子），α+β+k 全网格恒定再省一项；
+ *    二项权重走对数域 + max-shift 归一（k 大时 p^j(1−p)^{k−j} 不下溢）。
+ *    与逐项调用 betaEntropy 的朴素口径数值一致（1e-9 内）且快一个量级。
  */
 
 import type { CausalKernel } from './causal-kernel.js';
-import { betaEntropy, FreeEnergyEngine } from './free-energy.js';
+import { betaEntropy, digamma, lnGamma, FreeEnergyEngine } from './free-energy.js';
 import type { TheoristEngine } from './theorist.js';
 
 // ─────────────────────────── 数据结构 ───────────────────────────
@@ -85,6 +99,20 @@ export interface DesignedExperiment {
   predictedP: number;
   hypothesis: string;
   rationale: string;
+}
+
+/**
+ * R5·11.0：批次设计单元（designBatch 产出）——批次口径的实验设计。
+ * 与 DesignedExperiment 的差别：armEig 换成批内边际 EIG（同边第 2+
+ * 个实验按联合信息增益的增量计价，不再重复发放单实验 EIG）。
+ */
+export interface BatchExperiment extends DesignedExperiment {
+  /** 批内序号（贪心选择顺序，1 起） */
+  batchIndex: number;
+  /** 批内边际 EIG（nat）：该边批内已有 k−1 个实验时第 k 个的增量 */
+  marginalEig: number;
+  /** 该问题在批内的累计实验数（含本个） */
+  armRunsInBatch: number;
 }
 
 /** 实验结算（信息台账单元） */
@@ -175,6 +203,14 @@ export class ScientistMind {
     this.kernel = kernel;
     this.freeEnergy = freeEnergy;
     this.config = { ...DEFAULT_SCIENTIST_CONFIG, ...config };
+  }
+
+  /**
+   * R5·11.0：k 次同臂实验的联合 EIG（静态纯函数直通——宿主不持有
+   * ScientistMind 实例也能做批次信息量核算，验证脚本经 dist 亦可直达）。
+   */
+  static batchEigOfBeta(alpha: number, beta: number, k: number): number {
+    return batchEigOfBeta(alpha, beta, k);
   }
 
   /** 挂载自由能引擎（实验结局的惊奇回流；幂等） */
@@ -298,6 +334,128 @@ export class ScientistMind {
     });
   }
 
+  // ─────────────────────────── R5 · 11.0 批次设计 ───────────────────────────
+
+  /**
+   * 贪心 EIG 批次设计：一次预约 maxCount 个实验的最优组合。
+   *
+   * 与 designExperiments 的分水岭：单实验口径对同一问题重复发放
+   * 单步 EIG（虚报——两个实验的联合信息 < 2×单实验信息）；批次口径
+   * 以联合期望信息增益的边际增量定价每个追加实验：
+   *   marginal(k) = jointEIG(k) − jointEIG(k−1)（次模递减）
+   * 每步在全部问题中选边际净价值最大者（混杂/定律加成只在首次纳入
+   * 计一次——它们属于问题，不属于重复实验）。次模性 ⇒ 贪心批次
+   * 总信息量 ≥ (1−1/e)·最优批次（Nemhauser 界）。
+   *
+   * @param maxCount 批次总实验数（跨问题组合预算）
+   */
+  designBatch(maxCount = 3, now = Date.now()): BatchExperiment[] {
+    // 候选评估与 designExperiments 同口径（臂选择/加成/成本）
+    interface Candidate {
+      from: string;
+      to: string;
+      arm: boolean;
+      alpha: number;
+      beta: number;
+      p: number;
+      singleEig: number;
+      bonus: number;
+      lawBonus: number;
+      costNat: number;
+      k: number; // 批内已分配实验数
+      jointK: number; // jointEIG(k)（增量滚动复用——共享子计算）
+      fromEff: { observationalAssociation: number; ate: number; confounding: number };
+      lawId?: string;
+      lawMembers?: number;
+      lawP?: number;
+    }
+    const candidates: Candidate[] = [];
+    for (const q of this.questions.values()) {
+      const eff = this.kernel.effect(q.from, q.to, now);
+      const ev = this.kernel.armEvidence(q.from, q.to, now);
+      if (!ev) continue;
+      const evidence = ev.doXSuccess + ev.doXFailure + ev.doNotXSuccess + ev.doNotXFailure;
+      if (evidence < this.config.minArmSamples * 2) continue;
+      const arms = [
+        { arm: true, s: ev.doXSuccess, f: ev.doXFailure },
+        { arm: false, s: ev.doNotXSuccess, f: ev.doNotXFailure },
+      ];
+      const evals = arms.map((a) => eigOfBeta(1 + a.s, 1 + a.f));
+      const best = evals[0]!.eig >= evals[1]!.eig ? { ...evals[0]!, arm: true } : { ...evals[1]!, arm: false };
+      const divergence = eff.confounding;
+      const bonus =
+        divergence > 0 ? Math.min(this.config.maxConfoundingBonus, -Math.log(Math.max(1e-9, 1 - divergence))) : 0;
+      const law = this.theorist?.coveringTheory(q.from, q.to, now);
+      const lawBonus = law ? Math.min(this.config.lawBonusCap, Math.log(law.members.length + 1)) : 0;
+      candidates.push({
+        from: q.from,
+        to: q.to,
+        arm: best.arm,
+        alpha: best.alpha,
+        beta: best.beta,
+        p: best.p,
+        singleEig: best.eig,
+        bonus,
+        lawBonus,
+        costNat: q.costNat ?? this.config.defaultCostNat,
+        k: 0,
+        jointK: 0,
+        fromEff: eff,
+        lawId: law?.id,
+        lawMembers: law?.members.length,
+        lawP: law?.lawP,
+      });
+    }
+
+    // 贪心：每步选边际净价值最大者；混杂/定律加成只在 k=0 时计入
+    const chosen: BatchExperiment[] = [];
+    for (let step = 1; step <= maxCount; step += 1) {
+      let bestC: Candidate | null = null;
+      let bestMarginal = 0;
+      let bestNextJoint = 0;
+      for (const c of candidates) {
+        const jointNext = batchEigOfBeta(c.alpha, c.beta, c.k + 1);
+        const marginal = jointNext - c.jointK;
+        const bonuses = c.k === 0 ? c.bonus + c.lawBonus : 0;
+        const val = marginal + bonuses - c.costNat;
+        if (val > bestMarginal) {
+          bestMarginal = val;
+          bestC = c;
+          bestNextJoint = jointNext;
+        }
+      }
+      if (bestC === null) break; // 所有边际净价值 ≤ 0：批次到此为止
+      const marginal = bestNextJoint - bestC.jointK;
+      const isFirst = bestC.k === 0;
+      bestC.k += 1;
+      bestC.jointK = bestNextJoint;
+      const totalEig = marginal + (isFirst ? bestC.bonus + bestC.lawBonus : 0);
+      this.experimentCounter += 1;
+      chosen.push({
+        id: this.experimentCounter,
+        from: bestC.from,
+        to: bestC.to,
+        arm: bestC.arm,
+        armEig: round(marginal),
+        confoundingBonus: round(isFirst ? bestC.bonus : 0),
+        totalEig: round(totalEig),
+        netValue: round(totalEig - bestC.costNat),
+        lawBonus: round(isFirst ? bestC.lawBonus : 0),
+        priorAlpha: bestC.alpha,
+        priorBeta: bestC.beta,
+        predictedP: round(bestC.p),
+        hypothesis: `假设：do(${bestC.from}=${bestC.arm ? '启用' : '停用'})（批内第 ${bestC.k} 次）对 ${bestC.to} 的效应将落在后验 ${bestC.p.toFixed(2)} 附近`,
+        rationale: isFirst
+          ? `批次首发：一步熵收缩 ${bestC.singleEig.toFixed(3)} nat（联合口径边际 ${marginal.toFixed(3)} nat）${bestC.bonus > 0 ? ` + 混杂加成 ${round(bestC.bonus)} nat` : ''}${bestC.lawBonus > 0 ? ` + 定律试验 ${round(bestC.lawBonus)} nat` : ''}`
+          : `批次追加：第 ${bestC.k} 个实验边际 ${marginal.toFixed(3)} nat（次模递减——联合口径下重复实验按增量计价，不虚报）`,
+        batchIndex: chosen.length + 1,
+        marginalEig: round(marginal),
+        armRunsInBatch: bestC.k,
+      });
+    }
+    return chosen;
+  }
+
   // ─────────────────────────── 执行与结算 ───────────────────────────
 
   /**
@@ -404,6 +562,77 @@ function eigOfBeta(alpha: number, beta: number): { eig: number; alpha: number; b
   const hYes = betaEntropy(alpha + 1, beta);
   const hNo = betaEntropy(alpha, beta + 1);
   return { eig: Math.max(0, h0 - (p * hYes + (1 - p) * hNo)), alpha, beta, p };
+}
+
+/**
+ * R5·11.0：k 次同臂实验的联合期望信息增益（nat）。
+ *
+ * jointEIG(k) = H(α,β) − Σ_j C(k,j)·p^j·(1−p)^{k−j}·H(α+j, β+k−j)，p = α/(α+β)
+ * （对 K~Binomial(k,p) 的后验熵取期望——一次预约 k 个实验期望换回的知识）。
+ * 数学性质：jointEIG(0) = 0；关于 k 次模（边际递减）⇒ 贪心批次设计
+ * 有 (1−1/e) 近似保证；对一切 (α,β,k) 非负（互信息非负性）。
+ *
+ * 性能（EIG 网格的共享子计算）：熵网格 H(α+j, β+k−j) 的 ψ/lnΓ 序列
+ * 沿递推 ψ(x+1)=ψ(x)+1/x、lnΓ(x+1)=lnΓ(x)+ln x 展开——每网格只需
+ * 2 个 digamma + 2 个 lnGamma 种子；α+β+k 在全网格恒定再省去第三项。
+ * 二项权重在对数域计算并 max-shift 归一（k 大时不下溢）。
+ * 与逐项 betaEntropy 的朴素口径在 1e-9 内一致（verify-r5-causal 锚定）。
+ */
+export function batchEigOfBeta(alpha: number, beta: number, k: number): number {
+  if (!Number.isFinite(alpha) || !Number.isFinite(beta) || alpha <= 0 || beta <= 0) {
+    throw new Error('batchEigOfBeta: alpha/beta 需为正有限数');
+  }
+  if (!Number.isInteger(k) || k < 0) throw new Error('batchEigOfBeta: k 需为 ≥ 0 的整数');
+  if (k === 0) return 0;
+  const p = alpha / (alpha + beta);
+  // ψ 与 lnΓ 的递推网格（ψ(x+1)=ψ(x)+1/x；lnΓ(x+1)=lnΓ(x)+ln x）
+  const psiA = new Float64Array(k + 1);
+  const lnGA = new Float64Array(k + 1);
+  psiA[0] = digamma(alpha);
+  lnGA[0] = lnGamma(alpha);
+  for (let j = 1; j <= k; j += 1) {
+    psiA[j] = psiA[j - 1]! + 1 / (alpha + j - 1);
+    lnGA[j] = lnGA[j - 1]! + Math.log(alpha + j - 1);
+  }
+  const psiB = new Float64Array(k + 1);
+  const lnGB = new Float64Array(k + 1);
+  psiB[0] = digamma(beta);
+  lnGB[0] = lnGamma(beta);
+  for (let j = 1; j <= k; j += 1) {
+    psiB[j] = psiB[j - 1]! + 1 / (beta + j - 1);
+    lnGB[j] = lnGB[j - 1]! + Math.log(beta + j - 1);
+  }
+  // 网格常量：α+j + β+k−j = α+β+k 与 j 无关
+  const abk = alpha + beta + k;
+  const lnGabk = lnGamma(abk);
+  const psiAbk = digamma(abk);
+  // 对数域二项权重：Pascal 递推 ln C(k,j) = ln C(k,j−1) + ln(k−j+1) − ln j，
+  // 再平移一步对数几率——除 2 个种子外全程无超越函数调用（共享子计算）
+  const lnP = Math.log(p);
+  const ln1mP = Math.log(1 - p);
+  const lnW = new Float64Array(k + 1);
+  lnW[0] = k * ln1mP;
+  const odds = lnP - ln1mP;
+  for (let j = 1; j <= k; j += 1) {
+    lnW[j] = lnW[j - 1]! + Math.log((k - j + 1) / j) + odds;
+  }
+  let wMax = Number.NEGATIVE_INFINITY;
+  for (let j = 0; j <= k; j += 1) if (lnW[j]! > wMax) wMax = lnW[j]!;
+  let wSum = 0;
+  for (let j = 0; j <= k; j += 1) {
+    lnW[j] = Math.exp(lnW[j]! - wMax); // 原地存归一前权重
+    wSum += lnW[j]!;
+  }
+  // 期望后验熵 + 联合 EIG（H0 − E[H]）
+  const h0 = betaEntropy(alpha, beta);
+  let expectedPosteriorH = 0;
+  for (let j = 0; j <= k; j += 1) {
+    const a = alpha + j;
+    const b = beta + k - j;
+    const hj = lnGA[j]! + lnGB[k - j]! - lnGabk - (a - 1) * psiA[j]! - (b - 1) * psiB[k - j]! + (abk - 2) * psiAbk;
+    expectedPosteriorH += (lnW[j]! / wSum) * hj;
+  }
+  return h0 - expectedPosteriorH;
 }
 
 function clampProb(p: number): number {

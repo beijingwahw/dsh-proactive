@@ -26,10 +26,17 @@
 
 import fs from 'node:fs';
 import type { CryptoEngine } from '../security/crypto-engine.js';
-import { createMemoryBackend, sanitizeMemoryStore } from './backend.js';
+import { createMemoryBackend, sanitizeMemoryStore, segment } from './backend.js';
 import type { MemoryBackend } from './backend.js';
 import type { IMemoryStore } from '../contracts.js';
 import { BAYES_PRIOR_STRENGTH, DECAY_HALF_LIFE_DAYS, LEGACY_EVIDENCE_DISCOUNT, type MemoryEvidence, evidenceRankScore, initEvidence, observeEvidence, readEvidence, wilsonLowerBound } from '../core/evidence.js';
+// 创世纪 60.0/68.0：率失真压缩规划（影子价格 KPI）/ NCD 近邻查重
+import { planMemoryCompression } from '../engines-frontier/genesis25.js';
+
+// 第二轮创世纪 98.0：经验重放（睡眠固化——白天经验离线固化成策略改进）
+import { ReplayConsolidator, type SleepResult } from '../engines-frontier/autonomy25.js';
+import type { CompressionPlan } from '../core/rate-distortion.js';
+import { ncd, ncdTriangleAudit, type NcdTriangleAudit } from '../core/compression-distance.js';
 
 // 3.0：统计内核迁至 core/evidence.ts（全层共享），此处再导出保持既有导入路径兼容
 export { wilsonLowerBound, DECAY_HALF_LIFE_DAYS, BAYES_PRIOR_STRENGTH } from '../core/evidence.js';
@@ -244,6 +251,13 @@ export interface SemanticMemory {
   lastDecayAt?: number;
   /** 3.0：时间加权 Beta 证据（并行旁路，同 DistilledStrategy.evidence） */
   evidence?: MemoryEvidence;
+  /**
+   * 第四轮：仲裁地位（缺省 active）。冲突仲裁的败方降级为「历史观点」
+   * （status='historical'）——检索层不再采纳，但记录保留可查（不删除）。
+   */
+  status?: 'active' | 'historical';
+  /** 第四轮：降级审计（败方专属：何时被谁以多少分差击败——翻转可解释） */
+  demotedBy?: { at: number; winnerId: string; winnerScore: number; loserScore: number };
 }
 
 /** 程序记忆条件维度（含 outcome/root-cause，用于反思规则） */
@@ -316,6 +330,10 @@ export interface ProceduralMemory {
   lastDecayAt?: number;
   /** 3.0：时间加权 Beta 证据（并行旁路，同 DistilledStrategy.evidence） */
   evidence?: MemoryEvidence;
+  /** 第四轮：仲裁地位（同 SemanticMemory.status——败方降历史不删除） */
+  status?: 'active' | 'historical';
+  /** 第四轮：降级审计（同 SemanticMemory.demotedBy） */
+  demotedBy?: { at: number; winnerId: string; winnerScore: number; loserScore: number };
 }
 
 /** 蒸馏报告（distillKnowledge 产物） */
@@ -572,6 +590,8 @@ export class LongTermMemory implements IMemoryStore {
   private backend: MemoryBackend;
   private store: MemoryStore;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 封账标志：dispose 后一切持久化为 no-op（HMR 卸载竞态防护） */
+  private disposed = false;
   private flushOnExit: () => void;
 
   // ── 3.0：主键索引（热路径 O(n) → O(1)）──
@@ -648,7 +668,10 @@ export class LongTermMemory implements IMemoryStore {
         best = pattern;
       }
     }
-    return bestScore >= MIN_SIMILARITY ? best : undefined;
+    if (bestScore < MIN_SIMILARITY) return undefined;
+    // 第三轮：分层存储旁路统计（挂载后命中即 touch——不改返回值，零漂移）
+    if (this.tieredStore && best) this.tieredTouch(best.fingerprint);
+    return best;
   }
 
   /**
@@ -701,12 +724,10 @@ export class LongTermMemory implements IMemoryStore {
     pattern.bestModelCombination = { ...params.modelAssignments };
 
     // 更新模型画像
-    const qualityValues = Object.values(params.qualityScores);
     for (const [nodeId, modelId] of Object.entries(params.modelAssignments)) {
       const quality = params.qualityScores[nodeId] ?? this.avgQuality(params.qualityScores);
       this.updateModelProfile(modelId, params.taskType, true, params.totalLatency, quality, params.tokenCost);
     }
-    void qualityValues;
 
     // 全局统计
     const stats = this.store.globalStats;
@@ -866,6 +887,780 @@ export class LongTermMemory implements IMemoryStore {
   /** 获取全部任务模式（迁移导出用） */
   getAllTaskPatterns(): TaskPatternMemory[] {
     return [...this.store.taskPatterns];
+  }
+
+  /**
+   * 60.0：挂载率失真压缩规划（幂等覆盖，挂载即生效——只读规划口径）。
+   *
+   * 蒸馏水位规则只回答「样本够不够多」，本内核回答「预算内留谁」：
+   * compressionPlan() 把全部任务模式折算为 (价值, 全保真比特, 压缩档
+   * 比特, 留存率)，在预算约束下解出 keep/compress/drop 三档与影子价格
+   * λ*——λ* 逐周期追踪即记忆健康度的第一条信息论 KPI（λ*↑ = 记忆库
+   * 趋紧，遗忘变贵之前边际条目先变贵；λ*=0 = 容量充裕）。内核不发起
+   * 任何删除/压缩动作（零介入承诺），执行仍由蒸馏管线决定。
+   */
+  attachCompressionPlanner(options?: { budgetBits?: number }): void {
+    this.compressionPlannerConfig = { budgetBits: options?.budgetBits ?? 1_000_000 };
+  }
+
+  /** 60.0：压缩规划配置（未挂载 undefined） */
+  private compressionPlannerConfig?: { budgetBits: number };
+
+  /**
+   * 60.0：当前记忆库的压缩规划（未挂载 / 无模式时 undefined）。
+   * @param budgetBits 预算比特覆盖（缺省取挂载时的配置）
+   */
+  compressionPlan(budgetBits?: number): CompressionPlan | undefined {
+    if (!this.compressionPlannerConfig) return undefined;
+    const patterns = this.getAllTaskPatterns();
+    if (patterns.length === 0) return undefined;
+    return planMemoryCompression(
+      patterns.map((p) => ({
+        taskSummary: p.taskSummary,
+        confidence: p.confidence,
+        successfulPlanCount: p.successfulPlans.length,
+      })),
+      budgetBits ?? this.compressionPlannerConfig.budgetBits,
+    );
+  }
+
+  /**
+   * 98.0：挂载经验重放固化器（幂等覆盖，挂载即生效——旁路口径）。
+   *
+   * 白天操作环经验逐条 push 进 PrioritizedReplay（分层配额——每个任务
+   * 域一个层，新域流量再大也挤不掉旧域的存活样本，灾难遗忘的存储侧
+   * 防线）；心跳睡眠阶段 consolidate() 只重放不采新、IS 加权消化——
+   * improvement 即「这一觉值不值」的量化汇报（心智报告素材）。旁路
+   * 挂载，不改变记忆库任何读写路径（零漂移）。
+   */
+  attachExperienceReplay(options?: { capacity?: number; alpha?: number; beta?: number; seed?: number }): void {
+    this.replayConsolidator = new ReplayConsolidator(options);
+  }
+
+  /** 98.0：经验重放固化器（未挂载零介入） */
+  private replayConsolidator?: ReplayConsolidator;
+
+  /** 98.0：记一条经验（task = 任务域；arm = 动作/模型下标；tdError = 预测误差口径） */
+  replayPush(transition: { task: string; arm: number; reward: number; tdError?: number }): void {
+    this.replayConsolidator?.push(transition);
+  }
+
+  /** 98.0：分层配额读数（未挂载时 undefined） */
+  replayStats(): ReturnType<ReplayConsolidator['stats']> | undefined {
+    return this.replayConsolidator?.stats();
+  }
+
+  /** 98.0：睡眠固化（只重放不采新；truth = 逐臂真值供数方注入；未挂载时 undefined） */
+  sleepConsolidate(truth: ReadonlyArray<number>, options?: { rounds?: number; batchSize?: number }): SleepResult | undefined {
+    return this.replayConsolidator?.consolidate(truth, options);
+  }
+
+  /**
+   * 68.0：挂载 NCD 查重（幂等覆盖，挂载即生效——只读咨询口径）。
+   *
+   * 新经验入库前的近邻查重有了「内容相近」的零模型判据：ncdNearDuplicate()
+   * 用归一化压缩距离（LZW，NCD 口径）在既有模式摘要中找最近邻——距离
+   * ≤ 阈值（缺省 0.65 = 自距离 0.41~0.55 + 裕量）即「内容同源，建议归并
+   * 而非新建」。不改变任何写入路径（零漂移）；归并决策由蒸馏管线消费。
+   */
+  attachNcdDedup(options?: { threshold?: number }): void {
+    this.ncdDedupConfig = { threshold: Math.max(0, Math.min(1, options?.threshold ?? 0.65)) };
+  }
+
+  /** 68.0：NCD 查重配置（未挂载 undefined） */
+  private ncdDedupConfig?: { threshold: number };
+
+  /**
+   * 68.0：NCD 近邻查重（未挂载 / 语料为空时 undefined）。
+   * @param text 候选经验文本
+   * @param corpus 对照语料（缺省取 Top 20 任务模式摘要）
+   */
+  ncdNearDuplicate(text: string, corpus?: string[]): { hit: boolean; distance: number; bestMatch: string; threshold: number } | undefined {
+    if (!this.ncdDedupConfig) return undefined;
+    const items = corpus ?? this.getTopPatterns(20).map((p) => p.taskSummary);
+    if (items.length === 0) return undefined;
+    let best = items[0];
+    let bestDistance = ncd(text, best);
+    for (const candidate of items.slice(1)) {
+      const d = ncd(text, candidate);
+      if (d < bestDistance) {
+        bestDistance = d;
+        best = candidate;
+      }
+    }
+    return { hit: bestDistance <= this.ncdDedupConfig.threshold, distance: Number(bestDistance.toFixed(4)), bestMatch: best, threshold: this.ncdDedupConfig.threshold };
+  }
+
+  /** 68.0：语料三角不等式审计（非度量的诚实统计；未挂载 undefined） */
+  ncdAudit(corpus?: string[]): NcdTriangleAudit | undefined {
+    if (!this.ncdDedupConfig) return undefined;
+    const items = corpus ?? this.getTopPatterns(12).map((p) => p.taskSummary);
+    if (items.length < 3) return undefined;
+    return ncdTriangleAudit(items);
+  }
+
+  // ───────────────────── 第三轮升级：分层存储（热/温/冷） ─────────────────────
+
+  /**
+   * 挂载分层存储（幂等覆盖；旁路统计口径——findPattern 命中时 touch 该模式，
+   * 不改变任何返回值）。条目按（访问频率 × 价值）在 热/温/冷 三层间
+   * 晋升/降级，各层容量预算独立；价值分缺省取 confidence（记忆自身的
+   * 可信度即价值），可由 valueOf 覆盖。未挂载零介入（零漂移）。
+   */
+  attachTieredStorage(options?: TieredStoreOptions & { valueOf?: (fingerprint: string) => number }): void {
+    this.tieredStore = new TieredStore(options);
+    this.tieredValueOf = options?.valueOf;
+  }
+
+  /** 分层存储实例（未挂载 undefined） */
+  private tieredStore?: TieredStore;
+  /** 指纹 → 价值分覆盖（缺省用模式 confidence） */
+  private tieredValueOf?: (fingerprint: string) => number;
+
+  /** 分层存储层内定位（未挂载 / 未登记 undefined） */
+  tierOf(fingerprint: string): StorageTier | undefined {
+    return this.tieredStore?.tierOf(fingerprint);
+  }
+
+  /** 分层存储读数（未挂载 undefined） */
+  tieredStats(): TieredStoreStats | undefined {
+    return this.tieredStore?.stats();
+  }
+
+  /** 分层存储内部 touch（验证/预热用；未挂载零介入） */
+  tieredTouch(fingerprint: string): StorageTier | undefined {
+    if (!this.tieredStore) return undefined;
+    const pattern = this.idxPattern.get(fingerprint);
+    const value = this.tieredValueOf?.(fingerprint) ?? pattern?.confidence ?? 0.5;
+    return this.tieredStore.touch(fingerprint, value);
+  }
+
+  // ───────────────────── 第三轮升级：检索多路融合（关键词/相似度/图邻居/别名） ─────────────────────
+
+  /**
+   * 挂载多路融合检索（幂等覆盖）。单键模糊匹配（findPattern 的
+   * taskType+complexity+features 单路打分）升级为四路加权融合：
+   * - 关键词路：查询 token 与 摘要+指纹 token 的 Jaccard（缺省权重 0.4）
+   * - 相似度路：既有 similarity() 口径（缺省 0.3）
+   * - 图邻居路：种子模式（关键词 top1 / 指定种子）在共现图上的邻居按
+   *   related() 序折算（缺省 0.2）——「关键词弱但图上强关联」由此召回
+   * - 别名路：查询中的 #n 短索引经 AliasMap 反解精确命中（缺省 0.1）
+   * 未挂载零介入（fusedSearch 返回 undefined——诚实降级，不静默走单路）。
+   */
+  attachRetrievalFusion(options?: RetrievalFusionOptions): void {
+    const weights = { keyword: 0.4, similarity: 0.3, graph: 0.2, alias: 0.1, ...options?.weights };
+    const total = Math.max(1e-9, weights.keyword + weights.similarity + weights.graph + weights.alias);
+    this.retrievalFusion = {
+      graph: options?.graph,
+      aliases: options?.aliases,
+      weights: {
+        keyword: weights.keyword / total,
+        similarity: weights.similarity / total,
+        graph: weights.graph / total,
+        alias: weights.alias / total,
+      },
+    };
+  }
+
+  /** 融合检索配置（未挂载 undefined） */
+  private retrievalFusion?: { graph?: RetrievalFusionOptions['graph']; aliases?: RetrievalFusionOptions['aliases']; weights: Required<NonNullable<RetrievalFusionOptions['weights']>> };
+
+  /**
+   * 多路融合检索：全部任务模式按四路信号加权打分，返回带各路得分的排序。
+   * @param query 自然语言查询（关键词路 token 源 + #n 别名扫描）
+   * @param opts 相似度路上下文 / 图路种子指纹 / 返回上限（缺省 8）
+   * @returns 未挂载融合时 undefined
+   */
+  fusedSearch(
+    query: string,
+    opts?: { taskType?: string; complexity?: number; features?: string[]; limit?: number; seedFingerprint?: string },
+  ): FusionHit[] | undefined {
+    if (!this.retrievalFusion) return undefined;
+    const { graph, aliases, weights } = this.retrievalFusion;
+    const limit = opts?.limit ?? 8;
+    const queryTokens = new Set(segment(query));
+
+    // 关键词路先行：同时为图路选种子（关键词最强者）
+    let keywordBest: TaskPatternMemory | undefined;
+    let keywordBestScore = 0;
+    const keywordScores = new Map<string, number>();
+    for (const pattern of this.store.taskPatterns) {
+      const patternTokens = new Set(segment(`${pattern.taskSummary} ${pattern.fingerprint}`));
+      let intersection = 0;
+      for (const token of queryTokens) if (patternTokens.has(token)) intersection += 1;
+      const union = queryTokens.size + patternTokens.size - intersection;
+      const score = union > 0 ? intersection / union : 0;
+      keywordScores.set(pattern.fingerprint, score);
+      if (score > keywordBestScore) {
+        keywordBestScore = score;
+        keywordBest = pattern;
+      }
+    }
+
+    // 图路：种子（显式指定 > 关键词 top1）的邻居序折算（rank 0 → 1.0 线性衰减）
+    const graphScores = new Map<string, number>();
+    const seed = opts?.seedFingerprint ?? keywordBest?.fingerprint;
+    if (graph && seed) {
+      const neighbors = graph.related(seed, 16);
+      graphScores.set(seed, 1);
+      neighbors.forEach((id, i) => {
+        if (!graphScores.has(id)) graphScores.set(id, Number(((neighbors.length - i) / neighbors.length).toFixed(4)));
+      });
+    }
+
+    // 别名路：查询中的 #n 短索引反解
+    const aliasHits = new Set<string>();
+    if (aliases) {
+      for (const match of query.match(/#\d+/g) ?? []) {
+        const resolved = aliases.resolve(match);
+        if (resolved) aliasHits.add(resolved);
+      }
+    }
+
+    const complexity = opts?.complexity ?? 0.5;
+    const hits: FusionHit[] = [];
+    for (const pattern of this.store.taskPatterns) {
+      const signals: FusionSignals = {
+        keyword: keywordScores.get(pattern.fingerprint) ?? 0,
+        similarity: this.similarity(pattern, opts?.taskType ?? '', complexity, opts?.features ?? []),
+        graph: graphScores.get(pattern.fingerprint) ?? 0,
+        alias: aliasHits.has(pattern.fingerprint) ? 1 : 0,
+      };
+      const score =
+        weights.keyword * signals.keyword +
+        weights.similarity * signals.similarity +
+        weights.graph * signals.graph +
+        weights.alias * signals.alias;
+      if (score > 0) {
+        hits.push({ pattern, score: Number(score.toFixed(6)), signals });
+      }
+    }
+    hits.sort((a, b) => b.score - a.score || (a.pattern.fingerprint < b.pattern.fingerprint ? -1 : 1));
+    return hits.slice(0, limit);
+  }
+
+  // ───────────────────── 第四轮升级 ①：冲突记忆仲裁 ─────────────────────
+  //
+  // 同主题（结构签名相同）新旧条目结论相反时，按（证据量 × 新鲜度 × 来源质量）
+  // 三因子几何加权裁决：胜者留任现役，败方降级为「历史观点」（status='historical'，
+  // 检索不再采纳）但记录保留可查——新证据可推翻旧结论，旧观点永不丢失。
+  // 与既有 upsert 冲突消解（supportCount 1.5 倍硬门槛，败方直接丢弃/被替换）互补：
+  // 仲裁是显式的、可解释的、带审计轨迹的裁决通道。
+
+  /** 仲裁器配置（未挂载 undefined——arbitrateConflicts 返回 undefined 零介入） */
+  private arbiterConfig?: { weights: ArbitrationWeights; freshnessHalfLifeDays: number; now: () => number };
+
+  /**
+   * 挂载冲突仲裁器（幂等覆盖，模块级 opt-in）。
+   * @param options 三因子权重 / 新鲜度半衰期 / 注入时钟（确定性验证用）
+   */
+  attachArbiter(options?: ArbitrationOptions): void {
+    const weights = { evidence: 0.5, freshness: 0.3, sourceQuality: 0.2, ...options?.weights };
+    const total = Math.max(1e-9, weights.evidence + weights.freshness + weights.sourceQuality);
+    this.arbiterConfig = {
+      weights: { evidence: weights.evidence / total, freshness: weights.freshness / total, sourceQuality: weights.sourceQuality / total },
+      freshnessHalfLifeDays: options?.freshnessHalfLifeDays ?? 30,
+      now: options?.now ?? (() => Date.now()),
+    };
+  }
+
+  /**
+   * 仲裁式准入（第四轮主通道）：新经验到达时若与现役条目同主题反结论，
+   * 不再走「1.5 倍支撑硬门槛」（门槛不过即丢弃挑战者 / 过门槛即销毁在位者），
+   * 而是三因子加权裁决：
+   * - 挑战者胜 → 挑战者准入 active，在位者降级 historical（新证据推翻旧结论）
+   * - 在位者胜 → 挑战者仍入库但标记 historical（败方不删除——观点留档可查）
+   * - 同分 → 挑战者准入 active，双方都不降级（证据不足不翻案）
+   * 无冲突时退化为常规 upsert 语义。
+   * @returns 裁决结果；未挂载仲裁器时 undefined（零介入）
+   */
+  admitWithArbitration<T extends SemanticMemory | ProceduralMemory>(
+    memory: T,
+  ):
+    | { outcome: 'arbitrated'; verdict: ArbitrationVerdict; challengerStatus: 'active' | 'historical' }
+    | { outcome: 'tie'; verdict: ArbitrationVerdict }
+    | { outcome: 'no-conflict'; write: 'created' | 'updated' | 'duplicate' | 'merged' | 'superseded' }
+    | undefined {
+    if (!this.arbiterConfig) return undefined;
+    const { weights, freshnessHalfLifeDays, now } = this.arbiterConfig;
+    const at = now();
+
+    // 定位同主题反结论的现役在位者（多在位时取三因子得分最强者应战）
+    const isSemantic = 'action' in memory === false;
+    const incumbents = isSemantic
+      ? this.store.semanticMemories.filter((m) => m.id !== memory.id && m.status !== 'historical')
+      : this.store.proceduralMemories.filter((p) => p.id !== memory.id && p.status !== 'historical');
+    const conflicting = incumbents.filter((m) => {
+      if (isSemantic) {
+        const challenger = memory as SemanticMemory;
+        const incumbent = m as SemanticMemory;
+        return incumbent.conclusion.value !== challenger.conclusion.value && semanticSignature(incumbent) === semanticSignature(challenger);
+      }
+      const challenger = memory as ProceduralMemory;
+      const incumbent = m as ProceduralMemory;
+      if (incumbent.kind !== challenger.kind || incumbent.action.type !== challenger.action.type) return false;
+      const modelA = incumbent.action.params['model'];
+      const modelB = challenger.action.params['model'];
+      if (typeof modelA !== 'string' || typeof modelB !== 'string' || modelA === modelB) return false;
+      return conditionSignature(incumbent.conditions) === conditionSignature(challenger.conditions);
+    });
+    if (conflicting.length === 0) {
+      const write = isSemantic
+        ? this.upsertSemanticMemory(memory as SemanticMemory)
+        : this.upsertProceduralMemory(memory as ProceduralMemory);
+      return { outcome: 'no-conflict', write };
+    }
+
+    const challengerScore = arbitrationScore(memory, weights, freshnessHalfLifeDays, at);
+    let strongest = conflicting[0]!;
+    let strongestScore = arbitrationScore(strongest, weights, freshnessHalfLifeDays, at);
+    for (const incumbent of conflicting.slice(1)) {
+      const score = arbitrationScore(incumbent, weights, freshnessHalfLifeDays, at);
+      if (score.score > strongestScore.score) {
+        strongest = incumbent;
+        strongestScore = score;
+      }
+    }
+
+    if (Math.abs(challengerScore.score - strongestScore.score) < 1e-9) {
+      // 同分：挑战者准入但双方都不降级（保守——证据不足不翻案）
+      this.insertAbstractMemory(memory);
+      this.schedulePersist();
+      const verdict: ArbitrationVerdict = {
+        kind: isSemantic ? 'semantic' : 'procedural',
+        signature: this.conflictSignatureOf(memory),
+        outcome: 'tie',
+        winner: challengerScore,
+        loser: strongestScore,
+        flipped: false,
+        rawSupportUpset: false,
+      };
+      return { outcome: 'tie', verdict };
+    }
+
+    const challengerWins = challengerScore.score > strongestScore.score;
+    const flipped = challengerWins && memory.distilledAt > strongest.distilledAt;
+    const rawSupportUpset = challengerWins && memory.supportCount < strongest.supportCount;
+    if (challengerWins) {
+      strongest.status = 'historical';
+      strongest.demotedBy = { at, winnerId: memory.id, winnerScore: challengerScore.score, loserScore: strongestScore.score };
+      this.insertAbstractMemory(memory);
+    } else {
+      memory.status = 'historical';
+      memory.demotedBy = { at, winnerId: strongest.id, winnerScore: strongestScore.score, loserScore: challengerScore.score };
+      this.insertAbstractMemory(memory);
+    }
+    this.schedulePersist();
+    const verdict: ArbitrationVerdict = {
+      kind: isSemantic ? 'semantic' : 'procedural',
+      signature: this.conflictSignatureOf(memory),
+      outcome: 'arbitrated',
+      winner: challengerWins ? challengerScore : strongestScore,
+      loser: challengerWins ? strongestScore : challengerScore,
+      flipped,
+      rawSupportUpset,
+    };
+    return { outcome: 'arbitrated', verdict, challengerStatus: challengerWins ? 'active' : 'historical' };
+  }
+
+  /** 冲突对结构签名（语义 = domain|结论类型|条件；程序 = kind|动作类型|条件） */
+  private conflictSignatureOf(memory: SemanticMemory | ProceduralMemory): string {
+    return 'action' in memory
+      ? `${memory.kind}|${memory.action.type}|${conditionSignature(memory.conditions)}`
+      : semanticSignature(memory);
+  }
+
+  /** 语义/程序记忆裸插入（维护主键索引；同 id 已存在时不覆盖——仲裁准入只走新条目） */
+  private insertAbstractMemory(memory: SemanticMemory | ProceduralMemory): void {
+    if ('action' in memory) {
+      const proc = memory as ProceduralMemory;
+      if (this.idxProcedural.has(proc.id)) return;
+      this.store.proceduralMemories.push(proc);
+      this.idxProcedural.set(proc.id, proc);
+      this.idxProceduralName.set(proc.name, proc);
+    } else {
+      const semantic = memory as SemanticMemory;
+      if (this.idxSemantic.has(semantic.id)) return;
+      this.store.semanticMemories.push(semantic);
+      this.idxSemantic.set(semantic.id, semantic);
+      this.idxSemanticStatement.set(semantic.statement, semantic);
+    }
+  }
+
+  /**
+   * 扫描并仲裁全部同主题冲突对（语义记忆 + 程序记忆）。
+   *
+   * 冲突判定：语义 = 同 domain+结论类型+条件签名但结论值不同；程序 = 同
+   * kind+动作类型+条件签名但目标模型不同。逐对按三因子加权得分裁决：
+   * - 胜者留任 active，败方降级 historical（写入 demotedBy 审计轨迹）
+   * - 同分（< 1e-9）判 tie：不降级（保守——证据不足时不翻案）
+   * - flips 计数「更晚沉淀者胜出」的翻转裁决（新证据推翻旧结论）
+   *
+   * @returns 仲裁报告；未挂载仲裁器时 undefined
+   */
+  arbitrateConflicts(): ArbitrationReport | undefined {
+    if (!this.arbiterConfig) return undefined;
+    const { weights, freshnessHalfLifeDays, now } = this.arbiterConfig;
+    const at = now();
+    const verdicts: ArbitrationVerdict[] = [];
+    let flips = 0;
+    let defended = 0;
+    let ties = 0;
+
+    const arbitratePair = (
+      kind: ArbitrationVerdict['kind'],
+      signature: string,
+      a: SemanticMemory | ProceduralMemory,
+      b: SemanticMemory | ProceduralMemory,
+    ): void => {
+      const scoreA = arbitrationScore(a, weights, freshnessHalfLifeDays, at);
+      const scoreB = arbitrationScore(b, weights, freshnessHalfLifeDays, at);
+      if (Math.abs(scoreA.score - scoreB.score) < 1e-9) {
+        ties += 1;
+        verdicts.push({ kind, signature, outcome: 'tie', winner: scoreA, loser: scoreB, flipped: false, rawSupportUpset: false });
+        return;
+      }
+      const winner = scoreA.score > scoreB.score ? { entry: a, score: scoreA } : { entry: b, score: scoreB };
+      const loser = scoreA.score > scoreB.score ? { entry: b, score: scoreB } : { entry: a, score: scoreA };
+      const flipped = winner.entry.distilledAt > loser.entry.distilledAt;
+      const rawSupportUpset = winner.entry.supportCount < loser.entry.supportCount;
+      if (flipped) flips += 1;
+      else defended += 1;
+      winner.entry.status = 'active';
+      loser.entry.status = 'historical';
+      loser.entry.demotedBy = { at, winnerId: winner.entry.id, winnerScore: winner.score.score, loserScore: loser.score.score };
+      verdicts.push({ kind, signature, outcome: 'arbitrated', winner: winner.score, loser: loser.score, flipped, rawSupportUpset });
+    };
+
+    // 语义记忆冲突对（同签名不同结论值）
+    for (let i = 0; i < this.store.semanticMemories.length; i += 1) {
+      const a = this.store.semanticMemories[i]!;
+      for (let j = i + 1; j < this.store.semanticMemories.length; j += 1) {
+        const b = this.store.semanticMemories[j]!;
+        if (a.status === 'historical' || b.status === 'historical') continue; // 已降级者不重复受审
+        if (a.conclusion.value === b.conclusion.value) continue;
+        const sigA = semanticSignature(a);
+        if (sigA !== semanticSignature(b)) continue;
+        arbitratePair('semantic', sigA, a, b);
+      }
+    }
+
+    // 程序记忆冲突对（同 kind+动作类型+条件签名但目标模型不同）
+    for (let i = 0; i < this.store.proceduralMemories.length; i += 1) {
+      const a = this.store.proceduralMemories[i]!;
+      for (let j = i + 1; j < this.store.proceduralMemories.length; j += 1) {
+        const b = this.store.proceduralMemories[j]!;
+        if (a.status === 'historical' || b.status === 'historical') continue;
+        if (a.kind !== b.kind || a.action.type !== b.action.type) continue;
+        const modelA = a.action.params['model'];
+        const modelB = b.action.params['model'];
+        if (typeof modelA !== 'string' || typeof modelB !== 'string' || modelA === modelB) continue;
+        if (conditionSignature(a.conditions) !== conditionSignature(b.conditions)) continue;
+        arbitratePair('procedural', `${a.kind}|${a.action.type}|${conditionSignature(a.conditions)}`, a, b);
+      }
+    }
+
+    if (verdicts.length > 0) this.schedulePersist();
+    return {
+      arbitratedAt: at,
+      conflictsConsidered: verdicts.length,
+      verdicts,
+      flips,
+      defended,
+      ties,
+      demotedCount: verdicts.filter((v) => v.outcome === 'arbitrated').length,
+    };
+  }
+
+  /**
+   * 历史观点查询（仲裁败方不删除的兑现）：返回全部被降级的历史条目。
+   * @param kind 限定记忆类别；缺省两类合并
+   */
+  historicalViews(kind?: 'semantic' | 'procedural'): Array<SemanticMemory | ProceduralMemory> {
+    const semantic = kind === undefined || kind === 'semantic' ? this.store.semanticMemories.filter((m) => m.status === 'historical') : [];
+    const procedural = kind === undefined || kind === 'procedural' ? this.store.proceduralMemories.filter((p) => p.status === 'historical') : [];
+    return [...semantic, ...procedural];
+  }
+
+  // ───────────────────── 第四轮升级 ②：记忆老化温度曲线 ─────────────────────
+  //
+  // 条目随年龄从热到温到冷非线性冷却；访问与被引用（蒸馏溯源）保温。
+  // 温度驱动处置建议（keep/compress/archive/evict-candidate）——荒废的高龄
+  // 条目先降温归档，被反复使用/引用的常青知识保温驻留。
+
+  /** 温度模型配置（未挂载 undefined——temperatureProfile 零介入） */
+  private temperatureModel?: TemperatureModelOptions & { citations?: (fingerprint: string) => number };
+
+  /**
+   * 挂载老化温度模型（幂等覆盖，模块级 opt-in）。
+   * @param options 冷却半衰期/保温增益/注入时钟/引用计数注入（缺省按蒸馏溯源指纹统计）
+   */
+  attachTemperatureModel(options?: TemperatureModelOptions & { citations?: (fingerprint: string) => number }): void {
+    this.temperatureModel = { ...options };
+  }
+
+  /** 默认引用计数：策略/语义/程序记忆的 sourceFingerprints 对该模式的引用总数 */
+  private defaultCitationCount(fingerprint: string): number {
+    let count = 0;
+    for (const s of this.store.distilledStrategies) if (s.sourceFingerprint === fingerprint) count += 1;
+    for (const m of this.store.semanticMemories) if (m.sourceFingerprints.includes(fingerprint)) count += 1;
+    for (const p of this.store.proceduralMemories) if (p.sourceFingerprints.includes(fingerprint)) count += 1;
+    return count;
+  }
+
+  /**
+   * 全库温度剖面（未挂载模型时 undefined）。
+   * 每条任务模式给出：年龄/访问/引用/保温系数/有效年龄/温度/温层/处置建议，
+   * 外加层内计数与「保温 vs 荒废」分岔强度（divergence = 温度极差）。
+   */
+  temperatureProfile(): TemperatureProfile | undefined {
+    if (!this.temperatureModel) return undefined;
+    const now = this.temperatureModel.now?.() ?? Date.now();
+    const halfLifeDays = this.temperatureModel.halfLifeDays ?? 14;
+    const accessGain = this.temperatureModel.accessGain ?? 0.5;
+    const citationGain = this.temperatureModel.citationGain ?? 0.75;
+    const citationsOf = this.temperatureModel.citations ?? ((fp: string) => this.defaultCitationCount(fp));
+
+    const entries: TemperatureReading[] = this.store.taskPatterns.map((p) => {
+      const ageDays = Math.max(0, (now - p.firstSeenAt) / 86_400_000);
+      const reading = temperatureOf({ ageDays, accesses: p.frequency, citations: citationsOf(p.fingerprint) }, { halfLifeDays, accessGain, citationGain });
+      const suggestion: TemperatureReading['suggestion'] =
+        reading.band === 'hot' || reading.band === 'warm'
+          ? 'keep'
+          : reading.band === 'cold'
+            ? 'compress'
+            : p.confidence < 0.3
+              ? 'evict-candidate'
+              : 'archive';
+      return { fingerprint: p.fingerprint, ...reading, suggestion };
+    });
+
+    const bands: Record<TemperatureBand, number> = { hot: 0, warm: 0, cold: 0, frozen: 0 };
+    const suggestions = { keep: 0, compress: 0, archive: 0, evictCandidate: 0 };
+    for (const e of entries) {
+      bands[e.band] += 1;
+      if (e.suggestion === 'keep') suggestions.keep += 1;
+      else if (e.suggestion === 'compress') suggestions.compress += 1;
+      else if (e.suggestion === 'archive') suggestions.archive += 1;
+      else suggestions.evictCandidate += 1;
+    }
+    const temps = entries.map((e) => e.temperature);
+    return {
+      generatedAt: now,
+      entries,
+      bands,
+      suggestions,
+      divergence: temps.length > 0 ? Number((Math.max(...temps) - Math.min(...temps)).toFixed(6)) : 0,
+    };
+  }
+
+  // ───────────────────── 第四轮升级 ③：经验因果链溯源 ─────────────────────
+  //
+  // 每条沉淀记录「从哪次执行 → 哪次反思 → 哪条洞察」的因果链（根节点为感知
+  // 信号 id），跨沉淀可链式衍生（derivedFromMemoryId）——任何一条经验都能
+  // 逐级回溯到最初的信号。请求级内存登记（同 AliasMap 口径，不持久化）。
+
+  /** memoryId → 因果链（会话级） */
+  private causality = new Map<string, CausalChain>();
+
+  /**
+   * 登记一条沉淀的因果链（幂等覆盖）。
+   * @returns 'created' 首次登记 / 'updated' 覆盖既有链
+   */
+  noteCausality(memoryId: string, chain: CausalChain): 'created' | 'updated' {
+    const existed = this.causality.has(memoryId);
+    this.causality.set(memoryId, { ...chain });
+    return existed ? 'updated' : 'created';
+  }
+
+  /**
+   * 因果链溯源：从指定记忆逐级回溯（derivedFromMemoryId 链）到最初的信号。
+   * @returns 完整路径 + 完备性判定；未登记时 undefined
+   */
+  traceCausality(memoryId: string): ProvenanceTrace | undefined {
+    if (!this.causality.has(memoryId)) return undefined;
+    const path: ProvenanceTraceStep[] = [];
+    const visited = new Set<string>();
+    let cursor: string | undefined = memoryId;
+    while (cursor && !visited.has(cursor) && path.length < 64) {
+      const chain = this.causality.get(cursor);
+      if (!chain) break;
+      visited.add(cursor);
+      path.push({ memoryId: cursor, chain: { ...chain }, complete: chainComplete(chain) });
+      cursor = chain.derivedFromMemoryId;
+    }
+    return {
+      memoryId,
+      path,
+      complete: path.every((step) => step.complete),
+      depth: path.length,
+      rootSignalId: path.length > 0 ? path[path.length - 1]!.chain.signalId : '',
+    };
+  }
+
+  /** 因果链统计（链数 / 完备链数 / 最大溯源深度） */
+  causalityStats(): { chains: number; complete: number; maxDepth: number } {
+    let complete = 0;
+    let maxDepth = 0;
+    for (const memoryId of this.causality.keys()) {
+      const trace = this.traceCausality(memoryId)!;
+      if (trace.complete) complete += 1;
+      maxDepth = Math.max(maxDepth, trace.depth);
+    }
+    return { chains: this.causality.size, complete, maxDepth };
+  }
+
+  // ───────────────────── 第四轮升级 ④：记忆健康审计 ─────────────────────
+  //
+  // 全库健康报告：重复率（NCD 近邻）/ 矛盾率（同主题反结论）/ 孤岛率（无人
+  // 引用且无图邻接）/ 陈旧率（长期未见）/ 分布漂移（早期 vs 近期任务类型
+  // 构成的 Jensen-Shannon 散度）。只读分析，无副作用——体检不治病，治病
+  // 由蒸馏/仲裁/温度模型各管一摊。
+
+  /**
+   * 全库健康审计。
+   * @param options 注入时钟 / NCD 查重阈值 / 陈旧天数 / 采样上限 / 图邻接注入（孤岛判定第二口径）
+   */
+  healthAudit(options?: HealthAuditOptions): MemoryHealthReport {
+    const now = options?.now?.() ?? Date.now();
+    const duplicateThreshold = options?.duplicateThreshold ?? 0.6;
+    const stalenessDays = options?.stalenessDays ?? 45;
+    const sampleCap = options?.sampleCap ?? 24;
+    const DAY = 86_400_000;
+
+    const totals = {
+      patterns: this.store.taskPatterns.length,
+      strategies: this.store.distilledStrategies.length,
+      semantic: this.store.semanticMemories.length,
+      procedural: this.store.proceduralMemories.length,
+    };
+
+    // ── 重复率：NCD 近邻对（采样上限内两两比对，确定性取库序前 sampleCap 条） ──
+    const sampled = this.store.taskPatterns.slice(0, Math.max(0, sampleCap));
+    const duplicatePairs: MemoryHealthReport['duplicatePairs'] = [];
+    const duplicated = new Set<string>();
+    for (let i = 0; i < sampled.length; i += 1) {
+      for (let j = i + 1; j < sampled.length; j += 1) {
+        const distance = ncd(sampled[i]!.taskSummary, sampled[j]!.taskSummary);
+        if (distance <= duplicateThreshold) {
+          duplicatePairs.push({ a: sampled[i]!.fingerprint, b: sampled[j]!.fingerprint, distance: Number(distance.toFixed(4)) });
+          duplicated.add(sampled[i]!.fingerprint);
+          duplicated.add(sampled[j]!.fingerprint);
+        }
+      }
+    }
+    const duplicateRate = totals.patterns > 0 ? Number((duplicated.size / totals.patterns).toFixed(6)) : 0;
+
+    // ── 矛盾率：同主题反结论对（语义签名 / 程序目标模型两口径；不区分 active/historical——历史观点仍是「库内矛盾」的存量事实） ──
+    const contradictions: MemoryHealthReport['contradictions'] = [];
+    for (let i = 0; i < this.store.semanticMemories.length; i += 1) {
+      for (let j = i + 1; j < this.store.semanticMemories.length; j += 1) {
+        const a = this.store.semanticMemories[i]!;
+        const b = this.store.semanticMemories[j]!;
+        if (a.conclusion.value === b.conclusion.value) continue;
+        const sigA = semanticSignature(a);
+        if (sigA === semanticSignature(b)) contradictions.push({ kind: 'semantic', ids: [a.id, b.id], signature: sigA });
+      }
+    }
+    for (let i = 0; i < this.store.proceduralMemories.length; i += 1) {
+      for (let j = i + 1; j < this.store.proceduralMemories.length; j += 1) {
+        const a = this.store.proceduralMemories[i]!;
+        const b = this.store.proceduralMemories[j]!;
+        if (a.kind !== b.kind || a.action.type !== b.action.type) continue;
+        const modelA = a.action.params['model'];
+        const modelB = b.action.params['model'];
+        if (typeof modelA !== 'string' || typeof modelB !== 'string' || modelA === modelB) continue;
+        if (conditionSignature(a.conditions) === conditionSignature(b.conditions)) {
+          contradictions.push({ kind: 'procedural', ids: [a.id, b.id], signature: `${a.kind}|${a.action.type}|${conditionSignature(a.conditions)}` });
+        }
+      }
+    }
+    const abstractTotal = totals.semantic + totals.procedural;
+    const contradictionRate = abstractTotal > 0 ? Number((contradictions.length / abstractTotal).toFixed(6)) : 0;
+
+    // ── 孤岛率：无蒸馏引用 且（注入口径下）无图邻接的任务模式 ──
+    const referenced = new Set<string>();
+    for (const s of this.store.distilledStrategies) referenced.add(s.sourceFingerprint);
+    for (const m of this.store.semanticMemories) for (const fp of m.sourceFingerprints) referenced.add(fp);
+    for (const p of this.store.proceduralMemories) for (const fp of p.sourceFingerprints) referenced.add(fp);
+    const isolated: string[] = [];
+    for (const p of this.store.taskPatterns) {
+      if (referenced.has(p.fingerprint)) continue;
+      if (options?.linkedTo ? options.linkedTo(p.fingerprint) : false) continue;
+      isolated.push(p.fingerprint);
+    }
+    const isolationRate = totals.patterns > 0 ? Number((isolated.length / totals.patterns).toFixed(6)) : 0;
+
+    // ── 陈旧率：lastSeenAt 早于 stalenessDays 前 ──
+    const staleCutoff = now - stalenessDays * DAY;
+    const stale: string[] = [];
+    for (const p of this.store.taskPatterns) if (p.lastSeenAt < staleCutoff) stale.push(p.fingerprint);
+    const stalenessRate = totals.patterns > 0 ? Number((stale.length / totals.patterns).toFixed(6)) : 0;
+
+    // ── 分布漂移：firstSeenAt 早晚半仓的任务类型构成 Jensen-Shannon 散度（比特） ──
+    const distributionDrift = this.distributionDrift(now);
+
+    // ── 综合健康分：五类缺陷加权扣分（漂移按 0.5 比特归一封顶） ──
+    const driftNorm = Math.min(1, distributionDrift.jsDivergenceBits / 0.5);
+    const defectMass =
+      0.2 * duplicateRate + 0.25 * contradictionRate + 0.2 * isolationRate + 0.2 * stalenessRate + 0.15 * driftNorm;
+    const healthScore = Number((100 * (1 - defectMass)).toFixed(2));
+
+    return {
+      generatedAt: now,
+      totals,
+      duplicateRate,
+      duplicatePairs,
+      contradictionRate,
+      contradictions,
+      isolationRate,
+      isolated,
+      stalenessRate,
+      stale,
+      distributionDrift,
+      healthScore,
+    };
+  }
+
+  /** 任务类型分布漂移（早期 vs 近期 cohort，JSD 比特；样本不足以分层时全零） */
+  private distributionDrift(now: number): MemoryHealthReport['distributionDrift'] {
+    const result: MemoryHealthReport['distributionDrift'] = {
+      jsDivergenceBits: 0,
+      taskTypes: [],
+      cohorts: { early: 0, late: 0 },
+    };
+    if (this.store.taskPatterns.length < 2) return result;
+    const sorted = [...this.store.taskPatterns].sort((a, b) => a.firstSeenAt - b.firstSeenAt || (a.fingerprint < b.fingerprint ? -1 : 1));
+    const mid = sorted[ Math.floor(sorted.length / 2) ]!.firstSeenAt;
+    const earlyMass = new Map<string, number>();
+    const lateMass = new Map<string, number>();
+    let earlyTotal = 0;
+    let lateTotal = 0;
+    for (const p of sorted) {
+      const type = p.fingerprint.split('::')[0] ?? 'general';
+      if (p.firstSeenAt < mid) {
+        earlyMass.set(type, (earlyMass.get(type) ?? 0) + Math.max(1, p.frequency));
+        earlyTotal += Math.max(1, p.frequency);
+      } else {
+        lateMass.set(type, (lateMass.get(type) ?? 0) + Math.max(1, p.frequency));
+        lateTotal += Math.max(1, p.frequency);
+      }
+    }
+    result.cohorts = { early: sorted.filter((p) => p.firstSeenAt < mid).length, late: sorted.length - sorted.filter((p) => p.firstSeenAt < mid).length };
+    if (earlyTotal === 0 || lateTotal === 0) return result;
+    const share = (m: Map<string, number>, total: number, type: string): number => (m.get(type) ?? 0) / total;
+    const types = [...new Set([...earlyMass.keys(), ...lateMass.keys()])].sort();
+    let jsd = 0;
+    for (const type of types) {
+      const pi = share(earlyMass, earlyTotal, type);
+      const qi = share(lateMass, lateTotal, type);
+      const mi = (pi + qi) / 2;
+      if (pi > 0) jsd += 0.5 * pi * Math.log2(pi / mi);
+      if (qi > 0) jsd += 0.5 * qi * Math.log2(qi / mi);
+      result.taskTypes.push({ type, earlyShare: Number(pi.toFixed(4)), lateShare: Number(qi.toFixed(4)), delta: Number((qi - pi).toFixed(4)) });
+    }
+    result.jsDivergenceBits = Number(Math.min(1, jsd).toFixed(6));
+    return result;
   }
 
   /** 获取全部决策反馈（迁移导出用） */
@@ -1214,7 +2009,10 @@ export class LongTermMemory implements IMemoryStore {
     } = {},
   ): SemanticMemory | undefined {
     const now = Date.now();
-    const candidates = this.store.semanticMemories.filter((m) => m.taskTypes.length === 0 || m.taskTypes.includes(taskType));
+    // 第四轮：被仲裁降级的「历史观点」不再作为现役规律被采纳（未标记时零漂移）
+    const candidates = this.store.semanticMemories.filter(
+      (m) => m.status !== 'historical' && (m.taskTypes.length === 0 || m.taskTypes.includes(taskType)),
+    );
     let best: SemanticMemory | undefined;
     let bestScore = 0;
     for (const mem of candidates) {
@@ -1230,11 +2028,11 @@ export class LongTermMemory implements IMemoryStore {
     return best;
   }
 
-  /** 获取指定任务类型的语义记忆（3.0：按证据化排序分降序） */
+  /** 获取指定任务类型的语义记忆（3.0：按证据化排序分降序；第四轮：历史观点除外） */
   getSemanticMemories(taskType: string, limit = 5): SemanticMemory[] {
     const now = Date.now();
     return this.store.semanticMemories
-      .filter((m) => m.taskTypes.length === 0 || m.taskTypes.includes(taskType))
+      .filter((m) => m.status !== 'historical' && (m.taskTypes.length === 0 || m.taskTypes.includes(taskType)))
       .sort((a, b) => evidenceRankScore(b.confidence, b.evidence, now) - evidenceRankScore(a.confidence, a.evidence, now))
       .slice(0, limit);
   }
@@ -1254,12 +2052,17 @@ export class LongTermMemory implements IMemoryStore {
    *    支撑数累加、置信度按证据加权、溯源指纹取并集、衰减基准重置（'merged'）
    * 3. 同 id 直接覆盖（'updated'） / 新增（'created'）
    *
+   * 第四轮：bypassConflictGate（迁移导入专用）——迁移是传输不是裁决，包内
+   * 条目在上游已仲裁过（含历史观点），导入侧不得再走冲突门槛二次裁决。
+   *
    * @returns 'created' / 'updated' / 'merged' / 'superseded' / 'duplicate'
    */
-  upsertSemanticMemory(memory: SemanticMemory): 'created' | 'updated' | 'duplicate' | 'merged' | 'superseded' {
+  upsertSemanticMemory(memory: SemanticMemory, options?: { bypassConflictGate?: boolean }): 'created' | 'updated' | 'duplicate' | 'merged' | 'superseded' {
     // ── 1. 冲突消解：同签名不同结论的旧规律 ──
     const signature = semanticSignature(memory);
-    const conflicting = this.store.semanticMemories.find(
+    const conflicting = options?.bypassConflictGate
+      ? undefined
+      : this.store.semanticMemories.find(
       (m) =>
         m.id !== memory.id &&
         semanticSignature(m) === signature &&
@@ -1398,7 +2201,7 @@ export class LongTermMemory implements IMemoryStore {
     } = {},
   ): ProceduralMemory | undefined {
     const candidates = this.store.proceduralMemories.filter(
-      (p) => p.kind === kind && (p.taskTypes.length === 0 || p.taskTypes.includes(taskType)),
+      (p) => p.kind === kind && p.status !== 'historical' && (p.taskTypes.length === 0 || p.taskTypes.includes(taskType)),
     );
     let best: ProceduralMemory | undefined;
     let bestScore = 0;
@@ -1416,11 +2219,11 @@ export class LongTermMemory implements IMemoryStore {
     return best;
   }
 
-  /** 获取指定任务类型的程序记忆（3.0：按证据化排序分降序） */
+  /** 获取指定任务类型的程序记忆（3.0：按证据化排序分降序；第四轮：历史观点除外） */
   getProceduralMemories(taskType: string, kind?: ProceduralMemory['kind'], limit = 5): ProceduralMemory[] {
     const now = Date.now();
     return this.store.proceduralMemories
-      .filter((p) => (kind ? p.kind === kind : true) && (p.taskTypes.length === 0 || p.taskTypes.includes(taskType)))
+      .filter((p) => (kind ? p.kind === kind : true) && p.status !== 'historical' && (p.taskTypes.length === 0 || p.taskTypes.includes(taskType)))
       .sort((a, b) => evidenceRankScore(b.confidence, b.evidence, now) - evidenceRankScore(a.confidence, a.evidence, now))
       .slice(0, limit);
   }
@@ -1436,12 +2239,16 @@ export class LongTermMemory implements IMemoryStore {
    * 冲突判定：同结构签名（kind + 动作类型 + 目标模型维度 + 条件）但目标模型不同
    * （如"长代码任务偏好模型A" vs "偏好模型B"）→ 新证据显著更强时取代，否则丢弃。
    *
+   * 第四轮：bypassConflictGate（迁移导入专用，语义同 upsertSemanticMemory）。
+   *
    * @returns 'created' / 'updated' / 'merged' / 'superseded' / 'duplicate'
    */
-  upsertProceduralMemory(memory: ProceduralMemory): 'created' | 'updated' | 'duplicate' | 'merged' | 'superseded' {
+  upsertProceduralMemory(memory: ProceduralMemory, options?: { bypassConflictGate?: boolean }): 'created' | 'updated' | 'duplicate' | 'merged' | 'superseded' {
     // ── 1. 冲突消解：同条件同动作类型但目标模型不同（如"偏好模型A" vs "偏好模型B"） ──
     const conditionSig = conditionSignature(memory.conditions);
-    const realConflicting = this.store.proceduralMemories.find((p) => {
+    const realConflicting = options?.bypassConflictGate
+      ? undefined
+      : this.store.proceduralMemories.find((p) => {
       if (p.id === memory.id) return false;
       if (p.kind !== memory.kind || p.action.type !== memory.action.type) return false;
       if (conditionSignature(p.conditions) !== conditionSig) return false;
@@ -1892,11 +2699,16 @@ export class LongTermMemory implements IMemoryStore {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
-    this.persist();
+    this.backend.save(this.store);
   }
 
-  /** 释放资源（落盘 + 移除 beforeExit 监听 + 关闭后端连接） */
+  /** 释放资源（落盘 + 移除 beforeExit 监听 + 关闭后端连接）。
+   *  先封账再关库：HMR 卸载后仍在途的异步回调可能再次 schedulePersist——
+   *  不封账会让新定时器在 backend.close() 之后触发 save，未捕获的
+   *  "database is not open" 直接杀死进程（HMR 热重载实测两次复现）。 */
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true; // 封账：此后一切定时器与落盘为 no-op
     this.flushSync();
     process.removeListener('beforeExit', this.flushOnExit);
     this.backend.close();
@@ -1914,8 +2726,9 @@ export class LongTermMemory implements IMemoryStore {
     return this.backend.load();
   }
 
-  /** 防抖持久化调度 */
+  /** 防抖持久化调度（封账后 no-op——见 dispose 的竞态说明） */
   private schedulePersist(): void {
+    if (this.disposed) return;
     this.store.lastUpdatedAt = Date.now();
     if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
@@ -1928,6 +2741,7 @@ export class LongTermMemory implements IMemoryStore {
 
   /** 执行持久化（委托后端：SQLite 事务 / JSON 原子写 / 加密落盘） */
   private persist(): void {
+    if (this.disposed) return;
     this.backend.save(this.store);
   }
 
@@ -2023,8 +2837,10 @@ export class LongTermMemory implements IMemoryStore {
     const patternType = pattern.fingerprint.split('::')[0] ?? '';
     const typeScore = patternType === taskType ? 1 : patternType.startsWith(taskType) || taskType.startsWith(patternType) ? 0.5 : 0;
 
-    // complexity：从指纹中还原分桶值
-    const patternComplexity = Number(pattern.fingerprint.split('::')[1] ?? 0.5);
+    // complexity：从指纹中还原分桶值（畸形/缺失段回退 0.5 中性复杂度——
+    // 否则 NaN 沿相似度传播，NaN 比较恒 false 会让该模式静默绕过匹配门槛）
+    const parsedComplexity = Number(pattern.fingerprint.split('::')[1]);
+    const patternComplexity = Number.isFinite(parsedComplexity) ? parsedComplexity : 0.5;
     const complexityScore = Math.max(0, 1 - Math.abs(patternComplexity - complexity) * 2);
 
     // features：Jaccard 系数
@@ -2058,4 +2874,530 @@ export class LongTermMemory implements IMemoryStore {
   private rollingAvg(prevAvg: number, newValue: number, count: number): number {
     return count <= 1 ? newValue : prevAvg + (newValue - prevAvg) / count;
   }
+}
+
+// ───────────────────── 第三轮升级：分层存储（热/温/冷） ─────────────────────
+
+/** 存储层：热（快/小/高频高价值）/ 温（中）/ 冷（大/归档/待淘汰） */
+export type StorageTier = 'hot' | 'warm' | 'cold';
+
+/** 分层存储配置 */
+export interface TieredStoreOptions {
+  /** 热层容量预算（缺省 64） */
+  hotCapacity?: number;
+  /** 温层容量预算（缺省 256） */
+  warmCapacity?: number;
+  /** 冷层容量预算（缺省 1024） */
+  coldCapacity?: number;
+  /** 新近度半衰期（毫秒，缺省 10 分钟——超过半衰期未访问，分数减半） */
+  halfLifeMs?: number;
+  /** 注入时钟（确定性实验/测试用；缺省 Date.now） */
+  now?: () => number;
+}
+
+/** 分层条目（层内定位与打分原料） */
+export interface TieredEntry {
+  key: string;
+  /** 价值分 0~1（记忆口径缺省 confidence——可信度即价值） */
+  value: number;
+  /** 访问次数（命中累积） */
+  freq: number;
+  lastAccessAt: number;
+  tier: StorageTier;
+}
+
+/** 分层存储读数（命中率按层拆口径） */
+export interface TieredStoreStats {
+  size: number;
+  hot: number;
+  warm: number;
+  cold: number;
+  hits: number;
+  misses: number;
+  /** 各层命中计数 */
+  hotHits: number;
+  warmHits: number;
+  coldHits: number;
+  /** 晋升（cold→warm / warm→hot）累计次数 */
+  promotions: number;
+  /** 降级（hot→warm / warm→cold）累计次数 */
+  demotions: number;
+  /** 冷层淘汰累计次数 */
+  evictions: number;
+  /** 热层命中率 = hotHits / (hits + misses)——快层捕获的访问占比 */
+  hotHitRate: number;
+  /** 总命中率（三层合计） */
+  totalHitRate: number;
+}
+
+/**
+ * 分层存储（第三轮升级）：条目按（访问频率 × 价值）在 热/温/冷 三层间
+ * 晋升/降级，各层容量预算独立。
+ *
+ * 打分（晋升/降级/淘汰的唯一裁决）：
+ *   score = value × (1 + log2(1 + freq)) × 0.5^(闲置时长 / halfLifeMs)
+ * ——价值 × 频次对数 × 新近度三因子：高价值高频新近者进热层；低价值
+ * 一次性访问者（噪声）即使新近也压不过热层常客的 log(freq) 增益。
+ *
+ * 与单层 LRU 的本质差异：LRU 只看新近度，一次冷噪声访问即可把常驻热键
+ * 挤出缓存；分层存储的降级/淘汰看综合分，噪声键在冷层即被价值分筛掉，
+ * 热层由「被反复验证的高价值条目」稳态占据。
+ */
+export class TieredStore {
+  private tiers: Record<StorageTier, Map<string, TieredEntry>>;
+  private options: Required<Pick<TieredStoreOptions, 'hotCapacity' | 'warmCapacity' | 'coldCapacity' | 'halfLifeMs'>> & Pick<TieredStoreOptions, 'now'>;
+  private hits = 0;
+  private misses = 0;
+  private tierHits: Record<StorageTier, number> = { hot: 0, warm: 0, cold: 0 };
+  private promotions = 0;
+  private demotions = 0;
+  private evictions = 0;
+
+  constructor(options?: TieredStoreOptions) {
+    this.options = {
+      hotCapacity: options?.hotCapacity ?? 64,
+      warmCapacity: options?.warmCapacity ?? 256,
+      coldCapacity: options?.coldCapacity ?? 1024,
+      halfLifeMs: options?.halfLifeMs ?? 10 * 60 * 1000,
+      now: options?.now,
+    };
+    this.tiers = { hot: new Map(), warm: new Map(), cold: new Map() };
+  }
+
+  private now(): number {
+    return this.options.now?.() ?? Date.now();
+  }
+
+  /** 综合分：价值 × 频次对数增益 × 新近度指数衰减 */
+  private score(entry: TieredEntry): number {
+    const age = Math.max(0, this.now() - entry.lastAccessAt);
+    const recency = Math.pow(0.5, age / this.options.halfLifeMs);
+    return entry.value * (1 + Math.log2(1 + entry.freq)) * recency;
+  }
+
+  /** 层容量预算 */
+  private capacityOf(tier: StorageTier): number {
+    return tier === 'hot' ? this.options.hotCapacity : tier === 'warm' ? this.options.warmCapacity : this.options.coldCapacity;
+  }
+
+  /** 层内综合分最低者 */
+  private lowestOf(tier: StorageTier): TieredEntry | undefined {
+    let lowest: TieredEntry | undefined;
+    let lowestScore = Infinity;
+    for (const entry of this.tiers[tier].values()) {
+      const score = this.score(entry);
+      if (score < lowestScore) {
+        lowestScore = score;
+        lowest = entry;
+      }
+    }
+    return lowest;
+  }
+
+  /** 降级链：层满 → 本层最低分降下一层（cold 满 → 淘汰） */
+  private ensureCapacity(tier: StorageTier): void {
+    const capacity = this.capacityOf(tier);
+    while (this.tiers[tier].size > capacity) {
+      const lowest = this.lowestOf(tier);
+      if (!lowest) return;
+      this.tiers[tier].delete(lowest.key);
+      if (tier === 'cold') {
+        this.evictions += 1;
+      } else {
+        const next: StorageTier = tier === 'hot' ? 'warm' : 'cold';
+        lowest.tier = next;
+        this.tiers[next].set(lowest.key, lowest);
+        this.demotions += 1;
+        this.ensureCapacity(next);
+      }
+    }
+  }
+
+  /** 晋升：score 超过上一层最低分时上移一层（单次访问最多一级） */
+  private tryPromote(entry: TieredEntry): void {
+    const upper: StorageTier | undefined = entry.tier === 'cold' ? 'warm' : entry.tier === 'warm' ? 'hot' : undefined;
+    if (!upper) return;
+    const upperLowest = this.lowestOf(upper);
+    if (this.tiers[upper].size < this.capacityOf(upper) || (upperLowest && this.score(entry) > this.score(upperLowest))) {
+      this.tiers[entry.tier].delete(entry.key);
+      entry.tier = upper;
+      this.tiers[upper].set(entry.key, entry);
+      this.promotions += 1;
+      this.ensureCapacity(upper);
+    }
+  }
+
+  /**
+   * 访问一个键：命中则记一次访问（freq + 新近度刷新）并尝试晋升，返回命中层；
+   * 未命中则登记（新条目自冷层起步——价值未证明前不占快层）并返回 undefined。
+   * @param key 条目键（记忆口径 = 模式指纹）
+   * @param value 价值分 0~1（同一键重复访问时以最新值为准）
+   */
+  touch(key: string, value = 0.5): StorageTier | undefined {
+    let entry: TieredEntry | undefined;
+    for (const tier of ['hot', 'warm', 'cold'] as const) {
+      entry = this.tiers[tier].get(key);
+      if (entry) break;
+    }
+    if (entry) {
+      this.hits += 1;
+      this.tierHits[entry.tier] += 1;
+      entry.freq += 1;
+      entry.lastAccessAt = this.now();
+      entry.value = value;
+      this.tryPromote(entry);
+      return entry.tier;
+    }
+    this.misses += 1;
+    const fresh: TieredEntry = { key, value, freq: 1, lastAccessAt: this.now(), tier: 'cold' };
+    this.tiers.cold.set(key, fresh);
+    this.ensureCapacity('cold');
+    // 高价值新条目的申诉性晋升（仅当仍存活于冷层——刚被容量淘汰者不复活）
+    const survivor = this.tiers.cold.get(key);
+    if (survivor) this.tryPromote(survivor);
+    return undefined;
+  }
+
+  /** 只读定位（不改统计） */
+  tierOf(key: string): StorageTier | undefined {
+    for (const tier of ['hot', 'warm', 'cold'] as const) {
+      if (this.tiers[tier].has(key)) return tier;
+    }
+    return undefined;
+  }
+
+  /** 只读条目（打分原料透明化） */
+  peek(key: string): TieredEntry | undefined {
+    for (const tier of ['hot', 'warm', 'cold'] as const) {
+      const entry = this.tiers[tier].get(key);
+      if (entry) return { ...entry };
+    }
+    return undefined;
+  }
+
+  /** 读数（命中率按层拆口径——热层命中率是快层价值的核心指标） */
+  stats(): TieredStoreStats {
+    const total = this.hits + this.misses;
+    return {
+      size: this.tiers.hot.size + this.tiers.warm.size + this.tiers.cold.size,
+      hot: this.tiers.hot.size,
+      warm: this.tiers.warm.size,
+      cold: this.tiers.cold.size,
+      hits: this.hits,
+      misses: this.misses,
+      hotHits: this.tierHits.hot,
+      warmHits: this.tierHits.warm,
+      coldHits: this.tierHits.cold,
+      promotions: this.promotions,
+      demotions: this.demotions,
+      evictions: this.evictions,
+      hotHitRate: total > 0 ? Number((this.tierHits.hot / total).toFixed(4)) : 0,
+      totalHitRate: total > 0 ? Number((this.hits / total).toFixed(4)) : 0,
+    };
+  }
+}
+
+// ───────────────────── 第三轮升级：多路融合检索类型 ─────────────────────
+
+/** 融合检索挂载选项 */
+export interface RetrievalFusionOptions {
+  /** 共现图（结构化注入：只需 related(id, limit)——MemoryGraph 天然满足） */
+  graph?: { related(id: string, limit?: number): string[] };
+  /** 别名映射（结构化注入：只需 resolve(alias)——AliasMap 天然满足） */
+  aliases?: { resolve(alias: string): string | undefined };
+  /** 四路权重（缺省 关键词 0.4 / 相似度 0.3 / 图 0.2 / 别名 0.1；自动归一化） */
+  weights?: Partial<Record<'keyword' | 'similarity' | 'graph' | 'alias', number>>;
+}
+
+/** 四路信号得分（0~1，融合前的原始口径） */
+export interface FusionSignals {
+  keyword: number;
+  similarity: number;
+  graph: number;
+  alias: number;
+}
+
+/** 融合命中（带各路信号与加权总分——排序可解释） */
+export interface FusionHit {
+  pattern: TaskPatternMemory;
+  score: number;
+  signals: FusionSignals;
+}
+
+// ───────────────────── 第四轮升级 ①：冲突记忆仲裁类型（纯函数口径） ─────────────────────
+
+/** 仲裁三因子权重（归一化前可任意正数；缺省 证据 0.5 / 新鲜 0.3 / 来源 0.2） */
+export interface ArbitrationWeights {
+  evidence: number;
+  freshness: number;
+  sourceQuality: number;
+}
+
+/** 仲裁器挂载选项（模块级 opt-in） */
+export interface ArbitrationOptions {
+  weights?: Partial<ArbitrationWeights>;
+  /** 新鲜度半衰期（天，缺省 30——闲置一个月新鲜度减半） */
+  freshnessHalfLifeDays?: number;
+  /** 注入时钟（确定性验证用；缺省 Date.now） */
+  now?: () => number;
+}
+
+/** 单条候选的三因子得分拆解（仲裁可解释的原子口径） */
+export interface ArbitrationScoreBreakdown {
+  id: string;
+  /** 证据量因子：有效样本量饱和归一 es/(es+5)（有 Beta 证据用时间加权口径，否则裸 supportCount） */
+  evidenceMass: number;
+  /** 新鲜度因子：0.5^(闲置天数/半衰期)，基准 max(distilledAt, lastAppliedAt) */
+  freshness: number;
+  /** 来源质量因子：溯源指纹多样性 nf/(nf+3)（单一来源 0.25，三个来源 0.5，饱和渐近 1） */
+  sourceQuality: number;
+  /**
+   * 总分 = evidenceMass^wE × freshness^wF × sourceQuality^wS（几何加权）：
+   * 三因子相乘结构——任一因子趋零则总分趋零（强证据 + 极陈旧 + 单一来源
+   * 综合不过中等证据 + 新鲜 + 多源，这正是「新证据推翻旧结论」的数学通道）。
+   */
+  score: number;
+}
+
+/** 单次仲裁裁决（winner/loser 各带三因子拆解） */
+export interface ArbitrationVerdict {
+  kind: 'semantic' | 'procedural';
+  signature: string;
+  /** 'arbitrated'：已裁决（败方降级）；'tie'：同分保守不翻案 */
+  outcome: 'arbitrated' | 'tie';
+  winner: ArbitrationScoreBreakdown;
+  loser: ArbitrationScoreBreakdown;
+  /** 胜者比败方更晚沉淀 → 新证据推翻旧结论（仲裁翻转） */
+  flipped: boolean;
+  /** 胜者裸支撑数反而更低 → 三因子加权击败了纯证据量口径 */
+  rawSupportUpset: boolean;
+}
+
+/** 仲裁报告 */
+export interface ArbitrationReport {
+  arbitratedAt: number;
+  /** 审议的冲突对总数 */
+  conflictsConsidered: number;
+  verdicts: ArbitrationVerdict[];
+  /** 翻转裁决数（新胜旧） */
+  flips: number;
+  /** 卫冕裁决数（旧胜新——证据厚度顶住新鲜度） */
+  defended: number;
+  /** 同分保守数（不降级任何一方） */
+  ties: number;
+  /** 降级为历史观点的条目数 */
+  demotedCount: number;
+}
+
+/**
+ * 仲裁三因子得分（纯函数——验证脚本可手算对照的确定性口径）。
+ * @param entry 语义/程序记忆（两接口的共用字段：id/supportCount/evidence/distilledAt/lastAppliedAt/sourceFingerprints）
+ * @param weights 归一化三因子权重
+ * @param freshnessHalfLifeDays 新鲜度半衰期（天）
+ * @param now 裁决时刻
+ */
+export function arbitrationScore(
+  entry: Pick<SemanticMemory, 'id' | 'supportCount' | 'evidence' | 'distilledAt' | 'lastAppliedAt' | 'sourceFingerprints'>,
+  weights: ArbitrationWeights,
+  freshnessHalfLifeDays: number,
+  now: number,
+): ArbitrationScoreBreakdown {
+  // 证据量：有 Beta 证据走时间加权有效样本量，无证据回退裸支撑数（legacy 口径）
+  const effectiveSamples = entry.evidence
+    ? readEvidence(entry.evidence, now).effectiveSamples
+    : entry.supportCount;
+  const evidenceMass = effectiveSamples / (effectiveSamples + 5);
+  // 新鲜度：自最近一次沉淀/应用起的指数衰减
+  const ageDays = Math.max(0, (now - Math.max(entry.distilledAt, entry.lastAppliedAt ?? 0)) / 86_400_000);
+  const freshness = Math.pow(0.5, ageDays / Math.max(1e-9, freshnessHalfLifeDays));
+  // 来源质量：溯源指纹多样性（去重计数）
+  const distinctSources = new Set(entry.sourceFingerprints).size;
+  const sourceQuality = distinctSources / (distinctSources + 3);
+  const score =
+    Math.pow(evidenceMass, weights.evidence) *
+    Math.pow(freshness, weights.freshness) *
+    Math.pow(sourceQuality, weights.sourceQuality);
+  return {
+    id: entry.id,
+    evidenceMass: Number(evidenceMass.toFixed(6)),
+    freshness: Number(freshness.toFixed(6)),
+    sourceQuality: Number(sourceQuality.toFixed(6)),
+    score: Number(score.toFixed(6)),
+  };
+}
+
+/** 因果链环节完备性（signal/execution/insight 必备，reflection 可选） */
+function chainComplete(chain: CausalChain): boolean {
+  return Boolean(chain.signalId && chain.executionId && chain.insightId);
+}
+
+// ───────────────────── 第四轮升级 ②：记忆老化温度曲线类型（纯函数口径） ─────────────────────
+
+/** 温层：热（现役常青）/ 温（缓冷）/ 冷（压缩候选）/ 冻结（归档/淘汰候选） */
+export type TemperatureBand = 'hot' | 'warm' | 'cold' | 'frozen';
+
+/** 温度模型配置（模块级 opt-in） */
+export interface TemperatureModelOptions {
+  /** 基准冷却半衰期（天，缺省 14——无保温时两周温度减半） */
+  halfLifeDays?: number;
+  /** 访问保温增益（缺省 0.5——访问量每翻倍，保温系数 +0.5） */
+  accessGain?: number;
+  /** 引用保温增益（缺省 0.75——被蒸馏引用比访问更保温：引用是被复用的强证据） */
+  citationGain?: number;
+  /** 注入时钟（确定性验证用；缺省 Date.now） */
+  now?: () => number;
+}
+
+/** 单条记忆的温度读数（建议由条目置信度与温层联合决定，纯读数不含建议） */
+export interface TemperatureCoreReading {
+  /** 条目年龄（天） */
+  ageDays: number;
+  /** 访问计数 */
+  accesses: number;
+  /** 被引用计数 */
+  citations: number;
+  /** 保温系数 = accessGain×log2(1+accesses) + citationGain×log2(1+citations) */
+  warmth: number;
+  /** 有效年龄 = ageDays / (1 + warmth)——保温把时钟折慢（非线性分岔的来源） */
+  effectiveAgeDays: number;
+  /** 温度 0~1（1 = 灼热）：0.5^(有效年龄/半衰期) */
+  temperature: number;
+  band: TemperatureBand;
+}
+
+/** 温度剖面条目（读数 + 处置建议） */
+export interface TemperatureReading extends TemperatureCoreReading {
+  fingerprint: string;
+  /** 温度驱动的处置建议：keep 驻留 / compress 压缩 / archive 归档 / evict-candidate 淘汰候选（冻结且低置信） */
+  suggestion: 'keep' | 'compress' | 'archive' | 'evict-candidate';
+}
+
+/** 全库温度剖面 */
+export interface TemperatureProfile {
+  generatedAt: number;
+  entries: TemperatureReading[];
+  /** 各温层条数 */
+  bands: Record<TemperatureBand, number>;
+  /** 各处置建议条数（压缩/归档候选清单的计数口径） */
+  suggestions: { keep: number; compress: number; archive: number; evictCandidate: number };
+  /** 保温/荒废分岔强度 = 库内温度极差（max-min；同库同龄条目因保温差异拉开档位） */
+  divergence: number;
+}
+
+/**
+ * 老化温度（纯函数——非线性模型，验证脚本手算对照的确定性口径）：
+ *
+ *   warmth        = accessGain×log2(1+accesses) + citationGain×log2(1+citations)
+ *   effectiveAge  = ageDays / (1 + warmth)
+ *   temperature   = 0.5^(effectiveAge / halfLifeDays)
+ *
+ * 非线性分岔：同龄两条记忆，被反复访问/引用者有效年龄按 (1+warmth) 折慢
+ * （保温），无人问津者按原速冷却——年龄相同而温度拉开档位；线性年龄模型
+ * （温度只看 ageDays）对两者给出完全相同的读数（保温不可见）。
+ *
+ * 温层切点（非线性档位）：hot ≥ 0.66 > warm ≥ 0.33 > cold ≥ 0.12 > frozen。
+ */
+export function temperatureOf(
+  input: { ageDays: number; accesses: number; citations: number },
+  options?: TemperatureModelOptions,
+): TemperatureCoreReading {
+  const halfLifeDays = options?.halfLifeDays ?? 14;
+  const accessGain = options?.accessGain ?? 0.5;
+  const citationGain = options?.citationGain ?? 0.75;
+  const warmth = accessGain * Math.log2(1 + Math.max(0, input.accesses)) + citationGain * Math.log2(1 + Math.max(0, input.citations));
+  const effectiveAgeDays = input.ageDays / (1 + warmth);
+  const temperature = Math.pow(0.5, effectiveAgeDays / Math.max(1e-9, halfLifeDays));
+  const band: TemperatureBand = temperature >= 0.66 ? 'hot' : temperature >= 0.33 ? 'warm' : temperature >= 0.12 ? 'cold' : 'frozen';
+  return {
+    ageDays: input.ageDays,
+    accesses: input.accesses,
+    citations: input.citations,
+    warmth: Number(warmth.toFixed(6)),
+    effectiveAgeDays: Number(effectiveAgeDays.toFixed(6)),
+    temperature: Number(temperature.toFixed(6)),
+    band,
+  };
+}
+
+// ───────────────────── 第四轮升级 ③：经验因果链溯源类型 ─────────────────────
+
+/**
+ * 单条沉淀的因果链：哪次信号 → 哪次执行 →（哪次反思）→ 哪条洞察 → 本条记忆。
+ * 可链式衍生（derivedFromMemoryId 指向上游记忆）——多级沉淀逐级回溯到源信号。
+ */
+export interface CausalChain {
+  /** 源信号 id（感知层事件——因果链的根） */
+  signalId: string;
+  /** 执行 id（该信号触发的任务执行） */
+  executionId: string;
+  /** 反思 id（执行后复盘；可选——并非所有沉淀都经过反思） */
+  reflectionId?: string;
+  /** 洞察 id（执行/反思提炼出的洞察） */
+  insightId: string;
+  /** 上游记忆 id（本条洞察衍生自哪条既有记忆；缺省 = 源头直沉淀） */
+  derivedFromMemoryId?: string;
+  /** 链登记时刻 */
+  recordedAt: number;
+}
+
+/** 溯源路径上的单步（一条记忆 + 它的因果链 + 环节完备性） */
+export interface ProvenanceTraceStep {
+  memoryId: string;
+  chain: CausalChain;
+  /** signal/execution/insight 必备环节是否齐全 */
+  complete: boolean;
+}
+
+/** 因果链溯源结果：从指定记忆逐级回溯到最初信号的完整路径 */
+export interface ProvenanceTrace {
+  memoryId: string;
+  path: ProvenanceTraceStep[];
+  /** 全路径必备环节全齐（任一环节缺要素即 false——诚实降级，不假造完整性） */
+  complete: boolean;
+  /** 溯源深度（= path.length；1 = 源头直沉淀，2 = 二级衍生……） */
+  depth: number;
+  /** 根信号 id（路径末端的 signalId） */
+  rootSignalId: string;
+}
+
+// ───────────────────── 第四轮升级 ④：记忆健康审计类型 ─────────────────────
+
+/** 健康审计选项（全部只读口径） */
+export interface HealthAuditOptions {
+  /** 注入时钟（确定性验证用；缺省 Date.now） */
+  now?: () => number;
+  /** NCD 查重阈值（缺省 0.6——低于此距离判定内容同源） */
+  duplicateThreshold?: number;
+  /** 陈旧判定天数（缺省 45——lastSeenAt 早于此即陈旧） */
+  stalenessDays?: number;
+  /** NCD 两两比对的采样上限（缺省 24；O(cap²) 的 LZW 开销护栏） */
+  sampleCap?: number;
+  /** 图邻接注入（孤岛判定的第二口径：共现图上有邻居则不算孤岛） */
+  linkedTo?: (fingerprint: string) => boolean;
+}
+
+/** 全库健康报告（五类缺陷指标 + 综合健康分） */
+export interface MemoryHealthReport {
+  generatedAt: number;
+  totals: { patterns: number; strategies: number; semantic: number; procedural: number };
+  /** 重复率 = 参与近邻对的模式数 / 总模式数（NCD ≤ 阈值） */
+  duplicateRate: number;
+  duplicatePairs: Array<{ a: string; b: string; distance: number }>;
+  /** 矛盾率 = 同主题反结论对数 / (语义 + 程序记忆总数) */
+  contradictionRate: number;
+  contradictions: Array<{ kind: 'semantic' | 'procedural'; ids: [string, string]; signature: string }>;
+  /** 孤岛率 = 无引用且无图邻接的模式数 / 总模式数 */
+  isolationRate: number;
+  isolated: string[];
+  /** 陈旧率 = lastSeenAt 超过 stalenessDays 的模式数 / 总模式数 */
+  stalenessRate: number;
+  stale: string[];
+  /** 任务类型分布漂移（早期 vs 近期 cohort 的 Jensen-Shannon 散度，比特；不足以分层时全零） */
+  distributionDrift: {
+    jsDivergenceBits: number;
+    taskTypes: Array<{ type: string; earlyShare: number; lateShare: number; delta: number }>;
+    cohorts: { early: number; late: number };
+  };
+  /** 综合健康分 0~100（五类缺陷加权扣分：重复 .2 / 矛盾 .25 / 孤岛 .2 / 陈旧 .2 / 漂移 .15） */
+  healthScore: number;
 }

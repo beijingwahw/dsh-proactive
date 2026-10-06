@@ -82,7 +82,6 @@ section('47.0 分布式同步 CRDT 通道（DistributedSync）');
   a.mergeCrdtState(b.crdtState());
   b.mergeCrdtState(a.crdtState());
   a.mergeCrdtState(b.crdtState()); // 重复投递
-  const canon = (obj) => JSON.stringify(obj, Object.keys(obj).sort());
   const canonDeep = (obj) => {
     const out = {};
     for (const k of Object.keys(obj).sort()) {
