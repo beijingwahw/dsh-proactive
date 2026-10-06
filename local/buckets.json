@@ -1,0 +1,1366 @@
+[
+ {
+  "prefix": "dsh-proactive/src/core/",
+  "files": [
+   {
+    "f": "astar-search.ts",
+    "l": 709
+   },
+   {
+    "f": "causal-kernel.ts",
+    "l": 1021
+   },
+   {
+    "f": "differential-privacy.ts",
+    "l": 323
+   },
+   {
+    "f": "experience-replay.ts",
+    "l": 1109
+   },
+   {
+    "f": "feedback-control.ts",
+    "l": 588
+   },
+   {
+    "f": "global-workspace.ts",
+    "l": 877
+   },
+   {
+    "f": "information-geometry.ts",
+    "l": 725
+   },
+   {
+    "f": "mcts.ts",
+    "l": 475
+   },
+   {
+    "f": "options-framework.ts",
+    "l": 1515
+   },
+   {
+    "f": "quality-diversity.ts",
+    "l": 523
+   },
+   {
+    "f": "robust-decisions.ts",
+    "l": 329
+   },
+   {
+    "f": "runtime-verification.ts",
+    "l": 775
+   },
+   {
+    "f": "safe-policy-improvement.ts",
+    "l": 655
+   },
+   {
+    "f": "safety-barrier.ts",
+    "l": 830
+   }
+  ],
+  "lines": 10454,
+  "id": 1
+ },
+ {
+  "prefix": "dsh-proactive/src/core/",
+  "files": [
+   {
+    "f": "anytime-evidence.ts",
+    "l": 708
+   },
+   {
+    "f": "belief-propagation.ts",
+    "l": 1021
+   },
+   {
+    "f": "canonical-correlation.ts",
+    "l": 584
+   },
+   {
+    "f": "causal-discovery.ts",
+    "l": 1427
+   },
+   {
+    "f": "conformal.ts",
+    "l": 534
+   },
+   {
+    "f": "crowd-aggregation.ts",
+    "l": 747
+   },
+   {
+    "f": "diffusion-maps.ts",
+    "l": 1112
+   },
+   {
+    "f": "multiscale-wavelet.ts",
+    "l": 337
+   },
+   {
+    "f": "optimal-assignment.ts",
+    "l": 462
+   },
+   {
+    "f": "queueing-network.ts",
+    "l": 318
+   },
+   {
+    "f": "self-play.ts",
+    "l": 930
+   },
+   {
+    "f": "simulated-annealing.ts",
+    "l": 841
+   },
+   {
+    "f": "simulation-calibration.ts",
+    "l": 778
+   },
+   {
+    "f": "speculative-decoding.ts",
+    "l": 652
+   }
+  ],
+  "lines": 10451,
+  "id": 2
+ },
+ {
+  "prefix": "dsh-proactive/src/core/",
+  "files": [
+   {
+    "f": "evidence.ts",
+    "l": 343
+   },
+   {
+    "f": "free-energy.ts",
+    "l": 524
+   },
+   {
+    "f": "hawkes-process.ts",
+    "l": 947
+   },
+   {
+    "f": "mapper-graph.ts",
+    "l": 863
+   },
+   {
+    "f": "matrix-completion.ts",
+    "l": 564
+   },
+   {
+    "f": "metacognitive-confidence.ts",
+    "l": 1118
+   },
+   {
+    "f": "optimal-transport.ts",
+    "l": 685
+   },
+   {
+    "f": "partial-info-decomposition.ts",
+    "l": 794
+   },
+   {
+    "f": "preference-learning.ts",
+    "l": 1371
+   },
+   {
+    "f": "quorum-systems.ts",
+    "l": 303
+   },
+   {
+    "f": "resilience.ts",
+    "l": 741
+   },
+   {
+    "f": "submodular.ts",
+    "l": 696
+   },
+   {
+    "f": "symbolic-solver.ts",
+    "l": 1024
+   },
+   {
+    "f": "theorist.ts",
+    "l": 464
+   }
+  ],
+  "lines": 10437,
+  "id": 3
+ },
+ {
+  "prefix": "dsh-proactive/src/core/",
+  "files": [
+   {
+    "f": "capacity-planning.ts",
+    "l": 419
+   },
+   {
+    "f": "information-bottleneck.ts",
+    "l": 556
+   },
+   {
+    "f": "kalman-filter.ts",
+    "l": 686
+   },
+   {
+    "f": "lyapunov-drift.ts",
+    "l": 988
+   },
+   {
+    "f": "mechanism-design.ts",
+    "l": 794
+   },
+   {
+    "f": "novelty-detection.ts",
+    "l": 1300
+   },
+   {
+    "f": "novelty-search.ts",
+    "l": 1119
+   },
+   {
+    "f": "nsga2-pareto.ts",
+    "l": 662
+   },
+   {
+    "f": "random-matrix.ts",
+    "l": 773
+   },
+   {
+    "f": "secret-sharing.ts",
+    "l": 376
+   },
+   {
+    "f": "sparse-recovery.ts",
+    "l": 872
+   },
+   {
+    "f": "spectral-ranking.ts",
+    "l": 264
+   },
+   {
+    "f": "streaming-sketch.ts",
+    "l": 1027
+   },
+   {
+    "f": "whittle-index.ts",
+    "l": 575
+   }
+  ],
+  "lines": 10411,
+  "id": 4
+ },
+ {
+  "prefix": "dsh-proactive/src/core/",
+  "files": [
+   {
+    "f": "correlated-equilibrium.ts",
+    "l": 815
+   },
+   {
+    "f": "extreme-value.ts",
+    "l": 594
+   },
+   {
+    "f": "fair-division.ts",
+    "l": 479
+   },
+   {
+    "f": "gaussian-process.ts",
+    "l": 725
+   },
+   {
+    "f": "langevin-sampling.ts",
+    "l": 723
+   },
+   {
+    "f": "max-flow.ts",
+    "l": 501
+   },
+   {
+    "f": "nonlinear-dynamics.ts",
+    "l": 350
+   },
+   {
+    "f": "nucleolus.ts",
+    "l": 1287
+   },
+   {
+    "f": "off-policy-evaluation.ts",
+    "l": 1127
+   },
+   {
+    "f": "pomdp-planning.ts",
+    "l": 864
+   },
+   {
+    "f": "robust-statistics.ts",
+    "l": 298
+   },
+   {
+    "f": "scientist.ts",
+    "l": 645
+   },
+   {
+    "f": "test-time-compute.ts",
+    "l": 983
+   },
+   {
+    "f": "world-model-learning.ts",
+    "l": 1044
+   }
+  ],
+  "lines": 10435,
+  "id": 5
+ },
+ {
+  "prefix": "dsh-proactive/src/core/",
+  "files": [
+   {
+    "f": "abstraction.ts",
+    "l": 985
+   },
+   {
+    "f": "argumentation.ts",
+    "l": 1053
+   },
+   {
+    "f": "attention-economy.ts",
+    "l": 684
+   },
+   {
+    "f": "bandit-knapsack.ts",
+    "l": 397
+   },
+   {
+    "f": "budget-allocation.ts",
+    "l": 420
+   },
+   {
+    "f": "first-passage.ts",
+    "l": 217
+   },
+   {
+    "f": "metareasoning.ts",
+    "l": 794
+   },
+   {
+    "f": "mirror-descent.ts",
+    "l": 533
+   },
+   {
+    "f": "online-calibration.ts",
+    "l": 866
+   },
+   {
+    "f": "optimal-stopping.ts",
+    "l": 561
+   },
+   {
+    "f": "persistent-homology.ts",
+    "l": 695
+   },
+   {
+    "f": "self-boundary.ts",
+    "l": 1271
+   },
+   {
+    "f": "shapley.ts",
+    "l": 761
+   },
+   {
+    "f": "stable-matching.ts",
+    "l": 1131
+   }
+  ],
+  "lines": 10368,
+  "id": 6
+ },
+ {
+  "prefix": "dsh-proactive/src/core/",
+  "files": [
+   {
+    "f": "automl-hyperband.ts",
+    "l": 973
+   },
+   {
+    "f": "best-arm-identification.ts",
+    "l": 596
+   },
+   {
+    "f": "compression-distance.ts",
+    "l": 643
+   },
+   {
+    "f": "crdt.ts",
+    "l": 255
+   },
+   {
+    "f": "curriculum-learning.ts",
+    "l": 1146
+   },
+   {
+    "f": "deliberation.ts",
+    "l": 1235
+   },
+   {
+    "f": "dynamic-pricing.ts",
+    "l": 1080
+   },
+   {
+    "f": "index-scheduling.ts",
+    "l": 369
+   },
+   {
+    "f": "interruptible-autonomy.ts",
+    "l": 871
+   },
+   {
+    "f": "online-learning.ts",
+    "l": 490
+   },
+   {
+    "f": "rate-distortion.ts",
+    "l": 725
+   },
+   {
+    "f": "sheaf-consensus.ts",
+    "l": 812
+   },
+   {
+    "f": "spectral-periodicity.ts",
+    "l": 481
+   },
+   {
+    "f": "variational-inference.ts",
+    "l": 727
+   }
+  ],
+  "lines": 10403,
+  "id": 7
+ },
+ {
+  "prefix": "dsh-proactive/src/",
+  "files": [
+   {
+    "f": "errors.ts",
+    "l": 774
+   },
+   {
+    "f": "index.ts",
+    "l": 6225
+   },
+   {
+    "f": "optimizer.ts",
+    "l": 1561
+   },
+   {
+    "f": "reflection-engine.ts",
+    "l": 1123
+   }
+  ],
+  "lines": 9683,
+  "id": 8
+ },
+ {
+  "prefix": "dsh-proactive/src/",
+  "files": [
+   {
+    "f": "goal-engine.ts",
+    "l": 1054
+   },
+   {
+    "f": "host-fusion.ts",
+    "l": 518
+   },
+   {
+    "f": "meta-cognition.ts",
+    "l": 1650
+   },
+   {
+    "f": "model-scheduler.ts",
+    "l": 2789
+   },
+   {
+    "f": "safety-governor.ts",
+    "l": 1465
+   },
+   {
+    "f": "strategy-evolution.ts",
+    "l": 1963
+   }
+  ],
+  "lines": 9439,
+  "id": 9
+ },
+ {
+  "prefix": "dsh-proactive/src/",
+  "files": [
+   {
+    "f": "contracts.ts",
+    "l": 1284
+   },
+   {
+    "f": "llm-client.ts",
+    "l": 2467
+   },
+   {
+    "f": "progress-ws.ts",
+    "l": 894
+   },
+   {
+    "f": "sentinel.ts",
+    "l": 2232
+   },
+   {
+    "f": "types.ts",
+    "l": 777
+   },
+   {
+    "f": "world-model.ts",
+    "l": 1912
+   }
+  ],
+  "lines": 9566,
+  "id": 10
+ },
+ {
+  "prefix": "dsh-proactive/src/",
+  "files": [
+   {
+    "f": "autonomy-loop.ts",
+    "l": 1415
+   },
+   {
+    "f": "curiosity-engine.ts",
+    "l": 874
+   },
+   {
+    "f": "decision-engine.ts",
+    "l": 2418
+   },
+   {
+    "f": "dsh-host.ts",
+    "l": 849
+   },
+   {
+    "f": "reflector.ts",
+    "l": 1796
+   },
+   {
+    "f": "task-executor.ts",
+    "l": 2283
+   }
+  ],
+  "lines": 9635,
+  "id": 11
+ },
+ {
+  "prefix": "",
+  "files": [
+   {
+    "f": "memory/backend.ts",
+    "l": 998
+   },
+   {
+    "f": "memory/long-term-memory.ts",
+    "l": 3394
+   },
+   {
+    "f": "memory/migration-tool.ts",
+    "l": 902
+   },
+   {
+    "f": "symbiosis/agent.ts",
+    "l": 640
+   },
+   {
+    "f": "sync/distributed-sync.ts",
+    "l": 1592
+   },
+   {
+    "f": "telemetry/audit-log.ts",
+    "l": 489
+   },
+   {
+    "f": "telemetry/event-bus.ts",
+    "l": 801
+   }
+  ],
+  "lines": 8816,
+  "id": 12
+ },
+ {
+  "prefix": "",
+  "files": [
+   {
+    "f": "benchmark/benchmark-engine.ts",
+    "l": 2390
+   },
+   {
+    "f": "engines-frontier/genesis25.ts",
+    "l": 701
+   },
+   {
+    "f": "meta/meta-types.ts",
+    "l": 810
+   },
+   {
+    "f": "meta/self-model.ts",
+    "l": 1639
+   },
+   {
+    "f": "symbiosis/belief.ts",
+    "l": 563
+   },
+   {
+    "f": "symbiosis/wrappers.ts",
+    "l": 408
+   },
+   {
+    "f": "telemetry/metrics.ts",
+    "l": 917
+   },
+   {
+    "f": "tenant/tenant-manager.ts",
+    "l": 1342
+   }
+  ],
+  "lines": 8770,
+  "id": 13
+ },
+ {
+  "prefix": "",
+  "files": [
+   {
+    "f": "consensus/raft-engine.ts",
+    "l": 2348
+   },
+   {
+    "f": "dashboard/index.ts",
+    "l": 850
+   },
+   {
+    "f": "hot-reload/hot-reload-engine.ts",
+    "l": 1038
+   },
+   {
+    "f": "memory/alias-map.ts",
+    "l": 193
+   },
+   {
+    "f": "meta/meta-controller.ts",
+    "l": 1815
+   },
+   {
+    "f": "symbiosis/ledger.ts",
+    "l": 792
+   },
+   {
+    "f": "symbiosis/observability.ts",
+    "l": 540
+   },
+   {
+    "f": "symbiosis/runtime.ts",
+    "l": 996
+   },
+   {
+    "f": "telemetry/trace.ts",
+    "l": 377
+   }
+  ],
+  "lines": 8949,
+  "id": 14
+ },
+ {
+  "prefix": "",
+  "files": [
+   {
+    "f": "engines-frontier/autonomy25.ts",
+    "l": 2215
+   },
+   {
+    "f": "memory/memory-graph.ts",
+    "l": 515
+   },
+   {
+    "f": "policy/policy-evolver.ts",
+    "l": 1936
+   },
+   {
+    "f": "policy/policy-types.ts",
+    "l": 455
+   },
+   {
+    "f": "policy/sandbox.ts",
+    "l": 963
+   },
+   {
+    "f": "security/crypto-engine.ts",
+    "l": 1060
+   },
+   {
+    "f": "symbiosis/bridge.ts",
+    "l": 778
+   },
+   {
+    "f": "symbiosis/market.ts",
+    "l": 889
+   }
+  ],
+  "lines": 8811,
+  "id": 15
+ },
+ {
+  "prefix": "dsh-proactive/scripts/",
+  "files": [
+   {
+    "f": "../../smoke/probe.mjs",
+    "l": 34
+   },
+   {
+    "f": "../../smoke/smoke-ns2.mjs",
+    "l": 24
+   },
+   {
+    "f": "../../smoke/smoke-pt.mjs",
+    "l": 48
+   },
+   {
+    "f": "generate-domestic-patches.mjs",
+    "l": 350
+   },
+   {
+    "f": "verify-active-inference.mjs",
+    "l": 311
+   },
+   {
+    "f": "verify-alignment-manifold.mjs",
+    "l": 653
+   },
+   {
+    "f": "verify-compression-distance.mjs",
+    "l": 324
+   },
+   {
+    "f": "verify-fabric-kernels.mjs",
+    "l": 254
+   },
+   {
+    "f": "verify-frontier-wiring.mjs",
+    "l": 115
+   },
+   {
+    "f": "verify-game-kernels.mjs",
+    "l": 485
+   },
+   {
+    "f": "verify-genesis-wiring.mjs",
+    "l": 298
+   },
+   {
+    "f": "verify-lyapunov-drift.mjs",
+    "l": 351
+   },
+   {
+    "f": "verify-mod-client.mjs",
+    "l": 880
+   },
+   {
+    "f": "verify-mod-decision.mjs",
+    "l": 391
+   },
+   {
+    "f": "verify-mod-integration.mjs",
+    "l": 415
+   },
+   {
+    "f": "verify-mod-symbiosis.mjs",
+    "l": 579
+   },
+   {
+    "f": "verify-mod-world.mjs",
+    "l": 504
+   },
+   {
+    "f": "verify-pricing-calibration.mjs",
+    "l": 478
+   },
+   {
+    "f": "verify-quality-diversity.mjs",
+    "l": 271
+   },
+   {
+    "f": "verify-r4-bench-dash.mjs",
+    "l": 755
+   },
+   {
+    "f": "verify-r4-contracts.mjs",
+    "l": 672
+   },
+   {
+    "f": "verify-r4-evolution.mjs",
+    "l": 859
+   },
+   {
+    "f": "verify-r4-reflect.mjs",
+    "l": 525
+   },
+   {
+    "f": "verify-r4-scheduler.mjs",
+    "l": 551
+   },
+   {
+    "f": "verify-r4-world.mjs",
+    "l": 618
+   },
+   {
+    "f": "verify-r5-causal.mjs",
+    "l": 738
+   },
+   {
+    "f": "verify-r5-evolutionary.mjs",
+    "l": 1242
+   },
+   {
+    "f": "verify-r5-statistics.mjs",
+    "l": 944
+   },
+   {
+    "f": "verify-scientist.mjs",
+    "l": 366
+   },
+   {
+    "f": "verify-search-sparse.mjs",
+    "l": 422
+   },
+   {
+    "f": "verify-symbiosis.mjs",
+    "l": 454
+   }
+  ],
+  "lines": 14911,
+  "id": 16
+ },
+ {
+  "prefix": "dsh-proactive/scripts/",
+  "files": [
+   {
+    "f": "../../smoke/probe2.mjs",
+    "l": 16
+   },
+   {
+    "f": "../../smoke/probe3.mjs",
+    "l": 26
+   },
+   {
+    "f": "../../smoke/smoke-lof.mjs",
+    "l": 38
+   },
+   {
+    "f": "verify-abstraction.mjs",
+    "l": 331
+   },
+   {
+    "f": "verify-anytime-evidence.mjs",
+    "l": 290
+   },
+   {
+    "f": "verify-autonomy25-wiring.mjs",
+    "l": 920
+   },
+   {
+    "f": "verify-belief-propagation.mjs",
+    "l": 371
+   },
+   {
+    "f": "verify-causal-discovery.mjs",
+    "l": 452
+   },
+   {
+    "f": "verify-crowd-aggregation.mjs",
+    "l": 250
+   },
+   {
+    "f": "verify-frontier-kernels.mjs",
+    "l": 149
+   },
+   {
+    "f": "verify-full-agents.mjs",
+    "l": 279
+   },
+   {
+    "f": "verify-genesis25-wiring.mjs",
+    "l": 877
+   },
+   {
+    "f": "verify-meta-edge.mjs",
+    "l": 395
+   },
+   {
+    "f": "verify-metareasoning.mjs",
+    "l": 317
+   },
+   {
+    "f": "verify-mod-distributed.mjs",
+    "l": 633
+   },
+   {
+    "f": "verify-mod-executor.mjs",
+    "l": 474
+   },
+   {
+    "f": "verify-mod-sentinel.mjs",
+    "l": 501
+   },
+   {
+    "f": "verify-novelty-detection.mjs",
+    "l": 517
+   },
+   {
+    "f": "verify-policy-evolution.mjs",
+    "l": 713
+   },
+   {
+    "f": "verify-prophet-kernels.mjs",
+    "l": 454
+   },
+   {
+    "f": "verify-r4-meta.mjs",
+    "l": 610
+   },
+   {
+    "f": "verify-r5-control.mjs",
+    "l": 1155
+   },
+   {
+    "f": "verify-r5-integration.mjs",
+    "l": 485
+   },
+   {
+    "f": "verify-r5-online.mjs",
+    "l": 846
+   },
+   {
+    "f": "verify-r5-planning.mjs",
+    "l": 571
+   },
+   {
+    "f": "verify-r5-resilience.mjs",
+    "l": 953
+   },
+   {
+    "f": "verify-self-evolution.mjs",
+    "l": 376
+   },
+   {
+    "f": "verify-stochastic-optimization.mjs",
+    "l": 660
+   },
+   {
+    "f": "verify-streaming-sketch.mjs",
+    "l": 564
+   },
+   {
+    "f": "verify-test-time-compute.mjs",
+    "l": 362
+   },
+   {
+    "f": "verify-theorist.mjs",
+    "l": 331
+   }
+  ],
+  "lines": 14916,
+  "id": 17
+ },
+ {
+  "prefix": "dsh-proactive/scripts/",
+  "files": [
+   {
+    "f": "../../smoke/smoke-ns4.mjs",
+    "l": 29
+   },
+   {
+    "f": "../../smoke/smoke-ph.mjs",
+    "l": 23
+   },
+   {
+    "f": "verify-awakening-kernels.mjs",
+    "l": 326
+   },
+   {
+    "f": "verify-awakening-wiring.mjs",
+    "l": 278
+   },
+   {
+    "f": "verify-belief-market.mjs",
+    "l": 322
+   },
+   {
+    "f": "verify-conformal.mjs",
+    "l": 244
+   },
+   {
+    "f": "verify-consensus-sync.mjs",
+    "l": 180
+   },
+   {
+    "f": "verify-deliberation.mjs",
+    "l": 357
+   },
+   {
+    "f": "verify-energy-feedback.mjs",
+    "l": 288
+   },
+   {
+    "f": "verify-equilibrium-kernels.mjs",
+    "l": 462
+   },
+   {
+    "f": "verify-genesis-kernels.mjs",
+    "l": 387
+   },
+   {
+    "f": "verify-global-workspace.mjs",
+    "l": 480
+   },
+   {
+    "f": "verify-mapper-graph.mjs",
+    "l": 400
+   },
+   {
+    "f": "verify-meta-cognition-v2.mjs",
+    "l": 587
+   },
+   {
+    "f": "verify-metacognition-replay.mjs",
+    "l": 667
+   },
+   {
+    "f": "verify-mod-autonomy.mjs",
+    "l": 736
+   },
+   {
+    "f": "verify-mod-meta.mjs",
+    "l": 872
+   },
+   {
+    "f": "verify-mod-scheduler.mjs",
+    "l": 651
+   },
+   {
+    "f": "verify-mod-telemetry.mjs",
+    "l": 582
+   },
+   {
+    "f": "verify-model-pomdp.mjs",
+    "l": 465
+   },
+   {
+    "f": "verify-ope-spi.mjs",
+    "l": 546
+   },
+   {
+    "f": "verify-preference-learning.mjs",
+    "l": 367
+   },
+   {
+    "f": "verify-r4-decision.mjs",
+    "l": 527
+   },
+   {
+    "f": "verify-r4-executor.mjs",
+    "l": 513
+   },
+   {
+    "f": "verify-r4-pipeline.mjs",
+    "l": 813
+   },
+   {
+    "f": "verify-r5-decision.mjs",
+    "l": 959
+   },
+   {
+    "f": "verify-r5-game.mjs",
+    "l": 1133
+   },
+   {
+    "f": "verify-r5-infogeo.mjs",
+    "l": 941
+   },
+   {
+    "f": "verify-self-evolution-v2.mjs",
+    "l": 339
+   },
+   {
+    "f": "verify-speculative-decoding.mjs",
+    "l": 440
+   }
+  ],
+  "lines": 14914,
+  "id": 18
+ },
+ {
+  "prefix": "dsh-proactive/scripts/",
+  "files": [
+   {
+    "f": "../../smoke/smoke-mapper.mjs",
+    "l": 58
+   },
+   {
+    "f": "../../smoke/smoke-ns.mjs",
+    "l": 32
+   },
+   {
+    "f": "../../smoke/smoke-ns3.mjs",
+    "l": 18
+   },
+   {
+    "f": "../../smoke/smoke-wolf.mjs",
+    "l": 42
+   },
+   {
+    "f": "../../smoke/stress-ph.mjs",
+    "l": 62
+   },
+   {
+    "f": "verify-attention-self.mjs",
+    "l": 521
+   },
+   {
+    "f": "verify-automl-hyperband.mjs",
+    "l": 427
+   },
+   {
+    "f": "verify-equilibrium-wiring.mjs",
+    "l": 345
+   },
+   {
+    "f": "verify-execution-kernels.mjs",
+    "l": 464
+   },
+   {
+    "f": "verify-futarchy.mjs",
+    "l": 325
+   },
+   {
+    "f": "verify-knowledge-distillation.mjs",
+    "l": 366
+   },
+   {
+    "f": "verify-meta-cognition.mjs",
+    "l": 731
+   },
+   {
+    "f": "verify-mod-contracts.mjs",
+    "l": 610
+   },
+   {
+    "f": "verify-mod-governance.mjs",
+    "l": 622
+   },
+   {
+    "f": "verify-mod-pipeline.mjs",
+    "l": 559
+   },
+   {
+    "f": "verify-mod-reflect.mjs",
+    "l": 582
+   },
+   {
+    "f": "verify-observability.mjs",
+    "l": 312
+   },
+   {
+    "f": "verify-partial-info-decomposition.mjs",
+    "l": 355
+   },
+   {
+    "f": "verify-prophet-wiring.mjs",
+    "l": 303
+   },
+   {
+    "f": "verify-r4-distributed.mjs",
+    "l": 915
+   },
+   {
+    "f": "verify-r4-governance.mjs",
+    "l": 663
+   },
+   {
+    "f": "verify-r4-integration.mjs",
+    "l": 494
+   },
+   {
+    "f": "verify-r4-symbiosis.mjs",
+    "l": 459
+   },
+   {
+    "f": "verify-r5-consensus.mjs",
+    "l": 1099
+   },
+   {
+    "f": "verify-r5-metacognition.mjs",
+    "l": 1034
+   },
+   {
+    "f": "verify-r5-stochastic.mjs",
+    "l": 811
+   },
+   {
+    "f": "verify-r5-topology.mjs",
+    "l": 872
+   },
+   {
+    "f": "verify-shapley.mjs",
+    "l": 263
+   },
+   {
+    "f": "verify-sim-interrupt.mjs",
+    "l": 500
+   },
+   {
+    "f": "verify-symbiosis-bridge.mjs",
+    "l": 267
+   },
+   {
+    "f": "verify-symbolic-solver.mjs",
+    "l": 386
+   },
+   {
+    "f": "verify-variational-langevin.mjs",
+    "l": 413
+   }
+  ],
+  "lines": 14910,
+  "id": 19
+ },
+ {
+  "prefix": "dsh-proactive/scripts/",
+  "files": [
+   {
+    "f": "../../smoke/probe4.mjs",
+    "l": 17
+   },
+   {
+    "f": "../../smoke/smoke-wolf2.mjs",
+    "l": 29
+   },
+   {
+    "f": "verify-argumentation.mjs",
+    "l": 531
+   },
+   {
+    "f": "verify-causal-kernel.mjs",
+    "l": 375
+   },
+   {
+    "f": "verify-curriculum-rd.mjs",
+    "l": 450
+   },
+   {
+    "f": "verify-fabric-wiring.mjs",
+    "l": 187
+   },
+   {
+    "f": "verify-flux-kernels.mjs",
+    "l": 317
+   },
+   {
+    "f": "verify-flux-wiring.mjs",
+    "l": 241
+   },
+   {
+    "f": "verify-hawkes-process.mjs",
+    "l": 296
+   },
+   {
+    "f": "verify-mechanism-design.mjs",
+    "l": 372
+   },
+   {
+    "f": "verify-mod-bench-dash.mjs",
+    "l": 578
+   },
+   {
+    "f": "verify-mod-evolution.mjs",
+    "l": 686
+   },
+   {
+    "f": "verify-mod-memory.mjs",
+    "l": 514
+   },
+   {
+    "f": "verify-novelty-search.mjs",
+    "l": 326
+   },
+   {
+    "f": "verify-online-frontier.mjs",
+    "l": 358
+   },
+   {
+    "f": "verify-r4-autonomy.mjs",
+    "l": 606
+   },
+   {
+    "f": "verify-r4-client.mjs",
+    "l": 1060
+   },
+   {
+    "f": "verify-r4-memory.mjs",
+    "l": 536
+   },
+   {
+    "f": "verify-r4-sentinel.mjs",
+    "l": 471
+   },
+   {
+    "f": "verify-r4-telemetry.mjs",
+    "l": 652
+   },
+   {
+    "f": "verify-r5-bayes.mjs",
+    "l": 1041
+   },
+   {
+    "f": "verify-r5-fairness.mjs",
+    "l": 852
+   },
+   {
+    "f": "verify-r5-learning.mjs",
+    "l": 878
+   },
+   {
+    "f": "verify-r5-spectral.mjs",
+    "l": 921
+   },
+   {
+    "f": "verify-resilience-governance.mjs",
+    "l": 397
+   },
+   {
+    "f": "verify-runtime-verification.mjs",
+    "l": 275
+   },
+   {
+    "f": "verify-self-play.mjs",
+    "l": 339
+   },
+   {
+    "f": "verify-stable-matching.mjs",
+    "l": 481
+   },
+   {
+    "f": "verify-unified-evidence.mjs",
+    "l": 456
+   },
+   {
+    "f": "verify-whittle-index.mjs",
+    "l": 670
+   }
+  ],
+  "lines": 14912,
+  "id": 20
+ }
+]
